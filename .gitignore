@@ -5,6 +5,8 @@ data/
 .lavish/
 .fm-secondmate-home
 .DS_Store
+memory/
+notify-push.log
 __pycache__/
 *.pyc
 .env
