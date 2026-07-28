@@ -25,14 +25,15 @@ fi
 ID=$1
 RAW_URL=$2
 # bin/fm-pr-lib.sh parses GitLab merge request URLs so the watcher can follow
-# them, but this path still addresses only GitHub by owner/repository. The
-# provider check holds that refusal exactly as it was until merge parity lands.
+# them, but this path still addresses only GitHub (github.com and GHE hosts from
+# config/github-hosts) by owner/repository. GitLab merge parity is a separate change.
 if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL" \
   || [ "$FM_PR_PROVIDER" != github ]; then
   echo "error: invalid PR merge request" >&2
   exit 2
 fi
 URL=$FM_PR_URL
+PR_HOST=$FM_PR_HOST
 PR_OWNER=$FM_PR_OWNER
 PR_REPO=$FM_PR_REPO
 PR_NUMBER=$FM_PR_NUMBER
@@ -81,4 +82,8 @@ if ! caller_has_merge_method "$@"; then
   merge_args=(--squash)
 fi
 
-gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${merge_args[@]}"}" "$@"
+if [ "$PR_HOST" = github.com ]; then
+  gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${merge_args[@]}"}" "$@"
+else
+  gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" --hostname "$PR_HOST" "${merge_args[@]+"${merge_args[@]}"}" "$@"
+fi

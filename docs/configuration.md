@@ -112,6 +112,21 @@ It does not set `commands.test` to a complete `tests/*.test.sh` walk.
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the firstmate-specific local test policy and entry points.
 Portable shard evidence and coverage rules are in [fm-test-portable-shards.md](fm-test-portable-shards.md), and [herdr-backend.md](herdr-backend.md) owns the real-Herdr lane's verification and isolation rationale.
 
+## GitHub Enterprise Server hosts (config/github-hosts)
+
+`config/github-hosts` is an optional local, gitignored file that lists GitHub Enterprise Server hostnames, one per line.
+Blank lines and lines beginning with `#` are ignored.
+Each listed hostname is treated as a valid GitHub provider host by `bin/fm-pr-lib.sh`, `bin/fm-pr-poll.sh`, and `bin/fm-pr-merge.sh`, so GHE pull request URLs on those hosts are parsed, polled, and merged exactly like `github.com` pull requests.
+The `gh` CLI handles GHE natively via `--hostname <host>`, so no extra authentication configuration is needed beyond a standard `gh auth login --hostname <host>`.
+
+Format: one hostname per line, no scheme, no path, no port.
+Example entry: `github.mpi-internal.com`.
+
+Bootstrap validates the file when present.
+Each non-comment line that is not a well-formed lowercase DNS hostname emits `BOOTSTRAP_INFO: config/github-hosts: invalid hostname: <line>`.
+A valid file is silent.
+The file is not inherited by secondmate homes.
+
 ## Captain Preferences (data/captain.md / data/captain-shared.md)
 
 Domain-local preferences for one captain's fleet live locally in each home's `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.

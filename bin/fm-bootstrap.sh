@@ -699,6 +699,29 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+github_hosts_validate() {
+  local file line lc_line
+  file="$CONFIG/github-hosts"
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    # A valid hostname: lowercase DNS label, no scheme, no path, no port, no
+    # leading/trailing dot, no consecutive dots, only a-z 0-9 - .
+    lc_line=$(printf '%s\n' "$line" | tr '[:upper:]' '[:lower:]')
+    case "$lc_line" in
+      .*|*.|*..*|*[!a-z0-9.-]*)
+        echo "BOOTSTRAP_INFO: config/github-hosts: invalid hostname: $line"
+        continue
+        ;;
+    esac
+    [ "${#lc_line}" -ge 1 ] && [ "${#lc_line}" -le 253 ] || {
+      echo "BOOTSTRAP_INFO: config/github-hosts: invalid hostname: $line"
+    }
+  done < "$file"
+}
+
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
@@ -862,6 +885,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != 
   echo "BOOTSTRAP_INFO: crew harness override active: $crew"
 fi
 crew_dispatch_validate
+github_hosts_validate
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "BOOTSTRAP_INFO: tasks-axi available"
