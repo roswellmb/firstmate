@@ -133,6 +133,35 @@ fm_pr_gitlab_path_valid() {
 # bin/fm-pr-merge.sh addresses GitHub by owner/repository. A gitlab URL leaves
 # them empty; teaching the merge path about GitLab is a separate change, and
 # until then it refuses a GitLab URL rather than merging anything.
+#
+# GitHub Enterprise Server hosts listed in config/github-hosts (one hostname per
+# line, blank lines and # comments ignored) are accepted as provider=github.
+# FM_PR_GHE_HOSTS_FILE overrides the default path derived from FM_HOME; callers
+# that set FM_HOME or CONFIG before sourcing this lib get GHE support for free.
+fm_pr_ghe_hosts_file() {
+  if [ -n "${FM_PR_GHE_HOSTS_FILE:-}" ]; then
+    printf '%s\n' "$FM_PR_GHE_HOSTS_FILE"
+    return 0
+  fi
+  local home
+  home="${FM_HOME:-}"
+  [ -n "$home" ] || return 1
+  printf '%s/config/github-hosts\n' "$home"
+}
+
+fm_pr_ghe_host_listed() {
+  local host=$1 file line
+  file=$(fm_pr_ghe_hosts_file) || return 1
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    [ "$line" = "$host" ] && return 0
+  done < "$file"
+  return 1
+}
+
 fm_pr_url_parse() {
   local raw=${1-} pattern host path
   local LC_ALL=C
@@ -158,6 +187,27 @@ fm_pr_url_parse() {
     FM_PR_REPO=${BASH_REMATCH[2]}
     FM_PR_NUMBER=${BASH_REMATCH[3]}
     return 0
+  fi
+  # GitHub Enterprise Server: same PR URL shape but on a host listed in
+  # config/github-hosts. The host regex is intentionally broad here; the listed
+  # hostname is the real gate (fm_pr_ghe_host_listed).
+  pattern='^https://([A-Za-z0-9][A-Za-z0-9.-]{0,251}[A-Za-z0-9])/([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])/([A-Za-z0-9._-]{1,100})/pull/([1-9][0-9]*)$'
+  if [[ "$raw" =~ $pattern ]]; then
+    host=${BASH_REMATCH[1]}
+    if fm_pr_ghe_host_listed "$host"; then
+      [[ "${BASH_REMATCH[2]}" != *--* ]] || return 1
+      [ "${BASH_REMATCH[3]}" != . ] && [ "${BASH_REMATCH[3]}" != .. ] || return 1
+      FM_PR_PROVIDER=github
+      FM_PR_URL=$raw
+      FM_PR_HOST=$host
+      FM_PR_PATH="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+      # shellcheck disable=SC2034
+      FM_PR_OWNER=${BASH_REMATCH[2]}
+      # shellcheck disable=SC2034
+      FM_PR_REPO=${BASH_REMATCH[3]}
+      FM_PR_NUMBER=${BASH_REMATCH[4]}
+      return 0
+    fi
   fi
   # The path class contains "/" and "-", so this match is greedy to the last
   # "/-/merge_requests/". Any earlier separator therefore lands inside the
