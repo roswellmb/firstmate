@@ -159,6 +159,11 @@
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
 #     __OPINPUT__   absolute path to the canonical operational-input encoder
+# Every launch command, verified adapter or raw escape hatch, is prefixed with the
+# browser-isolation environment built by browser_isolation_env() below: the agent's
+# chrome-devtools-axi work runs in its own named bridge on a throwaway Chrome profile
+# with no logged-in sessions, instead of inheriting the captain's authenticated
+# browser. That function's comment owns the exact variables and why each is pinned.
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -661,6 +666,7 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+BROWSER_REFUSAL_ABORT_DIR=
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -681,6 +687,12 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
+  if [ -n "$BROWSER_REFUSAL_ABORT_DIR" ]; then
+    rm -rf "$BROWSER_REFUSAL_ABORT_DIR" 2>/dev/null || true
+    rmdir "$(dirname "$BROWSER_REFUSAL_ABORT_DIR")" 2>/dev/null || true
+    rmdir "$STATE/.browser-refusal" 2>/dev/null || true
+    BROWSER_REFUSAL_ABORT_DIR=
+  fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -1063,6 +1075,209 @@ shell_quote() {
   printf "'"
 }
 
+# AGENTS.md section 3 points every agent at chrome-devtools-axi for browser work
+# and crewmates run with permissions bypassed, so whatever browser that tool
+# reaches is inside the agent's blast radius. The tool's own default is already an
+# isolated throwaway profile - chrome-devtools-mcp --isolated --headless, a fresh
+# /tmp/puppeteer_dev_chrome_profile-* user-data-dir carrying no cookies - but a
+# default is not a guarantee, and two inherited paths reach the captain's real
+# authenticated Chrome without anyone editing firstmate: any CHROME_DEVTOOLS_AXI_*
+# value exported into the environment firstmate runs in is inherited by every
+# agent it launches, and the unnamed "default" session is a single shared bridge,
+# so an agent's first browser command attaches to whatever page the captain's own
+# interactive use of the tool left live on port 9224.
+# These assignments pin the isolating choice rather than relying on it. An empty
+# assignment is enough to neutralise the four profile inputs because the tool
+# reads each as falsy-when-empty, and AUTO_CONNECT is compared against the exact
+# string 1:
+#   AUTO_CONNECT=0     refuses --autoConnect, the attach-to-the-captain's-Chrome mode
+#   BROWSER_URL=       refuses --browserUrl/--wsEndpoint (and inerts WS_HEADERS with it)
+#   USER_DATA_DIR=     keeps --isolated, so the profile is a fresh temp dir per bridge
+#   CHROME_ARGS=       drops inherited --chrome-arg flags, which can carry their own
+#                      --user-data-dir and override the isolated one - measured to
+#                      beat --isolated in the launched browser, so neutralising
+#                      USER_DATA_DIR alone would leave this override open
+#   PORT=              lets each session keep its own derived port; a globally
+#                      exported PORT collapses every session onto one and the losing
+#                      bridge dies on EADDRINUSE (the tool's own help warns about this)
+#   SESSION=<name>     gives this task its own bridge, port, and browser, so it never
+#                      shares a live authenticated page with the captain or another
+#                      task, and so tearing one task down cannot kill another's bridge.
+#                      fm-pr-lib.sh's fm_task_browser_session owns that name, so
+#                      fm-teardown closes the same session this launch opened.
+#                      This one pin is the only CONDITIONAL half of the guarantee:
+#                      named sessions are a tool capability, and a chrome-devtools-axi
+#                      that lacks them ignores the variable and puts the agent back on
+#                      the shared "default" bridge while the launch still looks
+#                      isolated. fm-pr-lib.sh's fm_browser_tool_supports_named_sessions
+#                      probes for it - the same probe fm-teardown gates its stop on, so
+#                      the two sides of a task's browser lifecycle cannot disagree - and
+#                      write_browser_refusal_shim refuses the tool for that agent
+#                      instead, so the promise is never made without the capability
+# The tool's five remaining variables - CHANNEL, HEADED, MCP_PATH, WS_HEADERS and
+# BRIDGE_TIMEOUT_MS - are inherited unchanged, on purpose. None of them selects a
+# profile or a session, so the guarantee above is not weakened by leaving them
+# alone, but an exported MCP_PATH still redirects which MCP module the agent's
+# bridge runs and HEADED=1 still opens the agent's Chrome on the captain's
+# display. Each has a legitimate operator use - headed mode for visible
+# debugging, MCP_PATH for the tool's documented npx-bootstrap speedup - that
+# pinning would remove, and the boundary is stated here rather than left unsaid
+# because an unstated boundary reads as coverage.
+# docs/verification/browser-isolation.md is the dated evidence for every claim
+# above and names the guard that re-derives it.
+# Scoped to the launch command exactly like CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
+# below; the captain's own shell, config, and Chrome are untouched.
+# This removes AMBIENT reach, not capability: an agent holds a shell and can
+# export different values itself, and a tool that already reads and writes
+# arbitrary files cannot be contained by an environment variable. The guarantee
+# is that a firstmate-launched agent does not START inside the captain's session.
+# The five profile-and-port assignments are taken from fm-pr-lib.sh's
+# fm_browser_isolation_pins rather than restated here, because fm-teardown needs
+# the same list on the `stop` it aims at this session and the two scripts must
+# agree by construction rather than by coincidence - the same reason the session
+# name and the capability probe are owned there.
+browser_isolation_env() {
+  local pin
+  while IFS= read -r pin; do
+    printf '%s ' "$pin"
+  done < <(fm_browser_isolation_pins)
+  printf 'CHROME_DEVTOOLS_AXI_SESSION=%s' "$(shell_quote "$(fm_task_browser_session "$1")")"
+}
+
+# The refusal a launched agent meets when the installed chrome-devtools-axi cannot
+# give this task its own bridge. It shadows the tool on that agent's PATH rather
+# than failing the spawn, because most tasks never browse and none of them should
+# be blocked by a browser tool's version; the agent hits it only at the moment it
+# would otherwise have attached to the shared "default" bridge on port 9224, which
+# is the silent degradation this whole pin exists to remove. The message says what
+# is still enforced, because the profile half of the pin above still applies here
+# and an operator who reads "refused" would otherwise assume nothing is.
+# The directory holding this shim goes on that agent's PATH ahead of every system
+# directory, so its location is a security property rather than a filing decision
+# and it has to satisfy two things at once.
+#
+# It is TASK-SCOPED, at state/.browser-refusal/<id>/, because a directory shared
+# by every task in the home would let anything one agent drops there shadow an
+# arbitrary command - git, node, npx - for every later-launched agent that takes
+# this path; agents run same-uid with permissions bypassed, so per-task privacy
+# removes that surface by construction rather than by policing what lands in a
+# shared one.
+#
+# It lives under the home's own state dir rather than the task's /tmp temp root
+# because /tmp is world-writable and a task id is predictable and enumerable, so
+# on a shared host or a multi-tenant CI runner another local user could pre-create
+# the path and leave executables the agent resolves ahead of /usr/bin - the same
+# shadowing class, reintroduced across users instead of across tasks. The state
+# dir is not world-writable, and it also exists long before the first backend side
+# effect, which is what lets the caller abort cleanly (see the gate below).
+#
+# The directory that actually goes on PATH is MINTED FRESH for this one launch:
+# an unpredictably named mktemp -d inside the task-scoped parent, created
+# owner-only. Ownership and mode alone cannot carry this, because a pre-existing
+# directory that mkdir -p silently accepted looks identical to one this script
+# created - and firstmate agents all run as the same uid, so an agent could
+# otherwise pre-create the path for a task id not yet spawned, drop a git or a
+# node in it, and have the whole directory prepended to the next agent's PATH.
+# An unguessable name created exclusively cannot be the path someone else
+# prepared, and that is the whole of the freshness property: a stale sibling left
+# inside the task-scoped parent can never be the directory this launch mints, so
+# nothing here needs to remove one. The parent is neither reclaimed nor refused on
+# sight - refusing a predictable path that already exists would let any agent deny
+# a future task by creating it, and removing it would be worse still.
+#
+# NOTHING on this path may delete anything under the task-scoped parent. This gate
+# runs ABOVE the duplicate-launch guard that refuses a second spawn for a task
+# whose endpoint is still alive, so at this point the parent may belong to an agent
+# that is still running with a directory inside it on its PATH. Removing it would
+# silently drop that PATH entry and send the live agent's next browser call to the
+# shared default bridge on port 9224 - precisely the degradation this gate exists
+# to prevent. Accumulation is handled where task liveness is already established:
+# teardown reclaims the parent, and spawn_abort_cleanup removes only the one
+# directory this launch minted.
+#
+# Owner-only mode and the symlink rejection stay as cheap defence in depth, and a
+# directory that already exists with loose permissions is refused rather than
+# chmod-repaired, because tightening a mode does not remove what was planted while
+# it was open. A directory that cannot be vouched for refuses the launch, because
+# an unvouchable shim directory is worse than no shim.
+#
+# Where this bottoms out, stated plainly rather than implied: firstmate agents run
+# same-uid with permissions bypassed, so no directory permission scheme isolates
+# one agent from another, and a same-uid agent that goes looking can still find and
+# write this directory. Minting it fresh and unguessably raises the bar; it does
+# not close the class. That is the same claim the rest of this pin makes - it
+# removes AMBIENT reach, not capability - and the shim is not tamper-proof.
+#
+# Teardown removes the task-scoped parent with the task's other state records, and
+# spawn_abort_cleanup removes this launch's own minted directory when a spawn exits
+# before publishing a record, so a host with an older browser tool does not
+# accumulate one executable-bearing
+# directory per attempted id. The write goes through a temp file so a reader never
+# sees a half-written shim.
+browser_refusal_dir_vouched() {  # <dir>
+  local dir=$1 mode owner
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    return 1
+  fi
+  if [ "$(uname)" = Darwin ]; then
+    owner=$(stat -f %u "$dir" 2>/dev/null) || return 1
+  else
+    owner=$(stat -c %u "$dir" 2>/dev/null) || return 1
+  fi
+  [ "$owner" = "$(id -u)" ] || return 1
+  mode=$(fm_inherit_file_mode "$dir") || return 1
+  case "$mode" in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  [ "$(( 8#$mode & 022 ))" -eq 0 ] || return 1
+}
+
+browser_refusal_dir_prepare() {  # <dir>
+  local dir=$1
+  if [ -L "$dir" ]; then
+    return 1
+  fi
+  (umask 077 && mkdir -p "$dir") || return 1
+  browser_refusal_dir_vouched "$dir" || return 1
+}
+
+write_browser_refusal_shim() {  # <state-dir> <task-id> <reason>
+  local root="$1/.browser-refusal" task_root="$1/.browser-refusal/$2" dir tmp sq_reason
+  sq_reason=$(shell_quote "$3")
+  browser_refusal_dir_prepare "$root" || return 1
+  browser_refusal_dir_prepare "$task_root" || return 1
+  dir=$(umask 077 && mktemp -d "$task_root/XXXXXXXXXX") || return 1
+  browser_refusal_dir_vouched "$dir" || return 1
+  tmp="$dir/.chrome-devtools-axi.$$"
+  cat > "$tmp" <<SH || { rm -f "$tmp"; return 1; }
+#!/bin/sh
+# Generated by bin/fm-spawn.sh; edits are overwritten by the next spawn.
+printf '%s\n' \\
+  'chrome-devtools-axi: refused - firstmate cannot give this agent its own browser.' \\
+  '' \\
+  $sq_reason \\
+  '' \\
+  'Without a per-task named session every agent shares one bridge on port 9224' \\
+  'with the operator, so a page the operator authenticated would be readable from' \\
+  'here. firstmate refuses rather than degrade to that silently.' \\
+  '' \\
+  'Still enforced on this launch: CHROME_DEVTOOLS_AXI_AUTO_CONNECT=0 and empty' \\
+  'BROWSER_URL, USER_DATA_DIR, CHROME_ARGS and PORT, so a browser started from' \\
+  'this shell still gets a throwaway profile carrying none of the operator cookies.' \\
+  'Not enforced: a bridge private to this task.' \\
+  '' \\
+  'To fix: install a chrome-devtools-axi whose --help documents' \\
+  'CHROME_DEVTOOLS_AXI_SESSION, then respawn this task. See the' \\
+  '"Agent browser isolation" section of docs/configuration.md.' >&2
+exit 1
+SH
+  if ! chmod +x "$tmp" || ! mv -f "$tmp" "$dir/chrome-devtools-axi"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  printf '%s\n' "$dir"
+}
+
 resolve_pi_executable() {
   local candidate dir
   candidate=$(type -P -- "$1" 2>/dev/null) || return 1
@@ -1191,6 +1406,43 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+# Applied here, after every branch above has produced a LAUNCH, so the verified
+# adapters and the raw-command escape hatch are covered by one prefix that no new
+# launch template can forget. Every template is a simple command (some already
+# carrying their own env assignments or an `env -u ...` wrapper), so prepending
+# more assignments is always valid shell and always reaches the harness process
+# and the tool calls it runs.
+LAUNCH="$(browser_isolation_env "$ID") $LAUNCH"
+
+# The capability gate for the SESSION half of that pin. Only the per-task bridge
+# depends on the installed tool; the profile pins above stand on their own and are
+# left in place in every branch here. An absent chrome-devtools-axi is neither
+# capable nor incapable - there is nothing to refuse and nothing to run - so the
+# launch is left exactly as composed, and a capable tool likewise adds nothing.
+#
+# The guarantee this placement provides is a CLEAN ABORT: it runs before the
+# backend task window is created and before `treehouse get` acquires the worktree,
+# so a spawn that cannot install the refusal exits having created nothing the
+# fleet would have to reclaim. spawn_abort_cleanup does not reclaim a window or a
+# worktree, and no task meta exists yet for fm-teardown to work from, so an abort
+# sited after those steps would orphan both. The shim's directory lives in the
+# state dir precisely so it can be written this early.
+BROWSER_REFUSAL_REASON=
+if BROWSER_TOOL_BIN=$(type -P -- chrome-devtools-axi 2>/dev/null) && [ -x "$BROWSER_TOOL_BIN" ]; then
+  fm_browser_tool_supports_named_sessions "$BROWSER_TOOL_BIN" || case $? in
+    1) BROWSER_REFUSAL_REASON="The installed chrome-devtools-axi ($BROWSER_TOOL_BIN) does not support named sessions: its --help does not document CHROME_DEVTOOLS_AXI_SESSION, so it predates the per-task bridge firstmate requires." ;;
+    *) BROWSER_REFUSAL_REASON="firstmate could not confirm that the installed chrome-devtools-axi ($BROWSER_TOOL_BIN) supports named sessions: its --help failed, produced nothing, or did not finish within the probe's bound. That is unconfirmed rather than known-too-old." ;;
+  esac
+fi
+if [ -n "$BROWSER_REFUSAL_REASON" ]; then
+  BROWSER_REFUSAL_DIR=$(write_browser_refusal_shim "$STATE" "$ID" "$BROWSER_REFUSAL_REASON") || {
+    echo "error: could not write a browser-refusal shim firstmate can vouch for under $STATE/.browser-refusal/$ID; the installed chrome-devtools-axi cannot isolate this agent's browser and firstmate will not launch it without the refusal in place" >&2
+    exit 1
+  }
+  BROWSER_REFUSAL_ABORT_DIR="$BROWSER_REFUSAL_DIR"
+  LAUNCH="PATH=$(shell_quote "$BROWSER_REFUSAL_DIR"):\"\$PATH\" $LAUNCH"
+fi
 
 case "$HARNESS" in
   pi|pi-signed)
@@ -2639,6 +2891,9 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   fm_lock_release "$SPAWN_TASK_SET_LOCK"
 fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+# The record is published, so this task's refusal shim is now teardown's to
+# reclaim rather than the abort path's.
+BROWSER_REFUSAL_ABORT_DIR=
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

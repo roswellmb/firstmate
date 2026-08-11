@@ -154,6 +154,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-lock-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"  # fm_run_timed: stop_task_browser_bridge's bound
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-public-followup-lib.sh
@@ -1409,6 +1411,77 @@ reap_task_backend_process_group() {  # <label>
   fi
 }
 
+# Close the browser session fm-spawn gave this task (see that script's
+# browser_isolation_env). A chrome-devtools-axi bridge has no idle timeout, so a
+# task that browsed leaves a bridge, an MCP server, and a headless Chrome behind.
+# The cwd-matched reap below already collects all three in the ordinary case,
+# because each inherits the agent's working directory - but only while that
+# directory was this task's own worktree. An agent that browsed from anywhere
+# else would leak a whole browser, so name the session and let the tool close it.
+# fm-spawn pins a session for every task kind, including secondmate, and forced
+# secondmate cleanup retires that home's children without ever running the reap,
+# so this takes the id whose session to close rather than reading $ID: the task
+# being torn down by default, and each retired child on that path.
+# Purely additive: `stop` is a documented idempotent no-op when nothing is
+# running, and a missing tool, a failure, or a HANG never blocks teardown. The
+# last of those is why the stop is bounded by fm_run_timed with the same
+# FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS the capability probe uses, and takes its
+# stdin from /dev/null: an installed third-party executable is not a trusted
+# caller, and forced secondmate cleanup issues one stop per retired child, so a
+# single build that hangs or reads stdin would otherwise wedge the whole
+# retirement rather than one call.
+#
+# The profile-and-port pins come from fm-pr-lib.sh's fm_browser_isolation_pins,
+# the same list fm-spawn puts on the launch command, so the two sides agree by
+# construction. PORT is the one that matters here: the tool derives a named
+# session's port from the name only when CHROME_DEVTOOLS_AXI_PORT is unset, so
+# inheriting an exported one would aim this stop at a port that is not the task's
+# - leaving the leak this function exists to close, and firing at the shared port
+# instead.
+#
+# Gated on the SAME capability probe fm-spawn refuses on, because the session
+# name is only a target on a tool that has named sessions. One that does not
+# resolves any CHROME_DEVTOOLS_AXI_SESSION to the shared session named `default`,
+# which is the OPERATOR's own bridge, MCP server, and Chrome. The probe is owned
+# by fm-pr-lib.sh, which both scripts source, so the two sides of a task's
+# browser lifecycle ask one question rather than keep two copies in step.
+#
+# That verdict is re-derived here rather than carried over from the spawn that
+# pinned the session, so it can disagree with the spawn-time one: a downgraded
+# tool, or a probe that merely hit its bound on a loaded machine, both read as
+# not-capable for a task that really does own a private bridge. Skipping is still
+# right under that ambiguity, because the two mistakes are not symmetric. A stop
+# issued on an unconfirmed verdict can end the operator's own live browsing,
+# while skipping leaves at most one headless Chrome, and the cwd-matched reap
+# below still collects it whenever the agent browsed from its own worktree. The
+# honest residual is narrow and real: a task capable at spawn, which browsed from
+# somewhere other than its worktree, and whose teardown probe came back
+# unconfirmed, keeps its browser past teardown.
+#
+# The verdict is a property of the installed tool, not of a task, so it is
+# resolved once per teardown even when forced secondmate cleanup closes a session
+# for every retired child.
+BROWSER_BRIDGE_CAPABLE=
+stop_task_browser_bridge() {  # [task-id]
+  local id=${1:-$ID} executable pin
+  local -a pins=()
+  if [ -z "$BROWSER_BRIDGE_CAPABLE" ]; then
+    BROWSER_BRIDGE_CAPABLE=no
+    if executable=$(type -P -- chrome-devtools-axi 2>/dev/null) && [ -x "$executable" ]; then
+      if fm_browser_tool_supports_named_sessions "$executable"; then
+        BROWSER_BRIDGE_CAPABLE=yes
+      fi
+    fi
+  fi
+  [ "$BROWSER_BRIDGE_CAPABLE" = yes ] || return 0
+  while IFS= read -r pin; do
+    pins+=("$pin")
+  done < <(fm_browser_isolation_pins)
+  fm_run_timed "$FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS" \
+    env "${pins[@]}" "CHROME_DEVTOOLS_AXI_SESSION=$(fm_task_browser_session "$id")" \
+    chrome-devtools-axi stop >/dev/null 2>&1 </dev/null || true
+}
+
 # Reap every process rooted (by cwd) under this task's own worktree or tasktmp
 # - both unique per task and never shared - before either is removed. TERM
 # first, then KILL after a short grace period for anything still alive; a
@@ -2214,6 +2287,7 @@ cleanup_firstmate_home_children() {
         fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
       fi
     fi
+    stop_task_browser_bridge "$child_id"
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
@@ -2377,7 +2451,10 @@ fi
 # leaked process can own live work in this exact worktree. Not for
 # kind=secondmate: a secondmate home's own runtime lifecycle is owned by the
 # dedicated process-event and firstmate-home removal machinery further below,
-# not by task-worktree cleanup.
+# not by task-worktree cleanup. The browser session is the exception: it is
+# named after the task rather than rooted in the worktree, and fm-spawn pins one
+# for every kind, so it is closed here for every kind.
+stop_task_browser_bridge
 if [ "$KIND" != secondmate ]; then
   conclude_task_no_mistakes_run "$WT"
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
@@ -2531,6 +2608,12 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+# Remove this task's browser-refusal shim directory, written by fm-spawn only when
+# the installed chrome-devtools-axi could not be confirmed capable of named
+# sessions. The id is path-safe by the validation at the top of this script. The
+# shared parent is removed only when the last task's directory leaves it empty.
+rm -rf "$STATE/.browser-refusal/$ID"
+rmdir "$STATE/.browser-refusal" 2>/dev/null || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \

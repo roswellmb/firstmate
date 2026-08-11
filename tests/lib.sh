@@ -152,9 +152,56 @@ fm_test_reap_orphans
 # whose installed version bootstrap gates, so a fixture cannot be reported as an
 # unparseable build simply for answering `--version` with nothing.
 
+# fm_fake_browser_tool <fakebin> [named-sessions|no-named-sessions]
+# An inert stand-in for chrome-devtools-axi. Both fm-spawn and fm-teardown ask the
+# installed one whether it supports named sessions, so without a stub every
+# fixture that drives either would reach whatever real browser tool the developer
+# running the suite happens to have, and teardown would go on to ask it to stop a
+# session. The default answers that probe the way a current build does, which is
+# what CI's tool-absent path and a current developer install already produce, so
+# a fixture's behaviour does not depend on the host. Every other invocation exits
+# 0 silently; a test that needs to observe the calls installs its own stub over
+# this one.
+fm_fake_browser_tool() {
+  local fakebin=$1 mode=${2:-named-sessions} session_line=
+  if [ "$mode" = named-sessions ]; then
+    session_line="  CHROME_DEVTOOLS_AXI_SESSION  Named session for concurrent isolation"
+  fi
+  cat > "$fakebin/chrome-devtools-axi" <<SH
+#!/usr/bin/env bash
+set -u
+if [ "\${1:-}" = --help ]; then
+  printf '%s\n' 'environment:' '  CHROME_DEVTOOLS_AXI_PORT     Bridge port'${session_line:+" '$session_line'"}
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/chrome-devtools-axi"
+}
+
+# fm_browser_isolation_launch_prefix <task-id>
+# The exact environment prefix fm-spawn prepends to EVERY launch command. Suites
+# that pin a whole launch string exactly compose it from here so they keep
+# asserting their own harness half exactly instead of loosening into a substring
+# match. It is restated as a literal rather than read back from
+# bin/fm-pr-lib.sh's fm_browser_isolation_pins on purpose: a test that derives
+# the expected value from the code under test would assert nothing. It lives here
+# rather than in one suite because the prefix is on every launch, so every suite
+# that pins one needs it, and a second copy is a second thing to forget - which
+# is exactly how tests/fm-kimi-harness.test.sh went stale.
+# tests/fm-spawn-browser-isolation.test.sh owns the contract this mirrors, and is
+# where a change to the pinned variables must be proven.
+fm_browser_isolation_launch_prefix() {
+  local id=$1
+  printf '%s' "CHROME_DEVTOOLS_AXI_AUTO_CONNECT=0 CHROME_DEVTOOLS_AXI_BROWSER_URL= "
+  printf '%s' "CHROME_DEVTOOLS_AXI_USER_DATA_DIR= CHROME_DEVTOOLS_AXI_CHROME_ARGS= "
+  printf '%s' "CHROME_DEVTOOLS_AXI_PORT= CHROME_DEVTOOLS_AXI_SESSION='fm-$id'"
+}
+
 fm_fakebin() {
   local dir=$1 fakebin="$1/fakebin"
   mkdir -p "$fakebin"
+  fm_fake_browser_tool "$fakebin"
   printf '%s\n' "$fakebin"
 }
 

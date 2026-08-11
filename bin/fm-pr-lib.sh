@@ -16,6 +16,12 @@
 # after its durable wake is appended.
 # The receipt binds the terminal observation to the canonical registration and
 # lets a restart finish fixed-path removal without executing state-file bytes.
+#
+# fm_browser_tool_supports_named_sessions below probes an installed third-party
+# executable, so it needs the repo's single owner of bounded execution rather
+# than an unbounded call that could wedge a spawn or a teardown.
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-timeout-lib.sh"
 
 FM_PR_PROVIDER=
 FM_PR_URL=
@@ -107,6 +113,135 @@ fm_task_id_creation_valid() {
   local id=${1-}
   fm_pr_task_id_valid "$id" || return 1
   [ "${#id}" -le 64 ]
+}
+
+# The chrome-devtools-axi session name for a task's own browser, so the agent
+# never shares a live authenticated page with the captain or another task.
+# fm-spawn pins it onto the launch command (see its browser_isolation_env) and
+# fm-teardown closes that session by name, so the derivation lives here, beside
+# the task-id validators it depends on, rather than in either script.
+#
+# The tool rejects a session name outside 1-64 chars of [A-Za-z0-9._-], and that
+# rejection breaks every browser command for the agent that inherits it, so this
+# must be TOTAL over ids fm_task_id_creation_valid already accepted: that exact
+# charset, no leading dot, at most 64 chars. The "fm-" prefix is the only thing
+# that can push a name out of range, and it is also what keeps firstmate's
+# bridges distinguishable from a session the captain named by hand under
+# ~/.chrome-devtools-axi/sessions/ and what guarantees the name is neither empty
+# nor all-dots.
+#
+# It must also be INJECTIVE, because this name is the only handle teardown has:
+# two ids mapping to one name would put two live tasks on one bridge, and tearing
+# either of them down would close the other's bridge and its headless Chrome
+# mid-work. Plain truncation is not injective - any two ids sharing a 61-char
+# prefix land on one name - so an id too long to carry whole is truncated and the
+# WHOLE id is folded into a digest suffix rather than having its tail dropped.
+# The two forms are separated by LENGTH, not by any marker character: every
+# character this charset allows can also occur inside an id, so no separator can
+# be reserved, but the pass-through form is at most 63 chars and the hashed form
+# is always exactly 64, so no truncated id can ever land on an untruncated one's
+# name. The derivation reads nothing but the id, so a teardown days after the
+# spawn re-derives the identical name.
+fm_task_browser_session() {  # <task-id>
+  local id=${1-}
+  if [ "${#id}" -le 60 ]; then
+    printf 'fm-%s' "$id"
+    return 0
+  fi
+  printf 'fm-%s-%s' "${id:0:44}" "$(fm_task_browser_session_digest "$id")"
+}
+
+# Exactly 16 hex characters over the whole task id, which is what makes the
+# truncated form above a fixed 64 chars and therefore length-separable from the
+# pass-through form. The shasum/sha256sum cascade follows
+# bin/fm-backend-hometag-lib.sh; the cksum tail is the same last resort for a
+# host carrying neither, padded to the same width so the length invariant holds
+# there too, at the cost of far weaker collision resistance.
+fm_task_browser_session_digest() {  # <task-id>
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{printf "%s", substr($1,1,16)}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{printf "%s", substr($1,1,16)}'
+  else
+    printf '%s' "$1" | cksum | awk '{printf "%08x%08x", $1, $2}'
+  fi
+}
+
+# The chrome-devtools-axi environment pins that make an invocation resolve to a
+# task's own bridge and a throwaway profile instead of to whatever the operator
+# exported. Owned here because BOTH sides of a task's browser lifecycle need the
+# same list: fm-spawn's browser_isolation_env prepends these to the launch
+# command - that function's comment owns why each one is pinned - and fm-teardown
+# prefixes them onto the `stop` it aims at the task's session.
+#
+# For teardown that is correctness, not tidiness. The tool derives a named
+# session's port from the name only when CHROME_DEVTOOLS_AXI_PORT is unset, so an
+# operator who exports it makes the stop target a port that is not the task's:
+# the task's own bridge and headless Chrome survive, and the stop lands on the
+# shared port the capability gate exists to keep firstmate away from.
+#
+# Emitted one NAME=VALUE assignment per line. Every value is a literal with no
+# shell metacharacters, so a caller may place them verbatim in a command line.
+# CHROME_DEVTOOLS_AXI_SESSION is not here: it is per-task, and fm_task_browser_session
+# above owns it.
+fm_browser_isolation_pins() {
+  printf '%s\n' \
+    'CHROME_DEVTOOLS_AXI_AUTO_CONNECT=0' \
+    'CHROME_DEVTOOLS_AXI_BROWSER_URL=' \
+    'CHROME_DEVTOOLS_AXI_USER_DATA_DIR=' \
+    'CHROME_DEVTOOLS_AXI_CHROME_ARGS=' \
+    'CHROME_DEVTOOLS_AXI_PORT='
+}
+
+# Seconds allowed for the capability probe below. An installed third-party
+# executable is not a trusted caller: a build that blocks on stdin or hangs would
+# otherwise wedge every spawn and every teardown with no diagnosis, where the
+# unconfirmed outcome is already the right answer for it.
+#
+# A non-positive bound is not a bound: `timeout 0` and the perl fallback's
+# `alarm 0` both disable the deadline, so an unvalidated override would restore
+# exactly the unbounded hang this bound exists to remove, and a non-numeric one
+# would fail the runner itself and silently degrade every spawn to the refusal
+# shim. bin/fm-timeout-lib.sh's header makes rejecting both the caller's job.
+# This is a sourced library rather than an entry point, so it falls back to the
+# default the way bin/fm-vendor-auth-probe.sh does instead of exiting the way
+# bin/fm-stow-cascade.sh does.
+FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS=${FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS:-10}
+case "$FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS" in
+  ''|*[!0-9]*|0*) FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS=10 ;;
+esac
+
+# Whether the installed chrome-devtools-axi can give a task its own bridge, which
+# is what makes fm_task_browser_session above a real isolation boundary rather
+# than a name the tool ignores. A tool without named sessions resolves any
+# CHROME_DEVTOOLS_AXI_SESSION - set, unset, or unsupported - to the shared
+# session named `default` on port 9224, which is the operator's own.
+#
+# Both sides of a task's browser lifecycle ask this same question and must not be
+# able to answer it differently, so it is owned here beside the session name they
+# share rather than in either script: fm-spawn refuses the tool for an agent it
+# cannot isolate, and fm-teardown skips the stop it would otherwise resolve onto
+# the operator's default bridge.
+#
+# The tool's CLI surface is version-dependent, so probe the resolved executable's
+# own help rather than asserting a version floor. --help lists the tool's
+# documented environment and neither launches a browser nor starts a bridge, the
+# same reason fm-spawn's pi_supports_tui_mode probes that way. Three outcomes,
+# because "could not confirm" must never be read as capable:
+#   0  the help documents CHROME_DEVTOOLS_AXI_SESSION - a per-task bridge is real
+#   1  the help ran and does not document it - the tool predates named sessions
+#   2  the help could not be read at all, including a probe that hit its bound -
+#      unconfirmed, which is a different diagnosis from too-old and is reported
+#      to the operator as one
+# stdin comes from /dev/null so a build that reads it cannot block on a caller's
+# terminal, and the bound covers everything else.
+fm_browser_tool_supports_named_sessions() {  # <executable>
+  local executable=${1-} help
+  [ -n "$executable" ] || return 2
+  help=$(fm_run_timed "$FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS" \
+    "$executable" --help 2>&1 </dev/null) || return 2
+  [ -n "$help" ] || return 2
+  printf '%s\n' "$help" | grep -q 'CHROME_DEVTOOLS_AXI_SESSION' || return 1
 }
 
 # GitLab serves self-hosted instances, so the host is part of the identity

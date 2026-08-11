@@ -180,6 +180,7 @@ family_for_basename() {
       printf '%s\n' session-bootstrap
       ;;
     fm-afk-pi-herdr-return-e2e.test.sh|\
+    fm-browser-isolation-live-e2e.test.sh|\
     fm-cmux-claude-composer-live-e2e.test.sh|\
     fm-composer-matrix-live-e2e.test.sh|\
     fm-codex-continuity-live-e2e.test.sh|fm-grok-continuity-live-e2e.test.sh|\
@@ -195,7 +196,7 @@ family_for_basename() {
     fm-tmux-agent-liveness.test.sh|\
     fm-control.test.sh|fm-control-relaunch.test.sh|\
     fm-herdr-session-cleanup.test.sh|fm-send-resolve-key.test.sh|fm-send-strict.test.sh|fm-spawn-batch.test.sh|\
-    fm-spawn-dispatch-profile.test.sh|\
+    fm-spawn-browser-isolation.test.sh|fm-spawn-dispatch-profile.test.sh|\
     fm-trace-context-spawn.test.sh|fm-spawn-worktree-settle.test.sh|\
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
@@ -915,12 +916,27 @@ families_for_changed_path() {
       ;;
     bin/fm-timeout-lib.sh)
       # The shared hard bound: session start's runtime bound, the fleet/bearings
-      # snapshots, the vendor auth probe, and the stow cascade's per-home step
-      # all depend on it.
+      # snapshots, the vendor auth probe, the stow cascade's per-home step, and
+      # fm-pr-lib's browser-tool capability probe all depend on it. That last one
+      # runs on every spawn and every teardown, which is why this reaches the two
+      # families below as well.
       printf '%s\n' session-bootstrap
       printf '%s\n' snapshot-bearings
       printf '%s\n' pure-contract-unit
       printf '%s\n' secondmate
+      printf '%s\n' pr-forge
+      printf '%s\n' backend-dispatch
+      ;;
+    bin/fm-pr-lib.sh)
+      # fm-pr-lib also owns fm_task_browser_session, fm_browser_isolation_pins and
+      # the browser-tool capability probe - the name fm-spawn pins onto every
+      # launch command and fm-teardown closes, the environment both put on their
+      # chrome-devtools-axi invocations, and the single verdict both gate on - so a
+      # change to any of them has to re-run the spawn-side pin test
+      # (backend-dispatch) alongside the pr-forge family that covers the teardown
+      # side.
+      printf '%s\n' pr-forge
+      printf '%s\n' backend-dispatch
       ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
@@ -941,7 +957,17 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       printf '%s\n' live-harness-optin
       ;;
-    bin/fm-spawn.sh|bin/fm-send.sh|bin/fm-harness.sh|\
+    bin/fm-spawn.sh)
+      # fm-spawn also composes the browser-isolation environment, whose verdict
+      # depends on the installed chrome-devtools-axi and on how each real harness
+      # hands its environment to the agent's shell, so a change here re-selects
+      # the live guard (fm-browser-isolation-live-e2e) alongside the portable
+      # families.
+      printf '%s\n' backend-dispatch
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-send.sh|bin/fm-harness.sh|\
     bin/fm-peek.sh|bin/fm-composer*)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit

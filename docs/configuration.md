@@ -344,6 +344,32 @@ The locked bootstrap inheritance pass uses the same placement-specific behavior;
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
+## Agent browser isolation
+
+Agents firstmate launches use `chrome-devtools-axi` in their own throwaway Chrome profile, holding no logged-in sessions, on a bridge named after the task where the installed tool can provide one.
+Your own browsing and your own use of the tool are untouched.
+So an agent cannot reach a site you are signed in to, and a task that genuinely needs an authenticated page has to sign in itself within its own profile.
+Every launch pins the six values that select the browser profile and the bridge - `CHROME_DEVTOOLS_AXI_AUTO_CONNECT`, `_BROWSER_URL`, `_USER_DATA_DIR`, `_CHROME_ARGS`, `_PORT`, and `_SESSION` - so exporting any of those in your own shell does not change what a launched agent gets.
+The tool's five other variables are deliberately not pinned, and an agent still inherits whatever you exported: `_MCP_PATH` still redirects which MCP module the agent's bridge runs, `_HEADED=1` still opens the agent's Chrome on your display, and `_CHANNEL`, `_WS_HEADERS`, and `_BRIDGE_TIMEOUT_MS` are inherited the same way.
+None of those five reaches an authenticated profile, so the isolation above is unchanged by them; they are left alone because each has a legitimate use, such as headed mode for visible debugging.
+
+The per-task bridge is the one part of this that depends on your installed `chrome-devtools-axi`: it needs the named-session support the tool documents as `CHROME_DEVTOOLS_AXI_SESSION`, and firstmate checks for it by reading the tool's own `--help`.
+When it cannot confirm that support - the tool is older, or its help cannot be read - the launched agent instead gets a `chrome-devtools-axi` that refuses to run and explains what is missing, rather than quietly falling back to the shared `default` bridge on port 9224 that your own use of the tool sits on.
+The throwaway-profile pins still hold in that case, so any browser the agent does start still carries none of your cookies; only the private bridge is withheld, and the refusal message says exactly that.
+That refusing shim goes into a directory minted fresh for that one launch, under `state/.browser-refusal/<id>/`, and that directory is what the launch puts on the agent's `PATH`.
+Keeping it inside the home's state dir rather than under world-writable `/tmp` means no other user on the machine can plant a directory there first, and giving it an unpredictable name created fresh each time means the path an agent gets is never one that was prepared in advance.
+firstmate creates it owner-only and checks it is a real directory owned by you and not group- or other-writable before putting it on any agent's `PATH`; if it cannot establish that, the spawn refuses rather than launch with a shim directory it cannot vouch for.
+This raises the bar rather than making the shim tamper-proof: firstmate agents all run as you with permissions bypassed, so no directory permissions separate one agent from another, and the guarantee here is the same one the rest of this section makes - it removes what an agent reaches by default, not what it is capable of.
+That refusal happens before the task window or worktree exists, so nothing is left behind to clean up; a spawn that fails later removes the directory on its way out, and tearing the task down removes it with the task's other state records.
+Apart from that unvouchable directory, spawning succeeds whether the tool is capable or not - the browser tool's version never blocks a task - and a task that never opens a browser is unaffected.
+If `chrome-devtools-axi` is not installed at all there is nothing to refuse and nothing changes.
+
+Tearing a task down closes that task's own bridge by name, since a bridge has no idle timeout and would otherwise outlive the agent along with its headless Chrome.
+That close is gated on the same check, so where the per-task bridge was refused firstmate closes nothing rather than issue a stop that a tool without named sessions would resolve onto the shared `default` bridge your own browsing sits on.
+
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh)'s `browser_isolation_env` owns why each value is pinned, and [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh) owns the three things both spawn and teardown have to agree on: `fm_browser_isolation_pins` (the pinned list itself), `fm_task_browser_session` (the per-task session name), and `fm_browser_tool_supports_named_sessions` (the capability check both gate on).
+[`docs/verification/browser-isolation.md`](verification/browser-isolation.md) holds the dated evidence and the guard that re-derives it.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
@@ -546,6 +572,7 @@ FM_PROCEVENT_CLAIM_ROOT=                # machine-wide source claim root; defaul
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_TEARDOWN_NM_TIMEOUT=10    # seconds allowed per no-mistakes query or abort inside fm-teardown.sh
+FM_BROWSER_TOOL_PROBE_TIMEOUT_SECS=10   # seconds allowed for the chrome-devtools-axi named-session capability probe that every spawn and teardown runs; any value that is not a positive whole number of seconds uses 10 (see "Agent browser isolation")
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
 FMX_PAIRING_TOKEN=      # Relay pairing token; .env opt-in authorizes replies and eligible lifecycle actions
