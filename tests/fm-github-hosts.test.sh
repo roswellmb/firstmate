@@ -11,7 +11,6 @@ set -u
 
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
 PR_POLL="$ROOT/bin/fm-pr-poll.sh"
-BOOTSTRAP="$ROOT/bin/fm-bootstrap.sh"
 TMP_ROOT=$(fm_test_tmproot fm-github-hosts)
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 
@@ -46,7 +45,7 @@ test_ghe_host_listed() {
   # File resolves from FM_HOME when FM_PR_GHE_HOSTS_FILE is unset
   mkdir -p "$dir/home/config"
   printf 'github.mpi-internal.com\n' > "$dir/home/config/github-hosts"
-  FM_HOME="$dir/home" FM_PR_GHE_HOSTS_FILE= fm_pr_ghe_host_listed github.mpi-internal.com \
+  FM_HOME="$dir/home" FM_PR_GHE_HOSTS_FILE='' fm_pr_ghe_host_listed github.mpi-internal.com \
     || fail "ghe_host_listed could not resolve host via FM_HOME"
 
   pass "fm_pr_ghe_host_listed correctly gates on file presence and hostname match"
