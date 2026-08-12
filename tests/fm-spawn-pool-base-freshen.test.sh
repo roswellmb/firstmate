@@ -6,6 +6,9 @@
 # These tests drive the real spawn path with a fake terminal, then prove it
 # starts the worker from the fetched origin/main tip or stops when origin is
 # unreachable.
+# They also cover the project that has no origin at all, the normal shape of a
+# local-only project, which must launch from its current local base instead of
+# being refused for a staleness it cannot have.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -65,6 +68,33 @@ make_case() {
   git -C "$publisher" push --quiet origin "$default"
 
   printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|$default"
+}
+
+# A local-only project normally has no origin at all - AGENTS.md section 7 states
+# local-only "may have no remote" - and make_case's fixture always builds one.
+# This builds the remote-less shape instead, so the refresh path is exercised
+# against a project that has nothing to be stale against.
+make_remoteless_case() {  # <name> <id>
+  local name=$1 id=$2 case_dir home project pool fakebin initial
+  case_dir="$TMP_ROOT/$name"
+  home="$case_dir/home"
+  project="$case_dir/project"
+  pool="$case_dir/pool"
+  fakebin=$(make_spawn_fakebin "$case_dir/fake")
+
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
+  printf 'codex\n' > "$home/config/crew-harness"
+  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  touch "$home/state/.last-watcher-beat"
+
+  git init --quiet -b main "$project"
+  printf 'base\n' > "$project/README.md"
+  git -C "$project" add README.md
+  git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+  initial=$(git -C "$project" rev-parse HEAD)
+  git -C "$project" worktree add --quiet --detach "$pool" "$initial"
+
+  printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|main"
 }
 
 read_case_record() {
@@ -227,11 +257,70 @@ test_unresolved_remote_default_refuses_pool() {
   pass "an unresolved remote default branch refuses the pooled worktree"
 }
 
+test_remoteless_project_spawns_and_keeps_local_work() {
+  local rec id out status before contract
+  for contract in local-only scout; do
+    id="pool-no-remote-${contract}-r6"
+    rec=$(make_remoteless_case "no-remote-$contract" "$id")
+    read_case_record "$rec"
+    [ -z "$(git -C "$POOL_DIR" remote)" ] \
+      || fail "fixture did not prove the $contract project has no remote"
+    before=$(git -C "$POOL_DIR" rev-parse HEAD)
+    printf 'keep this local work\n' > "$POOL_DIR/uncommitted.txt"
+
+    if [ "$contract" = scout ]; then
+      out=$(run_spawn "$id" --scout)
+    else
+      out=$(run_spawn "$id" --mode local-only --yolo off)
+    fi
+    status=$?
+    expect_code 0 "$status" "a $contract spawn into a remote-less project should not be refused"
+    assert_contains "$out" "spawned $id" "$contract spawn did not report success without an origin"
+    [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+      || fail "$contract spawn moved the pooled worktree of a remote-less project"
+    assert_grep 'keep this local work' "$POOL_DIR/uncommitted.txt" \
+      "$contract spawn discarded local work in a remote-less project"
+
+    git -C "$POOL_DIR" checkout --quiet -b "fm/$id"
+    assert_grep 'base' "$POOL_DIR/README.md" \
+      "the branch created after a remote-less $contract spawn lost the project base"
+    if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+      printf '# observed remote-less %s spawn: %s\n' "$contract" "$(printf '%s\n' "$out" | tail -n 1)"
+    fi
+  done
+  pass "a project with no origin spawns from its current local base without a refresh"
+}
+
+# The pair that matters: absence of an origin is what skips the refresh, not the
+# fetch failing. This drives one fixture both ways, so a fix that merely
+# downgraded the unreachable-origin refusal into a warning would fail here even
+# though test_unreachable_origin_refuses_stale_pool_base uses its own fixture.
+test_broken_origin_on_a_local_project_still_refuses() {
+  local rec id out status before
+  id='pool-no-remote-then-broken-r6'
+  rec=$(make_remoteless_case no-remote-then-broken "$id")
+  read_case_record "$rec"
+  git -C "$POOL_DIR" remote add origin "file://$CASE_DIR/missing-origin.git"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] \
+    || fail "spawn succeeded once the same project gained an unreachable origin"
+  assert_contains "$out" "could not fetch origin" \
+    "spawn did not refuse an unreachable origin on an otherwise local project"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD while refusing an unreachable origin"
+  pass "adding an unreachable origin to the same project restores the stale-base refusal"
+}
+
 test_stale_pool_base_refreshes_before_branching
 test_non_main_default_branch_refreshes_before_branching
 test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool
 test_unreachable_origin_refuses_stale_pool_base
+test_remoteless_project_spawns_and_keeps_local_work
+test_broken_origin_on_a_local_project_still_refuses
 
 echo "# all fm-spawn-pool-base-freshen tests passed"

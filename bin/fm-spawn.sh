@@ -1937,8 +1937,19 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+# Refresh a pooled worktree to origin's current default-branch tip before the
+# crew branches off it. A project with no origin at all - the normal shape of a
+# local-only project, which AGENTS.md section 7 states "may have no remote" - has
+# nothing to be stale against, so it skips the refresh entirely rather than
+# failing every spawn into it. The probe is a local-config read, so a project
+# that HAS an origin it cannot reach still falls through to the refusal below:
+# that one is a genuinely unverifiable base, not an absent one.
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
+  if ! git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
+    echo "notice: project for pooled worktree '$worktree' has no origin remote; launching from its current local base without a refresh" >&2
+    return 0
+  fi
   if ! git -C "$worktree" fetch --quiet origin; then
     echo "error: could not fetch origin for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1
