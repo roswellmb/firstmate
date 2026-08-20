@@ -374,13 +374,20 @@ fi
 SH
   chmod +x "$WORLD/fakebin/fm-crew-state.sh"
 
+  # Both scans have to do real work inside their budget: reaching one child and
+  # reconciling it costs a whole process startup, the scan lock, the state read
+  # and a durable wake enqueue - about a second on an idle machine. A budget of
+  # exactly one second therefore races its own overhead, and on a loaded runner
+  # the resuming scan spends the lot before it can report child b. Budget both
+  # scans above that fixed cost; the bound still proves itself because it cuts
+  # the 30s stall short by an order of magnitude.
   started=$(date +%s)
-  FM_INACTIVE_RECONCILE_BUDGET_SECS=1 run_reconcile "$MAIN" --startup
+  FM_INACTIVE_RECONCILE_BUDGET_SECS=3 run_reconcile "$MAIN" --startup
   elapsed=$(( $(date +%s) - started ))
-  [ "$elapsed" -le 3 ] || fail "stalled state read exceeded aggregate scan budget (${elapsed}s)"
+  [ "$elapsed" -le 10 ] || fail "stalled state read exceeded aggregate scan budget (${elapsed}s)"
 
   write_child "$MAIN" b 'done: green'
-  FM_INACTIVE_RECONCILE_BUDGET_SECS=1 run_reconcile "$MAIN" --startup
+  FM_INACTIVE_RECONCILE_BUDGET_SECS=5 run_reconcile "$MAIN" --startup
   grep -Fq 'child=b state=done' "$MAIN/state/.wake-queue" \
     || fail "next bounded scan did not resume with the following child"
   pass "stalled state reads are bounded without starving later children"
