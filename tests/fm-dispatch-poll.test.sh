@@ -3,10 +3,11 @@
 #
 # The check exists so that work becoming dispatchable WAKES firstmate instead of
 # waiting to be noticed. These cases pin the three things that make that signal
-# worth reading: it is silent when nothing is dispatchable, it never repeats an
-# unchanged ready set, and it REPORTS rather than goes silent when it cannot
-# establish an answer. That last one is the whole value of the check: silence
-# must mean "nothing is ready", never "I could not tell".
+# worth reading: it is silent when nothing is dispatchable, it speaks ONLY when
+# something actionable appeared (bin/fm-dispatch-poll.sh owns that definition -
+# a gain in the dispatchable-and-briefed set), and it REPORTS rather than goes
+# silent when it cannot establish an answer. That last one is the whole value of
+# the check: silence must mean "nothing is ready", never "I could not tell".
 #
 # tasks-axi owns backlog state (blocks, holds, date gates), so the cases that
 # need a real dispatchable set use the real tool and skip without it. The
@@ -148,8 +149,10 @@ test_blocked_and_gated_work_is_not_dispatchable() {
   tasks-axi hold lapsed --reason "gate has passed" --kind external \
     --until 2000-01-01 --file "$DATA/backlog.md" >/dev/null 2>&1 \
     || fail "fixture: could not hold lapsed"
+  give_brief leader
+  give_brief lapsed
   scan >/dev/null
-  assert_contains "$SCAN_OUT" "2 dispatchable" \
+  assert_contains "$SCAN_OUT" "2 dispatchable in all" \
     "blocked work or an active date gate was counted as dispatchable"
   assert_not_contains "$SCAN_OUT" "follower" "a blocked task was reported dispatchable"
   assert_not_contains "$SCAN_OUT" "waiting" "a task held behind a future date was reported dispatchable"
@@ -162,20 +165,29 @@ test_work_already_under_way_is_not_dispatchable() {
   make_home underway
   add_task queued-one "genuinely waiting"
   add_task running-one "already has a worker"
+  give_brief queued-one
   fm_write_meta "$STATE/running-one.meta" "window=fm:1" "kind=ship" "harness=claude"
   scan >/dev/null
-  assert_contains "$SCAN_OUT" "1 dispatchable" \
+  assert_contains "$SCAN_OUT" "1 dispatchable in all" \
     "a task that already has a live worker was counted as dispatchable"
   assert_contains "$SCAN_OUT" "queued-one" "the genuinely waiting task was not reported"
   pass "work that already has a worker is not reported as dispatchable"
 }
 
-# --- it must not repeat itself ----------------------------------------------
+# --- only an ACTIONABLE change speaks ---------------------------------------
+#
+# bin/fm-dispatch-poll.sh owns the definition: a ready verdict is actionable
+# only when the dispatchable-AND-BRIEFED set GAINED a member, because that is
+# the only movement that leaves firstmate something it can spawn right now.
+# These cases drive that from both sides - what must speak, and what must stay
+# quiet - because a check that speaks with nothing to act on trains its reader
+# to ignore it, which costs more than the signal was ever worth.
 
 test_unchanged_ready_set_does_not_repeat() {
   have_tasks_axi || { skip_case no-repeat "tasks-axi not found"; return 0; }
   make_home norepeat
   add_task alpha "first"
+  give_brief alpha
   RESURFACE_SECS=0 scan >/dev/null
   [ "$(wakes)" = 1 ] || fail "first scan did not queue a wake"
   RESURFACE_SECS=0 scan >/dev/null
@@ -185,36 +197,126 @@ test_unchanged_ready_set_does_not_repeat() {
   pass "an unchanged ready set never wakes anyone twice"
 }
 
-test_changed_ready_set_wakes_again() {
-  have_tasks_axi || { skip_case changed-set "tasks-axi not found"; return 0; }
-  make_home changed
-  add_task alpha "first"
-  scan >/dev/null
-  [ "$(wakes)" = 1 ] || fail "first scan did not queue a wake"
-  add_task beta "newly filed"
-  scan >/dev/null
-  assert_contains "$SCAN_OUT" "2 dispatchable" "a newly ready task did not re-surface"
-  [ "$(wakes)" = 2 ] || fail "a changed ready set did not queue a second wake"
-  pass "a changed ready set wakes again"
-}
-
-test_acquiring_a_brief_changes_the_signal() {
-  have_tasks_axi || { skip_case brief-changes-signal "tasks-axi not found"; return 0; }
-  make_home briefchange
-  add_task alpha "first"
-  scan >/dev/null
-  assert_contains "$SCAN_OUT" "needs intake: alpha" "the unbriefed task was not reported as needing intake"
+# The live 2026-08-20 case, end to end. One briefed task sitting among a large
+# standing intake queue wakes firstmate; firstmate dispatches it; the total
+# drops by one and there is nothing left to act on. The first event is the
+# signal. The second is the cry-wolf, and it must be silent.
+test_dispatching_the_only_briefed_task_is_silent() {
+  have_tasks_axi || { skip_case dispatch-then-silent "tasks-axi not found"; return 0; }
+  make_home dispatchsilent
+  add_task alpha "the one with instructions"
+  add_task beta "still needs intake"
+  add_task gamma "still needs intake too"
   give_brief alpha
   scan >/dev/null
-  assert_contains "$SCAN_OUT" "briefed: alpha" "a task acquiring a brief did not re-surface as briefed"
-  [ "$(wakes)" = 2 ] || fail "a task acquiring a brief did not queue a second wake"
-  pass "a task acquiring a brief is itself a change worth waking for"
+  assert_contains "$SCAN_OUT" "newly briefed and ready to dispatch: alpha" \
+    "the one dispatchable briefed task was not named as the actionable change"
+  assert_contains "$SCAN_OUT" "3 dispatchable in all (1 briefed, 2 need intake)" \
+    "the ready verdict lost the standing queue it sits in"
+  [ "$(wakes)" = 1 ] || fail "the first briefed task did not queue exactly one wake"
+
+  tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not start alpha"
+  scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "dispatching the only briefed task woke firstmate again: $SCAN_OUT"
+  [ "$(wakes)" = 1 ] || fail "dispatching the only briefed task queued a second wake"
+  pass "dispatching the only briefed task is silent, because nothing new became actionable"
 }
 
-test_ready_set_returning_after_going_empty_wakes_again() {
+# A queue nobody has intaken is a standing condition, not news. It stays silent
+# however large it grows, and however often the total moves.
+test_an_unbriefed_queue_never_wakes_on_its_own() {
+  have_tasks_axi || { skip_case unbriefed-queue "tasks-axi not found"; return 0; }
+  make_home unbriefedqueue
+  local i
+  for i in 1 2 3; do
+    add_task "queued-$i" "queued item $i"
+    scan >/dev/null
+    [ -z "$SCAN_OUT" ] || fail "an unbriefed ready task woke firstmate: $SCAN_OUT"
+  done
+  [ "$(wakes)" = 0 ] || fail "a queue of unbriefed ready work queued a wake"
+  pass "a ready queue that nobody has intaken never wakes on its own"
+}
+
+test_a_task_arriving_without_a_brief_is_not_a_wake() {
+  have_tasks_axi || { skip_case intake-arrival-silent "tasks-axi not found"; return 0; }
+  make_home intakearrival
+  add_task alpha "first"
+  give_brief alpha
+  scan >/dev/null
+  [ "$(wakes)" = 1 ] || fail "the briefed task did not queue a wake"
+  add_task beta "arrives with no instructions"
+  scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "a task arriving without a brief woke firstmate: $SCAN_OUT"
+  [ "$(wakes)" = 1 ] || fail "a task arriving without a brief queued a wake"
+  pass "a task arriving without a brief moves the total and nothing else"
+}
+
+test_a_brief_arriving_on_a_standing_queue_wakes_and_names_it() {
+  have_tasks_axi || { skip_case brief-arrival "tasks-axi not found"; return 0; }
+  make_home briefarrival
+  add_task alpha "first"
+  add_task beta "second"
+  scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "an entirely unbriefed ready set woke firstmate: $SCAN_OUT"
+  give_brief alpha
+  scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: alpha" \
+    "a task acquiring a brief did not surface as the actionable change"
+  assert_contains "$SCAN_OUT" "needs intake: beta" \
+    "the ready verdict lost the rest of the queue it reports alongside"
+  [ "$(wakes)" = 1 ] || fail "a task acquiring a brief did not queue exactly one wake"
+  pass "a brief arriving on a standing queue is the change worth waking for"
+}
+
+test_a_second_brief_wakes_for_itself_alone() {
+  have_tasks_axi || { skip_case second-brief "tasks-axi not found"; return 0; }
+  make_home secondbrief
+  add_task alpha "first"
+  add_task beta "second"
+  give_brief alpha
+  scan >/dev/null
+  [ "$(wakes)" = 1 ] || fail "the first brief did not queue a wake"
+  give_brief beta
+  scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: beta" \
+    "the second brief did not surface, or did not name itself alone as the gain"
+  assert_contains "$SCAN_OUT" "briefed: alpha, beta" \
+    "the ready verdict lost the briefed work that was already waiting"
+  [ "$(wakes)" = 2 ] || fail "the second brief did not queue its own wake"
+  pass "a second brief wakes for itself alone, never re-announcing the first"
+}
+
+# The record has to follow what is actually dispatchable, including on a scan
+# that says nothing, or a task that is dispatched now and re-queued later would
+# be measured against a set it never left and could never be a gain again.
+test_a_re_queued_task_can_be_a_gain_again() {
+  have_tasks_axi || { skip_case requeued-gain "tasks-axi not found"; return 0; }
+  make_home requeued
+  add_task alpha "first"
+  add_task beta "second"
+  give_brief alpha
+  give_brief beta
+  scan >/dev/null
+  [ "$(wakes)" = 1 ] || fail "the first scan did not queue a wake"
+  tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not start alpha"
+  scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "dispatching one of two briefed tasks woke firstmate: $SCAN_OUT"
+  tasks-axi reopen alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not reopen alpha"
+  scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: alpha" \
+    "a re-queued briefed task was not a gain again, so the silent scan had forgotten to record the loss"
+  [ "$(wakes)" = 2 ] || fail "a re-queued briefed task did not queue its own wake"
+  pass "a briefed task that is dispatched and later re-queued is a gain again"
+}
+
+test_a_ready_set_returning_after_going_empty_wakes_again() {
   have_tasks_axi || { skip_case empty-then-return "tasks-axi not found"; return 0; }
   make_home returning
   add_task alpha "first"
+  give_brief alpha
   scan >/dev/null
   [ "$(wakes)" = 1 ] || fail "first scan did not queue a wake"
   tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
@@ -224,8 +326,48 @@ test_ready_set_returning_after_going_empty_wakes_again() {
   tasks-axi reopen alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
     || fail "fixture: could not reopen alpha"
   scan >/dev/null
-  assert_contains "$SCAN_OUT" "1 dispatchable" "a ready set returning after empty did not re-surface"
+  assert_contains "$SCAN_OUT" "1 dispatchable in all" "a ready set returning after empty did not re-surface"
   pass "a ready set that empties and returns wakes again"
+}
+
+# An inability observed nothing. It must not erase what was known, and it must
+# not manufacture a gain out of the same briefed set when it clears.
+test_an_inability_never_manufactures_a_gain() {
+  have_tasks_axi || { skip_case inability-no-gain "tasks-axi not found"; return 0; }
+  make_home inabilitygain
+  add_task alpha "first"
+  give_brief alpha
+  scan >/dev/null
+  [ "$(wakes)" = 1 ] || fail "the briefed task did not queue a wake"
+  chmod 000 "$DATA/backlog.md"
+  RESURFACE_SECS=0 scan >/dev/null
+  chmod 644 "$DATA/backlog.md"
+  assert_contains "$SCAN_OUT" "backlog-unreadable" "the intervening inability was not reported"
+  scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "an inability that cleared was re-reported as newly briefed work: $SCAN_OUT"
+  [ "$(wakes)" = 2 ] || fail "an inability that cleared queued a third wake for unchanged work"
+  unset RESURFACE_SECS
+  pass "an inability that clears does not manufacture a gain out of unchanged work"
+}
+
+# With no room nothing is dispatchable, so a blocked verdict records the empty
+# set. That is what re-arms the wake: the moment room returns, whatever is
+# briefed is a gain again and firstmate hears about it rather than waiting for
+# some unrelated change to the queue.
+test_room_returning_re_offers_the_briefed_work() {
+  have_tasks_axi || { skip_case room-returns "tasks-axi not found"; return 0; }
+  make_home roomreturns
+  add_task alpha "first"
+  give_brief alpha
+  OS_RESERVE_MB=999999999 scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch blocked:" "an exhausted disk did not block"
+  [ -z "$(sed -n 's/^dispatchable_briefed=//p' "$STATE/.dispatch-poll")" ] \
+    || fail "a blocked verdict kept work on the dispatchable record while there was no room for it"
+  OS_RESERVE_MB=1 scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: alpha" \
+    "room returning did not re-offer the briefed work that had nowhere to go"
+  unset OS_RESERVE_MB
+  pass "room returning re-offers the briefed work that had nowhere to go"
 }
 
 # --- it must not decide which work matters ----------------------------------
@@ -236,8 +378,11 @@ test_never_ranks_and_never_spawns() {
   add_task zulu "filed first"
   add_task alpha "filed second"
   add_task mike "filed third"
+  give_brief zulu
+  give_brief alpha
+  give_brief mike
   scan >/dev/null
-  assert_contains "$SCAN_OUT" "needs intake: alpha, mike, zulu" \
+  assert_contains "$SCAN_OUT" "briefed: alpha, mike, zulu" \
     "the ready set was not reported in a fixed identifier order"
   assert_not_contains "$SCAN_OUT" "priority" "the report carried a priority judgement"
   assert_not_contains "$SCAN_OUT" "recommend" "the report carried a recommendation"
@@ -252,18 +397,24 @@ test_long_ready_set_is_bounded_and_the_cut_is_disclosed() {
   local i
   for i in 1 2 3 4 5; do
     add_task "task-$i" "queued item $i"
+    give_brief "task-$i"
   done
   FM_DISPATCH_LIST_LIMIT=2 scan >/dev/null
-  assert_contains "$SCAN_OUT" "5 dispatchable (0 briefed, 5 need intake)" \
+  assert_contains "$SCAN_OUT" "5 dispatchable in all (5 briefed, 0 need intake)" \
     "the bounded report lost the true group counts"
-  assert_contains "$SCAN_OUT" "needs intake: task-1, task-2 (+3 more)" \
+  assert_contains "$SCAN_OUT" "briefed: task-1, task-2 (+3 more)" \
     "the identifier list was not bounded with the cut disclosed"
-  # The signature must still cover every item, or an item beyond the display
-  # limit could change without ever waking anyone.
+  assert_contains "$SCAN_OUT" "5 newly briefed and ready to dispatch: task-1, task-2 (+3 more)" \
+    "the newly-briefed list was not bounded with the cut disclosed"
+  # The comparison must cover every briefed item, or one beyond the display
+  # limit could arrive without ever waking anyone.
   add_task task-9 "beyond the display limit"
+  give_brief task-9
   FM_DISPATCH_LIST_LIMIT=2 scan >/dev/null
-  assert_contains "$SCAN_OUT" "6 dispatchable" \
+  assert_contains "$SCAN_OUT" "6 dispatchable in all" \
     "an item added beyond the display limit did not re-surface"
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: task-9" \
+    "an item added beyond the display limit was not named as the gain"
   pass "a long ready set is bounded and the cut is disclosed, never silent"
 }
 
@@ -287,6 +438,7 @@ test_ready_verdict_carries_its_capacity_evidence() {
   have_tasks_axi || { skip_case capacity-evidence "tasks-axi not found"; return 0; }
   make_home evidence
   add_task alpha "first"
+  give_brief alpha
   fm_write_meta "$STATE/live-one.meta" "window=fm:1" "kind=ship" "harness=claude"
   fm_write_meta "$STATE/mate.meta" "window=fm:2" "kind=secondmate" "harness=claude"
   scan >/dev/null
@@ -417,6 +569,7 @@ test_ready_verdict_never_resurfaces_on_cadence() {
   have_tasks_axi || { skip_case ready-no-cadence "tasks-axi not found"; return 0; }
   make_home readycadence
   add_task alpha "first"
+  give_brief alpha
   RESURFACE_SECS=0 scan >/dev/null
   [ "$(wakes)" = 1 ] || fail "first scan did not queue a wake"
   RESURFACE_SECS=0 scan >/dev/null
@@ -443,6 +596,7 @@ test_pool_copies_are_measured_below_the_per_repo_pool() {
     || fail "fixture: could not write the second worktree"
   printf '{}\n' > "$pool/repo-abc123/treehouse-state.json"
   add_task alpha "first"
+  give_brief alpha
   copy_kb=$(du -sk "$pool/repo-abc123/1" | awk 'NR == 1 {print $1}')
   pool_kb=$(du -sk "$pool/repo-abc123" | awk 'NR == 1 {print $1}')
   case "$copy_kb$pool_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
@@ -475,6 +629,7 @@ test_a_pool_root_holding_copies_directly_still_measures() {
   dd if=/dev/urandom of="$pool/lone-copy/blob" bs=1048576 count=48 2>/dev/null \
     || fail "fixture: could not write the copy"
   add_task alpha "first"
+  give_brief alpha
   copy_kb=$(du -sk "$pool/lone-copy" | awk 'NR == 1 {print $1}')
   reserve_mb=7
   FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
@@ -534,6 +689,7 @@ deadband_holds_across() { # <label> <how-to-produce-the-intervening-verdict>
   dd if=/dev/urandom of="$pool/repo-abc/1/blob" bs=1048576 count=64 2>/dev/null \
     || fail "fixture: could not write a measurable isolated copy"
   add_task alpha "first"
+  give_brief alpha
   copy_kb=$(du -sk "$pool/repo-abc/1" | awk 'NR == 1 {print $1}')
   free_kb=$(free_kb_of "$pool")
   case "$copy_kb$free_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
@@ -600,6 +756,7 @@ test_watcher_sweep_surfaces_a_changed_verdict() {
   have_tasks_axi || { skip_case watcher-sweep "tasks-axi not found"; return 0; }
   make_home watchersweep
   add_task alpha "first"
+  give_brief alpha
   local out=$HOME_DIR/watch.out pid i=0
   FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$FM_ROOT_OVERRIDE" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 FM_HEARTBEAT=999999 \
@@ -631,10 +788,13 @@ test_superseded_verdicts_collapse_to_the_latest() {
   make_home wakekey
   local keys shown
   add_task alpha "first"
+  give_brief alpha
   scan >/dev/null
   add_task beta "second"
+  give_brief beta
   scan >/dev/null
   add_task gamma "third"
+  give_brief gamma
   scan >/dev/null
   [ "$(wakes)" = 3 ] || fail "three distinct verdicts did not queue three durable records"
   keys=$(awk -F '\t' '$3 == "check" { print $4 }' "$STATE/.wake-queue" | LC_ALL=C sort -u)
@@ -647,7 +807,7 @@ test_superseded_verdicts_collapse_to_the_latest() {
   ' _ "$ROOT/bin/fm-wake-lib.sh" "$STATE/.wake-queue")
   [ "$(printf '%s\n' "$shown" | grep -c 'dispatch ready:')" = 1 ] \
     || fail "the drain would present more than the current verdict: $shown"
-  assert_contains "$shown" "3 dispatchable" "the drain kept a superseded verdict instead of the newest"
+  assert_contains "$shown" "3 dispatchable in all" "the drain kept a superseded verdict instead of the newest"
   pass "superseded verdicts collapse so only the current one is ever presented"
 }
 
@@ -693,6 +853,7 @@ test_a_scan_that_finds_the_lock_held_stays_silent() {
   make_home scanlock
   local holder
   add_task alpha "first"
+  give_brief alpha
   mkdir -p "$STATE/.dispatch-poll.lock"
   sleep 30 &
   holder=$!
@@ -745,6 +906,7 @@ test_blocked_verdict_holds_until_a_whole_clone_of_room_returns() {
   dd if=/dev/urandom of="$pool/copy/blob" bs=1048576 count=64 2>/dev/null \
     || fail "fixture: could not write a measurable isolated copy"
   add_task alpha "first"
+  give_brief alpha
   clone_kb=$(du -sk "$pool/copy" | awk 'NR == 1 {print $1}')
   free_kb=$(free_kb_of "$pool")
   case "$clone_kb$free_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
@@ -786,6 +948,7 @@ test_a_pool_with_no_copies_uses_the_plain_comparison() {
   pool="$HOME_DIR/pool"
   mkdir -p "$pool"
   add_task alpha "first"
+  give_brief alpha
   FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB=7 scan >/dev/null
   assert_contains "$SCAN_OUT" "dispatch ready:" "an empty pool did not evaluate the plain comparison"
   assert_contains "$SCAN_OUT" "clone reserve 0 MiB" \
@@ -793,6 +956,38 @@ test_a_pool_with_no_copies_uses_the_plain_comparison() {
   assert_contains "$SCAN_OUT" "against a 7 MiB floor" \
     "an empty pool did not degrade the floor to the operating-system reserve alone"
   pass "a pool with no isolated copy reports a zero clone reserve and the plain comparison"
+}
+
+# --- the harness must not let the operator's own home into a scan -----------
+
+# Every script here resolves FM_HOME before FM_ROOT_OVERRIDE, so an FM_HOME
+# exported by the surrounding firstmate session outranks the hermetic root
+# tests/wake-helpers.sh installs, and outranks every case-local override under
+# it. A suite run from inside a live session would then scan the OPERATOR's
+# backlog - real queued work, surfacing a real wake, inside cases that assert
+# silence - and its failures would follow the operator's backlog rather than the
+# code under test. The harness removes the ambient value; this pins that it
+# stays removed, by running the real check exactly the way a suite that sources
+# the harness leaves the environment.
+test_the_harness_keeps_the_operators_home_out_of_a_scan() {
+  have_tasks_axi || { skip_case harness-home "tasks-axi not found"; return 0; }
+  make_home harnesshome
+  local operator out
+  operator="$TMP_ROOT/harness-operator-home"
+  mkdir -p "$operator/data/alpha"
+  tasks-axi add alpha "the operator's own queued work" --file "$operator/data/backlog.md" \
+    >/dev/null 2>&1 || fail "fixture: could not stock the operator home's backlog"
+  printf '# Brief\n\nA real brief sitting in the operator home.\n' \
+    > "$operator/data/alpha/brief.md"
+  out=$(FM_HOME="$operator" bash -c '
+    # shellcheck disable=SC1090,SC1091
+    . "$1/tests/wake-helpers.sh" >/dev/null 2>&1
+    FM_STATE_OVERRIDE="$2" FM_DISPATCH_POOL_ROOT="$3" FM_DISPATCH_OS_RESERVE_MB=1 \
+      "$1/bin/fm-dispatch-poll.sh" scan 2>&1
+  ' _ "$ROOT" "$STATE" "$HOME_DIR")
+  [ -z "$out" ] || fail "the harness let the operator's own backlog into a scan: $out"
+  [ "$(wakes)" = 0 ] || fail "the harness let the operator's own backlog queue a wake"
+  pass "the harness keeps an ambient FM_HOME out of a scan, whatever the operator's backlog holds"
 }
 
 # --- usage ------------------------------------------------------------------
@@ -811,9 +1006,15 @@ test_briefed_is_distinguishable_from_intake
 test_blocked_and_gated_work_is_not_dispatchable
 test_work_already_under_way_is_not_dispatchable
 test_unchanged_ready_set_does_not_repeat
-test_changed_ready_set_wakes_again
-test_acquiring_a_brief_changes_the_signal
-test_ready_set_returning_after_going_empty_wakes_again
+test_dispatching_the_only_briefed_task_is_silent
+test_an_unbriefed_queue_never_wakes_on_its_own
+test_a_task_arriving_without_a_brief_is_not_a_wake
+test_a_brief_arriving_on_a_standing_queue_wakes_and_names_it
+test_a_second_brief_wakes_for_itself_alone
+test_a_re_queued_task_can_be_a_gain_again
+test_a_ready_set_returning_after_going_empty_wakes_again
+test_an_inability_never_manufactures_a_gain
+test_room_returning_re_offers_the_briefed_work
 test_never_ranks_and_never_spawns
 test_long_ready_set_is_bounded_and_the_cut_is_disclosed
 test_no_room_is_reported_not_claimed_ready
@@ -840,4 +1041,5 @@ test_the_copy_measurement_shares_one_deadline
 test_deadband_survives_an_intervening_none_verdict
 test_deadband_survives_an_intervening_unknown_verdict
 test_watcher_sweep_surfaces_a_changed_verdict
+test_the_harness_keeps_the_operators_home_out_of_a_scan
 test_rejects_an_unknown_verb

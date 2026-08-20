@@ -1492,9 +1492,9 @@ EOF
 # It runs on the locked path ahead of the wake drain precisely so a verdict
 # lands in THIS digest instead of arriving as a separate wake minutes later,
 # so the assertion is that the digest states the verdict AND the drain in the
-# same digest presents the durable record it queued. The briefed and
-# needs-intake split is asserted too: a wake that says which is far more
-# useful than one that does not.
+# same digest presents the durable record it queued. The actionable change the
+# verdict is FOR, and the briefed/needs-intake split it sits in, are asserted
+# too: a wake that says which is far more useful than one that does not.
 test_dispatch_readiness_lands_in_the_startup_digest() {
   local rec root home fakebin out presented
   rec=$(new_world dispatch-readiness)
@@ -1511,15 +1511,18 @@ EOF
   out=$(FM_DISPATCH_POOL_ROOT="$home" FM_DISPATCH_OS_RESERVE_MB=1 \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
 
-  assert_contains "$out" "dispatch readiness: actionable: dispatch ready: 2 dispatchable" \
-    "the startup digest did not state the dispatch-readiness verdict"
+  assert_contains "$out" \
+    "dispatch readiness: actionable: dispatch ready: 1 newly briefed and ready to dispatch: ready-1" \
+    "the startup digest did not state the dispatch-readiness verdict, or what became actionable"
+  assert_contains "$out" "2 dispatchable in all" \
+    "the startup digest lost the standing queue the actionable change sits in"
   assert_contains "$out" "briefed: ready-1" \
     "the startup digest did not name the ready-and-briefed task"
   assert_contains "$out" "needs intake: ready-2" \
     "the startup digest did not name the ready-but-needs-intake task"
   assert_grep 'dispatch ready:' "$home/state/.wake-queue" \
     "session start did not leave the durable dispatch wake record"
-  presented=$(printf '%s\n' "$out" | grep -c 'dispatch ready: 2 dispatchable' || true)
+  presented=$(printf '%s\n' "$out" | grep -c 'dispatch ready: 1 newly briefed' || true)
   [ "$presented" -ge 2 ] \
     || fail "the wake drain in the same digest did not present the verdict session start queued"
   pass "session start: a dispatch-readiness verdict lands in the one startup digest"
