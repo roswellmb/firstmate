@@ -14,7 +14,18 @@ FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 # still far below this, so reaching it means the holder is never going to
 # release. Generous by design: it exists to convert a permanent wedge into one
 # diagnostic line, not to arbitrate ordinary contention.
-FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-300}"
+#
+# CONSTRAINT: this must stay below HALF of FM_GUARD_GRACE (default 300, and the
+# default for FM_WATCHER_STALE_GRACE through it). One watcher poll cycle can
+# contain TWO contended waits - procevent_surface_queued takes the wake-queue
+# lock, then resurface_after_downtime's arm-check takes it again - and the
+# beacon is touched only at the top of the loop, so a wedged lock ages the
+# beacon by about 2*(budget+1) before the next touch. At 120 that is ~242s and
+# stays inside the grace; at 300 it was ~602s, so a watcher that survived a
+# wedge exactly as designed still read as stale and the re-arm path told the
+# operator to stop it. Raising either knob without re-checking the other
+# re-creates that: a live, correctly degrading watcher reported as dead.
+FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-120}"
 # Resolved once at source time: fm_pid_identity and fm_path_mtime run inside 0.2s
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
@@ -759,11 +770,11 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    had.
 fm_lock_acquire_wait() {  # <lockdir>
   local lockdir=$1 budget deadline= now
-  budget=${FM_LOCK_WAIT_TIMEOUT:-300}
+  budget=${FM_LOCK_WAIT_TIMEOUT:-120}
   # An unreadable override must not silently disable the ceiling that exists to
   # stop a permanent wait, so fall back to the default rather than to zero.
   case "$budget" in
-    ''|*[!0-9]*|0) budget=300 ;;
+    ''|*[!0-9]*|0) budget=120 ;;
   esac
   while ! fm_lock_try_acquire "$lockdir"; do
     if fm_lock_held_by_current_process "$lockdir"; then
