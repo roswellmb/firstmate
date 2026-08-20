@@ -188,6 +188,47 @@ test_added_content_cannot_impersonate_a_diff_header() {
   pass "added content that looks like a diff header does not silence the rest of the file"
 }
 
+test_a_path_with_a_space_is_reported_correctly() {
+  local repo anchor title rc out name
+  repo="$(new_repo spaced-path)"
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  # git terminates a --- or +++ header with a literal TAB when the path
+  # contains a space. Carried into the label, that tab splits the record the
+  # scanner emits, so the finding still fires but names a garbled location.
+  name='release notes.md'
+  {
+    printf 'an ordinary first line\n'
+    printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title"
+  } >"$repo/docs/$name"
+  git -C "$repo" add "docs/$name"
+  rc="$(run_guard_status "$repo" 'docs: record reprocessing')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "a leak in a file whose name contains a space must refuse (got exit $rc: $out)"
+  case "$out" in
+    *"docs/$name:2 refers to a document"*) : ;;
+    *) fail "the finding must name the real path and line number (got: $out)" ;;
+  esac
+
+  name='quarterly "draft" notes.md'
+  repo="$(new_repo spaced-quoted-path)"
+  {
+    printf 'an ordinary first line\n'
+    printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title"
+  } >"$repo/docs/$name"
+  git -C "$repo" add "docs/$name"
+  rc="$(run_guard_status "$repo" 'docs: record reprocessing')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "a leak in a file whose name is quoted and spaced must refuse (got exit $rc: $out)"
+  case "$out" in
+    *"docs/$name:2 refers to a document"*) : ;;
+    *) fail "a quoted spaced path must still be unquoted for the label (got: $out)" ;;
+  esac
+  pass "a path containing a space is reported with the right file and line number"
+}
+
 test_diff_prefix_configuration_does_not_hide_a_leak() {
   local repo anchor title rc out
   repo="$(new_repo noprefix)"
@@ -612,6 +653,7 @@ test_forced_private_path_is_refused
 test_private_path_git_has_to_quote_is_refused
 test_added_content_cannot_impersonate_a_diff_header
 test_diff_prefix_configuration_does_not_hide_a_leak
+test_a_path_with_a_space_is_reported_correctly
 test_a_long_line_is_still_scanned
 test_invalid_utf8_content_is_still_evaluated
 test_ordinary_repo_prose_passes

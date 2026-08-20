@@ -94,15 +94,16 @@ The scanner case is the one that matters most, because a scanner failure is the 
 
 ## Measured false-positive rate
 
-Measured against this repository's real content, not invented examples, on 2026-08-20.
+Measured against this repository's real content, not invented examples, on 2026-08-20, with `56d9ddb` as the branch tip.
 Each row names the command whose output it counted, so the scope of the claim and the scope of the measurement are the same thing.
+A measurement stored in the repository it measures is always one commit behind the tree that carries it, so the pin is what makes each row reproducible rather than a count that has to be chased.
 
 | Corpus | Size | Refused by rule T | Refused by rule P |
 | --- | --- | --- | --- |
-| `git rev-list --all --no-merges`, each commit's diff and message together | 405 commits | 0 | 1 |
-| Every added content line of those same commits | 211,059 lines | 0 | not applicable |
-| Every line of every tracked text file in the working tree, from `git ls-files` | 168,547 lines in 392 files | 0 | not applicable |
-| `git rev-list --all`, message only, merges included | 407 commits, 9,321 lines | 0 | not applicable |
+| `git rev-list --all --no-merges`, each commit's diff and message together | 406 commits | 0 | 1 |
+| Every added content line of those same commits | 211,126 lines | 0 | not applicable |
+| `git ls-tree -r 56d9ddb`, every tracked blob `grep -I` reads as text | 167,983 lines in 393 of 394 files | 0 | not applicable |
+| `git rev-list --all`, message only, merges included | 408 commits, 9,323 lines | 0 | not applicable |
 
 Rule T's false-positive rate on real repository content is **0**, across all four corpora.
 

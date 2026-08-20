@@ -334,9 +334,12 @@ added_lines() {
   !in_hunk && /^--- / { saw_old = 1; next }
   !in_hunk && saw_old && /^\+\+\+ / {
     saw_old = 0
-    p = unquote(substr($0, 5))
+    p = substr($0, 5)
+    sub(/\t$/, "", p)
+    p = unquote(p)
     if (p == "/dev/null") { path = ""; next }
     sub(/^b\//, "", p)
+    gsub(/\t/, " ", p)
     path = p
     next
   }
