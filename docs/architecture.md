@@ -25,7 +25,11 @@ Its initial normal-mode status signal still surfaces through the no-verb path, w
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or a proven busy worker outranks an old captain-relevant status-log line left behind before validation.
 No-change heartbeats are also benign.
 Separately from heartbeat backoff and wedge handling, the watcher poll runs `bin/fm-inactive-reconcile.sh` on its own bounded cadence, while locked session start performs the same bounded local scan immediately.
-In each home the scan considers only that home's long-inactive direct ordinary crewmates, excludes captain-held work, and accepts only `done` or `failed` from `bin/fm-crew-state.sh`.
+The watcher's slow-check sweep opens with `bin/fm-dispatch-poll.sh`, which turns the backlog from something firstmate must remember to look at into something that wakes it: it notices when queued work becomes dispatchable and surfaces one `check: dispatch` wake, and locked session start runs the identical scan so the verdict lands in the startup digest instead of arriving separately.
+Noticing is all it does - it never spawns, never ranks, and never repeats an unchanged ready set, because deciding to dispatch needs the project, delivery-mode, autonomy, and brief judgement that AGENTS.md sections 7 and 11 keep with firstmate.
+That script's header owns its verdicts, its no-repeat rule, why it needs no `state/<id>.check.sh` identity or `bin/fm-check-register.sh` binding, and where its capacity numbers come from.
+A completely idle home runs no watcher at all, because `bin/fm-supervision-lib.sh` requires in-flight work, a Relay poll, or a registered event source before supervision is needed, so there the backlog is noticed at the next locked session start rather than on the sweep.
+In each home the inactive-outcome scan considers only that home's long-inactive direct ordinary crewmates, excludes captain-held work, and accepts only `done` or `failed` from `bin/fm-crew-state.sh`.
 A secondmate retains a durable receipt for its idempotent report through the established parent route, and main-home captain presentation retains a separate receipt; neither path performs a forge or PR check.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 Each `fm-wake-drain.sh` presentation runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only handles queued wakes.

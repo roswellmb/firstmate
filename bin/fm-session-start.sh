@@ -36,9 +36,11 @@
 #                       X-mode artifact writes, fleet sync) also run only when
 #                       locked; the four network sweeps run in the deferred
 #                       stage rather than this synchronous bootstrap section.
-#   3. inactive outcomes + wake-drain - runs the local bounded inactive-outcome
-#                       reconciliation before presenting durable wakes and advancing
-#                       recovery handling state, so both only run when locked.
+#   3. inactive outcomes + dispatch readiness + wake-drain - runs the local
+#                       bounded inactive-outcome reconciliation and the
+#                       fleet-level dispatch-readiness check before presenting
+#                       durable wakes and advancing recovery handling state, so
+#                       all three only run when locked.
 #   4. supervision-instructions - the one emitted operating block for the
 #                       detected primary harness.
 #   5. read-once contract - the do-not-re-read contract covering every source
@@ -238,12 +240,15 @@ stage() {  # <stage-name>: breadcrumb for the parent's truncation banner
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
 
+# A non-positive or non-numeric budget is not a budget (`timeout 0` disables the
+# deadline outright), so an unusable value falls back to the default rather than
+# silently removing the bound. Resolved on BOTH sides of the re-exec below: the
+# parent bounds the child with it, and the child sizes its own per-stage bounds
+# from it, so no stage can be given a bound its enclosing budget cannot honour.
+SESSION_START_BUDGET=${FM_SESSION_START_TIMEOUT:-120}
+case "$SESSION_START_BUDGET" in ''|*[!0-9]*|0) SESSION_START_BUDGET=120 ;; esac
+
 if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
-  SESSION_START_BUDGET=${FM_SESSION_START_TIMEOUT:-120}
-  # A non-positive or non-numeric budget is not a budget (`timeout 0` disables
-  # the deadline outright), so an unusable value falls back to the default
-  # rather than silently removing the bound.
-  case "$SESSION_START_BUDGET" in ''|*[!0-9]*|0) SESSION_START_BUDGET=120 ;; esac
   SESSION_START_STAGE_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-session-start-stage.XXXXXX" 2>/dev/null) || SESSION_START_STAGE_FILE=
   if [ -z "$SESSION_START_STAGE_FILE" ]; then
     # Without a breadcrumb the bound still holds; only the banner's precision
@@ -252,6 +257,7 @@ if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
   fi
   fm_run_timed "$SESSION_START_BUDGET" \
     env FM_SESSION_START_STAGE_FILE="$SESSION_START_STAGE_FILE" \
+    FM_SESSION_START_TIMEOUT="$SESSION_START_BUDGET" \
     "$SCRIPT_DIR/fm-session-start.sh" "$@"
   SESSION_START_RC=$?
   if [ "$SESSION_START_RC" -eq 124 ]; then
@@ -583,10 +589,11 @@ else
   printf '(silent - all good)\n'
 fi
 
-# --- 3. inactive outcomes + wake-drain -----------------------------------
+# --- 3. inactive outcomes + dispatch readiness + wake-drain ---------------
 # The existing locked session-start path runs the same local inactive-outcome
-# reconciliation as the watcher poll before it presents the resulting durable
-# wake, without adding a daemon or external-network call.
+# reconciliation and the same fleet-level dispatch-readiness check as the
+# watcher poll before it presents the resulting durable wakes, without adding a
+# daemon or external-network call.
 # Presented records are this turn's first work queue and remain durable until
 # post-handling acknowledgement. The drain's separate OPEN DECISIONS section
 # remains actionable even when that queue is empty (AGENTS.md sections 3 and 8).
@@ -609,6 +616,35 @@ else
     "$SCRIPT_DIR/fm-inactive-reconcile.sh" scan --startup 2>&1) || INACTIVE_OUT=
   if [ -n "$INACTIVE_OUT" ]; then
     printf 'inactive outcome reconciliation: %s\n' "$INACTIVE_OUT"
+  fi
+  # The same fleet-level dispatch-readiness check the watcher poll runs, on the
+  # same locked path and ahead of the drain, so its verdict is presented in this
+  # one digest rather than arriving as a separate wake minutes later.
+  # This bound is sized from session start's OWN budget, not from the scan's
+  # inner bounds, and it is deliberately short enough that it can cut a slow
+  # scan off before that scan's own timeout classes get to report. The
+  # alternative is worse: a backstop long enough to never preempt an inner bound
+  # would be most of the startup budget, spent at the third of nine stages, so
+  # the enclosing bound would fire first and truncate the digest at wake-queue -
+  # losing the drain, the supervision instructions, and the fleet state. A hung
+  # scan must cost one stage, not the whole digest. Nothing is lost by cutting
+  # it: the scan is idempotent and holds no lock afterwards, and the watcher
+  # runs the identical scan on its own cadence with a backstop that cannot
+  # preempt an inner bound. Firing here is still reported, never swallowed.
+  DISPATCH_STAGE_BACKSTOP_SECS=$((SESSION_START_BUDGET / 8))
+  [ "$DISPATCH_STAGE_BACKSTOP_SECS" -ge 5 ] || DISPATCH_STAGE_BACKSTOP_SECS=5
+  [ "$DISPATCH_STAGE_BACKSTOP_SECS" -le 30 ] || DISPATCH_STAGE_BACKSTOP_SECS=30
+  DISPATCH_OUT=$(fm_run_timed "$DISPATCH_STAGE_BACKSTOP_SECS" \
+    env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-dispatch-poll.sh" scan 2>&1)
+  DISPATCH_RC=$?
+  if [ "$DISPATCH_RC" -eq 124 ]; then
+    DISPATCH_OUT="scan hit this stage's ${DISPATCH_STAGE_BACKSTOP_SECS}s bound and was stopped, so dispatch readiness is unestablished here; the watcher sweep re-runs it unbounded by the startup budget"
+  elif [ "$DISPATCH_RC" -ne 0 ]; then
+    DISPATCH_OUT=
+  fi
+  if [ -n "$DISPATCH_OUT" ]; then
+    printf 'dispatch readiness: %s\n' "$DISPATCH_OUT"
   fi
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   if [ -n "$DRAIN_OUT" ]; then
