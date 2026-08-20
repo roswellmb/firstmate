@@ -233,6 +233,26 @@ assert_dir_not_plantable() {  # <dir> <label>
     || fail "$label: '$dir' is mode $mode, so another user can drop an executable the agent resolves ahead of /usr/bin"
 }
 
+# assert_dir_chain_not_plantable <dir> <boundary> <label>: the check above applied to
+# every directory from <dir> up to and including <boundary>, because a tight leaf
+# inside a loose parent is still plantable. <boundary> is the home fm-spawn filed the
+# shim under; above it the tree is the operator's rather than firstmate's. Walking the
+# chain is also what makes this portable: the fixture home is itself inside the host's
+# temp root, so matching the shim path against /tmp would only report where the test
+# put its fixture, not where fm-spawn put the shim - which is why this is a permission
+# walk rather than a path-prefix check.
+assert_dir_chain_not_plantable() {  # <dir> <boundary> <label>
+  local dir=$1 boundary=$2 label=$3
+  while :; do
+    assert_dir_not_plantable "$dir" "$label"
+    [ "$dir" != "$boundary" ] || break
+    case "$dir" in
+      /|.|'') fail "$label: '$1' is not inside '$boundary'" ;;
+    esac
+    dir=$(dirname "$dir")
+  done
+}
+
 # A PATH carrying no chrome-devtools-axi at all, for the not-installed branch.
 # Filtering the inherited PATH beats hand-building one, which would drop whatever
 # git and coreutils this host actually resolves fm-spawn's own calls to.
@@ -671,11 +691,9 @@ test_refusal_shim_is_private_to_the_task_it_was_written_for() {
     *) fail "the refusal shim at '$shim_a' is outside the task-scoped directory teardown reclaims for $id_a" ;;
   esac
   # A directory another local user could have created first is not usable as a PATH
-  # entry, so it must not sit anywhere world-writable.
-  case "$shim_a" in
-    /tmp/*|/var/tmp/*) fail "the refusal shim at '$shim_a' is under a world-writable temp root, where another user can plant executables the agent resolves ahead of /usr/bin" ;;
-  esac
-  assert_dir_not_plantable "$shim_a" "task $id_a's refusal directory"
+  # entry, so nothing along the part of the path firstmate files the shim under may
+  # be world-writable either.
+  assert_dir_chain_not_plantable "$shim_a" "$HOME_DIR" "task $id_a's refusal directory"
 
   rec=$(make_spawn_case browseriso-priv-b claude "$id_b")
   read_case_record "$rec"
