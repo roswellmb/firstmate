@@ -31,7 +31,8 @@
     "docs/zellij-backend.md",
     "docs/orca-backend.md",
     "docs/cmux-backend.md",
-    "docs/remote-secondmates.md"
+    "docs/remote-secondmates.md",
+    "docs/redaction-guard.md"
   ],
   "requiredOwnerPointers": [
     {
@@ -274,6 +275,10 @@
     },
     {
       "path": "docs/orca-backend.md",
+      "audience": "operator-current"
+    },
+    {
+      "path": "docs/redaction-guard.md",
       "audience": "operator-current"
     },
     {
