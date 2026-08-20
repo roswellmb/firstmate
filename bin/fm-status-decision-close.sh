@@ -48,7 +48,9 @@
 #     operator reads in a human note is not always the key the fold holds.
 #   - the closing line would not take effect per the fold: a reserved key
 #     namespace transitions only on its owner's vocabulary, and this is checked
-#     BEFORE the append so a line the fold ignores never lands in the log.
+#     BEFORE the append so a line the fold ignores never lands in the log. That
+#     refusal names the route that DOES close such a key, so an operator is not
+#     left with --force as the only way forward.
 #   - another lifecycle action holds the task's control lock.
 #
 # Exit status is 0 only after the closing line is written and the fold agrees the
@@ -63,9 +65,6 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-classify-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-classify-lib.sh"
-# shellcheck source=bin/fm-line-cap-lib.sh
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/fm-line-cap-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -196,7 +195,8 @@ case "$OPEN" in
 esac
 
 # Same one-line shape and sanitization the answerer-closes path writes, so both
-# closers leave a log a single reader can parse. The disposition token is what
+# closers leave a log a single reader can parse. The sanitization is what keeps
+# one close to exactly one line; the substance itself is stored whole. The disposition token is what
 # distinguishes a close made without delivery from fm-send's "answered:".
 NOTE=$(printf '%s' "$SUBSTANCE" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177')
 NOTE=${NOTE#"${NOTE%%[![:space:]]*}"}
@@ -207,15 +207,26 @@ case "$DISPOSITION" in
   answered-elsewhere) NOTE="answered elsewhere: $NOTE" ;;
   moot) NOTE="moot: $NOTE" ;;
 esac
-fm_cap_line_var "resolved [key=$KEY]: $NOTE"
-LINE=$FM_LINE_CAP_LINE
+# No length cap here. bin/fm-line-cap-lib.sh caps agent-facing DIGEST lines,
+# where truncation is recoverable because the digest names the durable
+# state/<id>.status the entry came from. This line IS that durable source, and a
+# close made without delivery has no second copy of its substance by
+# construction, so capping it would destroy the very thing this command exists
+# to record. Rendering stays the renderer's job: bin/fm-wake-drain.sh caps what
+# it shows.
+LINE="resolved [key=$KEY]: $NOTE"
 
 # Prove the append takes effect BEFORE making it: the fold, not this script,
 # decides whether a line closes a key, and a line it would ignore must never
 # land in an append-only log next to the decision it claims to have closed.
 status_line_closes_key "$OPEN" "$LINE" "$KEY" || {
   print_open_set "$OPEN"
-  fail "this close would not take effect on key '$KEY': that key transitions only on its owning namespace's own vocabulary, so close it through the owner that opened it; nothing was written"
+  printf 'fm-status-decision-close: key %s belongs to a reserved namespace, which transitions only on its owner\x27s own vocabulary.\n' "$KEY" >&2
+  printf 'The reserved namespace in use today is pending-reply-<corr>, owned by bin/fm-pending-reply-lib.sh: its closing line is written by\n' >&2
+  printf 'fm_pending_reply_close_escalation once the request is answered on the PARENT status file with the same corr token, which is what\n' >&2
+  printf '  bin/fm-secondmate-report.sh <parent-status-file> <verb> <corr_id> <note...>\n' >&2
+  printf 'appends (a plain status line carrying that corr token is equally valid).\n' >&2
+  fail "this close would not take effect on key '$KEY'; nothing was written"
 }
 
 printf '%s\n' "$LINE" >> "$STATUS" \

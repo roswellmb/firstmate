@@ -32,6 +32,11 @@
 #       compared against the same logs rather than against each other's source.
 #   (i) --force still completes, and writes what became of the open decision.
 #   (j) --force refuses when that record cannot be written, rather than losing it.
+#   (k) a teardown that refuses AFTER that record is written leaves a record that
+#       claims only the authorization, leaves the decision open, and does not
+#       stack a duplicate block when the operator reruns.
+#   (l) the substance of a deliberate close is stored whole - the durable log is
+#       the only copy - while still being exactly one line.
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -297,7 +302,13 @@ test_reserved_namespace_refuses_before_writing() {
     || fail "a close the fold would ignore still appended a misleading resolved line"
   drain_entries "$home" t9 | grep -Fq 'pending-reply-abcdef0123456789' \
     || fail "the reserved decision should still be open"
-  pass "a close the fold would ignore refuses before writing anything"
+  # A refusal with no route out is how --force becomes a habit, so the refusal
+  # has to name the command that DOES close a key in this namespace.
+  assert_contains "$out" 'bin/fm-pending-reply-lib.sh' \
+    "the reserved-namespace refusal should name the library that owns the key"
+  assert_contains "$out" 'bin/fm-secondmate-report.sh <parent-status-file> <verb> <corr_id> <note...>' \
+    "the reserved-namespace refusal should name the concrete command that closes it"
+  pass "a close the fold would ignore refuses before writing anything and names the route that works"
 }
 
 # --- teardown fixture -------------------------------------------------------
@@ -517,6 +528,93 @@ test_force_refuses_when_the_record_cannot_be_written() {
   pass "--force refuses when the discard record cannot be written"
 }
 
+# --- (k) the record must not claim a teardown that did not happen -----------
+
+test_force_record_states_authorization_and_does_not_duplicate() {
+  local case_dir rc out record before after
+  case_dir=$(make_teardown_case force-later-refusal)
+  write_status "$case_dir/home" task-x1 \
+    'needs-decision [key=api-shape]: pick REST or gRPC before the migration'
+  # The record is written before teardown's remaining refusals, on purpose: a
+  # record that cannot be written must refuse before anything is destroyed. A
+  # second window= line makes the endpoint metadata ambiguous, so teardown's own
+  # cleanup-authorization check refuses AFTER the record has landed - the case
+  # where wording that asserted a completed discard would be a lie.
+  printf 'window=firstmate:fm-task-x1-stale\n' >> "$case_dir/home/state/task-x1.meta"
+
+  out=$(run_teardown "$case_dir" --force 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "teardown completed despite ambiguous endpoint metadata: $out"
+
+  record="$case_dir/home/data/task-x1/discarded-decisions.md"
+  [ -f "$record" ] || fail "the discard record was not written before the later refusal"
+  [ -f "$case_dir/home/state/task-x1.status" ] \
+    || fail "a teardown that refused still removed the status log"
+  drain_entries "$case_dir/home" task-x1 | grep -Fq '[key=api-shape]' \
+    || fail "the decision should still be open after a refused teardown"
+  if grep -Fq 'torn down with --force' "$record"; then
+    fail "the record claims a teardown that did not happen: $(cat "$record")"
+  fi
+  grep -Fq 'authorized' "$record" \
+    || fail "the record should record the discard authorization: $(cat "$record")"
+
+  before=$(cat "$record")
+  out=$(run_teardown "$case_dir" --force 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "the rerun completed despite ambiguous endpoint metadata: $out"
+  after=$(cat "$record")
+  [ "$before" = "$after" ] \
+    || fail "a rerun appended a second block for the same still-open set: $after"
+  pass "a --force record states the authorization, survives a later refusal, and does not duplicate"
+}
+
+# --- (l) the durable close keeps its whole substance ------------------------
+
+test_close_substance_is_stored_whole() {
+  local home substance stored expected count
+  home=$(make_home long-substance)
+  write_status "$home" t-long 'needs-decision [key=api-shape]: REST or gRPC'
+
+  # Well past the digest cap: this log is the ONLY copy of an answer that was
+  # never delivered to a worker, so nothing here may drop the tail.
+  substance='the captain ruled gRPC, and the reason matters more than the verdict:'
+  while [ "${#substance}" -lt 400 ]; do
+    substance="$substance the streaming leg of the migration cannot be expressed over REST without a bespoke framing layer,"
+  done
+  substance="$substance so REST is off the table until that layer exists."
+
+  run_close "$home" t-long --key api-shape --answered-elsewhere "$substance" >/dev/null \
+    || fail "the deliberate close failed on a long substance"
+  stored=$(grep -F 'resolved [key=api-shape]:' "$home/state/t-long.status")
+  expected="resolved [key=api-shape]: answered elsewhere: $substance"
+  [ "$stored" = "$expected" ] \
+    || fail "the durable close line did not round-trip intact:
+$stored"
+  case "$stored" in
+    *'[truncated]'*) fail "the durable close line carries a truncation marker: $stored" ;;
+  esac
+  count=$(wc -l < "$home/state/t-long.status" | tr -d ' ')
+  [ "$count" = 2 ] \
+    || fail "the close should have added exactly one line, log has $count lines"
+
+  # Storing the substance whole must not cost the line-oriented guarantee: a
+  # multi-line substance is still folded onto one line.
+  write_status "$home" t-folded 'needs-decision [key=api-shape]: REST or gRPC'
+  run_close "$home" t-folded --key api-shape \
+    --answered-elsewhere "$substance"$'\n'$'\t'"and the follow-up note stays on the same line" >/dev/null \
+    || fail "the deliberate close failed on a multi-line substance"
+  count=$(wc -l < "$home/state/t-folded.status" | tr -d ' ')
+  [ "$count" = 2 ] \
+    || fail "a multi-line substance produced $count lines instead of one close line"
+  stored=$(grep -F 'resolved [key=api-shape]:' "$home/state/t-folded.status")
+  case "$stored" in
+    *'so REST is off the table until that layer exists.'*'and the follow-up note stays on the same line'*) : ;;
+    *) fail "the folded close lost part of its substance: $stored" ;;
+  esac
+  case "$stored" in
+    *'[truncated]'*) fail "the folded close line carries a truncation marker: $stored" ;;
+  esac
+  pass "a deliberate close stores its whole substance on exactly one line"
+}
+
 # --- (a, concluded) the checkout is untouched -------------------------------
 
 test_checkout_is_unchanged_after_the_suite() {
@@ -539,4 +637,6 @@ test_teardown_refuses_while_a_decision_is_open
 test_refusal_agrees_with_the_fold_on_every_grammar_case
 test_force_completes_and_records_the_discarded_decision
 test_force_refuses_when_the_record_cannot_be_written
+test_force_record_states_authorization_and_does_not_duplicate
+test_close_substance_is_stored_whole
 test_checkout_is_unchanged_after_the_suite

@@ -36,8 +36,11 @@
 # grammar, so this refusal always agrees with the OPEN DECISIONS listing. The
 # refusal names bin/fm-status-decision-close.sh, the supported way to close such
 # a decision when no live worker is left to deliver an answer to. --force still
-# completes, and first records what was open in data/<task-id>/discarded-decisions.md;
-# a discard record that cannot be written refuses rather than losing the question.
+# completes, and first records what was open in data/<task-id>/discarded-decisions.md
+# as an AUTHORIZATION to discard - written before the destructive steps, so a
+# later refusal cannot make it a lie, and marked with the open set it covers so a
+# rerun does not stack a duplicate block. A discard record that cannot be written
+# refuses rather than losing the question.
 # The gate covers THIS home's ledger for THIS task. A forced secondmate
 # retirement's child cleanup below discards each child home's own ledger without
 # recording its decisions, which stays a deliberate boundary: that path already
@@ -459,7 +462,7 @@ remote_secondmate_teardown_locked() {
 # Runs before the remote-secondmate retirement below and before every local
 # destructive step, because both paths remove the status log.
 teardown_open_decisions_gate() {
-  local status="$STATE/$ID.status" open key verb note record stamp need_title
+  local status="$STATE/$ID.status" open key verb note record stamp fingerprint marker block
   open=$(status_open_decisions "$status")
   [ -n "$open" ] || return 0
 
@@ -475,7 +478,7 @@ EOF
     echo "With a live worker, answer it: bin/fm-send.sh $ID --resolve-key <key> '<answer>'" >&2
     echo "With no live worker, close it deliberately: bin/fm-status-decision-close.sh $ID --key <key> --answered-elsewhere '<the answer that was given>'" >&2
     echo "  or, if it no longer needs an answer: bin/fm-status-decision-close.sh $ID --key <key> --moot '<why>'" >&2
-    echo "Then rerun teardown. --force discards the decision after explicit captain approval, and records what was dropped." >&2
+    echo "Then rerun teardown. --force discards the decision after explicit captain approval, and records what it was authorized to drop." >&2
     return 1
   fi
 
@@ -483,7 +486,15 @@ EOF
   # captain authorized a discard" is a reason, and silence is not. Write what was
   # open where it outlives the state dir, next to this task's brief and report.
   # A record that cannot be written refuses instead: losing the question to a
-  # failed append is the one outcome this gate exists to prevent.
+  # failed append is the one outcome this gate exists to prevent, so the write
+  # stays BEFORE every destructive step rather than at the point of no return.
+  #
+  # What the record therefore asserts is the AUTHORIZATION, not a completed
+  # teardown: teardown's own remaining checks (endpoint validation, the herdr
+  # gone-checks, home removal, busy retirement) can still refuse after this
+  # point, leaving the log and these decisions in place. Wording that claimed
+  # the decisions were ended would be false in that outcome, and a record a
+  # later reader cannot trust is worse than no record at all.
   record="$DATA/$ID/discarded-decisions.md"
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [ -L "$DATA/$ID" ] || ! mkdir -p "$DATA/$ID" 2>/dev/null; then
@@ -494,26 +505,46 @@ EOF
     echo "REFUSED: task $ID has an open decision and its discard record $record is not a regular file; nothing was torn down." >&2
     return 1
   fi
-  # Decided before the append stream opens, so nothing reads the record while it
-  # is being written to.
-  need_title=0
-  [ -s "$record" ] || need_title=1
-  if ! {
-    [ "$need_title" = 0 ] || printf '# Discarded decisions - %s\n' "$ID"
-    printf '\n## %s - forced teardown\n\n' "$stamp"
-    printf 'These decisions were still open when task %s was torn down with --force.\n' "$ID"
-    printf 'Explicit discard authority ended them; nothing answered them.\n\n'
-    while IFS=$'\t' read -r key verb note; do
-      [ -n "$key" ] || continue
-      printf -- '- [key=%s] %s: %s\n' "$key" "$verb" "$note"
-    done <<EOF
+  # Because a refusal after this point invites a rerun, the same still-open set
+  # must not stack up identical dated blocks. The marker names the exact set this
+  # block covers, so a rerun whose set is unchanged recognizes its own earlier
+  # authorization and a rerun whose set has moved on records the new one.
+  fingerprint=$(printf '%s' "$open" | cksum | awk '{ print $1 ":" $2 }') || fingerprint=
+  if [ -z "$fingerprint" ]; then
+    echo "REFUSED: task $ID has an open decision and its discard record could not be fingerprinted; nothing was torn down." >&2
+    return 1
+  fi
+  marker="<!-- fm-discard-authorized open-set=$fingerprint -->"
+  if [ -s "$record" ] && grep -Fqx -- "$marker" "$record" 2>/dev/null; then
+    echo "teardown $ID: this open decision set was already recorded in $record" >&2
+    return 0
+  fi
+  # Built whole first, then written by ONE checked append. A block assembled
+  # inside the redirection would report only its last command's status, so a
+  # failed title or a failed entry would pass unnoticed and cleanup would delete
+  # the status log anyway - exactly the loss this gate exists to prevent.
+  block=
+  [ -s "$record" ] || block="# Discarded decisions - $ID"$'\n'
+  block="$block"$'\n'"## $stamp - forced teardown, discard authorized"$'\n'$'\n'
+  block="$block$marker"$'\n'$'\n'
+  block="${block}These decisions were open in task $ID's status log when a --force teardown"$'\n'
+  block="${block}was run against it. --force carries explicit discard authority, so teardown"$'\n'
+  block="${block}was authorized to delete that log and every decision listed below with it, and"$'\n'
+  block="${block}nothing ever answered them."$'\n'
+  block="${block}This is written before teardown's remaining checks, so teardown may have"$'\n'
+  block="${block}refused afterwards and left the log in place; what is certain is the"$'\n'
+  block="${block}authorization and the absence of an answer."$'\n'$'\n'
+  while IFS=$'\t' read -r key verb note; do
+    [ -n "$key" ] || continue
+    block="$block- [key=$key] $verb: $note"$'\n'
+  done <<EOF
 $open
 EOF
-  } >> "$record"; then
+  if ! printf '%s' "$block" >> "$record"; then
     echo "REFUSED: task $ID has an open decision and it could not be recorded in $record; nothing was torn down." >&2
     return 1
   fi
-  echo "teardown $ID: discarded open decisions were recorded in $record" >&2
+  echo "teardown $ID: open decisions authorized for discard were recorded in $record" >&2
   return 0
 }
 teardown_open_decisions_gate || exit 1
