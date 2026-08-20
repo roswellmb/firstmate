@@ -710,6 +710,45 @@ test_scout_and_secondmate_scaffold() {
   pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
+# The decision-key token only registers when it sits in the state prefix, before
+# the first colon: bin/fm-classify-lib.sh owns that grammar, and a key written
+# after the colon folds to "default" with no error, so a later --resolve-key finds
+# nothing to close. Every crewmate scaffold must therefore SHOW the keyed line's
+# shape where the worker copies it, not describe it in later prose. This asserts
+# the property that matters rather than the wording: it lifts the keyed template
+# straight out of the generated brief, fills its placeholders, and folds the
+# result through the real classifier.
+test_crewmate_briefs_show_keyed_status_position() {
+  local home brief label line status_file open
+  home="$TMP_ROOT/keyed-position-home"
+  write_registry "$home"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-keyed-ship some-proj --mode no-mistakes >/dev/null 2>&1 \
+    || fail "keyed-position ship brief should scaffold"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-keyed-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "keyed-position scout brief should scaffold"
+
+  for label in brief-keyed-ship brief-keyed-scout; do
+    brief="$home/data/$label/brief.md"
+    # The one keyed echo template the worker is shown, reduced to the status text
+    # it would append.
+    line=$(grep -F 'echo "' "$brief" | grep -m1 -F '[key=' | sed -e 's/^[^"]*"//' -e 's/".*$//')
+    [ -n "$line" ] || fail "$label: brief shows no keyed status-line template for a worker to copy"
+    line=${line//\{state\}/needs-decision}
+    line=${line//\{slug\}/shown-key}
+    line=${line//\{one short line\}/pick an option}
+
+    status_file="$home/$label.status"
+    printf '%s\n' "$line" > "$status_file"
+    open=$(bash -c '. "$1"; status_open_decisions "$2"' _ "$ROOT/bin/fm-classify-lib.sh" "$status_file")
+    assert_contains "$open" "shown-key" \
+      "$label: the keyed template it shows does not actually open a decision under that key"
+    assert_not_contains "$open" "default" \
+      "$label: the keyed template it shows folds to the default key (token is on the wrong side of the colon)"
+  done
+  pass "fm-brief: crewmate briefs show a keyed status line that folds to its own key"
+}
+
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
@@ -730,3 +769,4 @@ test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_crewmate_briefs_show_keyed_status_position
