@@ -143,6 +143,24 @@ worker_recover_quarantine() { # <account-home>
   rm -f -- "$WORKER_LOCK/quarantine"
 }
 
+# The temp file of a publish that never finished. worker_publish_lock_owner and
+# worker_publish_quarantine both mktemp inside the lock and publish by mv, so a
+# worker killed between the two leaves one of these names behind while nothing
+# was ever published. rmdir refuses a non-empty directory, so leaving that
+# residue turns one interrupted shutdown into ownership no later worker can ever
+# reclaim - the lock is then held by nobody, forever. Only this worker's own
+# publish names are removable; anything else in an abandoned lock is
+# unaccounted for and refuses the reclaim rather than guessing.
+worker_clear_interrupted_publish() {
+  local entry
+  for entry in "$WORKER_LOCK"/.pid.* "$WORKER_LOCK"/.start.* \
+    "$WORKER_LOCK"/.command.* "$WORKER_LOCK"/.quarantine.*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    [ ! -L "$entry" ] && [ -f "$entry" ] || return 1
+    rm -f -- "$entry" || return 1
+  done
+}
+
 worker_acquire_lock() {
   local account_home=$1 attempt=0
   while [ "$attempt" -lt 150 ]; do
@@ -164,6 +182,7 @@ worker_acquire_lock() {
     fi
     [ ! -L "$WORKER_LOCK/pid" ] && [ ! -L "$WORKER_LOCK/start" ] && [ ! -L "$WORKER_LOCK/command" ] || return 1
     rm -f -- "$WORKER_LOCK/pid" "$WORKER_LOCK/start" "$WORKER_LOCK/command" || return 1
+    worker_clear_interrupted_publish || return 1
     rmdir "$WORKER_LOCK" || return 1
   done
   return 1
