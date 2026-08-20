@@ -11,6 +11,8 @@ metadata:
 # Durable unresolved-decision lifecycle
 
 This skill is the single policy owner for unresolved captain decisions discovered by an investigation or visual review.
+It does not own the keyed `needs-decision:`/`blocked:` records a worker appends to its own status log.
+Those are a separate object with their own teardown gate and their own closer, `bin/fm-status-decision-close.sh`; completing an inventory here never closes one, and never lets teardown erase one.
 
 ## Policy
 

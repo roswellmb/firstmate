@@ -285,6 +285,27 @@ wait "$OTHER_PID" 2>/dev/null || true
 OTHER_PID=
 pass "stale ownership is reclaimed without signaling a reused pid"
 
+# A worker killed between the mktemp and the mv of a publish leaves that temp
+# file inside the lock it still owned - the state a SIGKILLed shutdown reaches
+# under load. Reclaim has to survive it: rmdir refuses a non-empty directory, so
+# a lock left holding one is otherwise ownership no later worker can ever take,
+# and every ensure after it fails with a worker that never reports ready.
+INTERRUPTED_WORKER_PID=$(cat "$STATE_ROOT/worker.pid")
+fm_remote_job_stop_worker_tree "$INTERRUPTED_WORKER_PID" \
+  || fail "the interrupted-publish fixture could not stop the live worker"
+rm -rf -- "$STATE_ROOT/worker.lock"
+rm -f -- "$STATE_ROOT/worker.ready" "$STATE_ROOT/worker.pid" "$STATE_ROOT/worker.identity"
+(umask 077; mkdir "$STATE_ROOT/worker.lock") || fail "the interrupted-publish fixture could not stage a lock"
+INTERRUPTED_PUBLISH="$STATE_ROOT/worker.lock/.quarantine.fixture"
+: > "$INTERRUPTED_PUBLISH"
+chmod 600 "$INTERRUPTED_PUBLISH"
+touch -t 200001010000 "$STATE_ROOT/worker.lock"
+fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ACCOUNT_HOME" || fail "$FM_REMOTE_JOB_ERROR"
+assert_absent "$INTERRUPTED_PUBLISH" "reclaim kept the interrupted publish's temp file"
+fm_remote_job_worker_identity_matches "$REMOTE_ROOT" "$ACCOUNT_HOME" \
+  || fail "the reclaiming worker did not publish the current code identity"
+pass "an interrupted publish's temp file never wedges worker ownership"
+
 FM_REMOTE_JOB_TIMEOUT=1
 fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" fm-timeout-job.sh < /dev/null > /dev/null
 JOB_ID=$FM_REMOTE_JOB_ID

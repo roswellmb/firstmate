@@ -202,6 +202,7 @@ family_for_basename() {
       printf '%s\n' backend-dispatch
       ;;
     fm-pr-check-security.test.sh|fm-pr-merge.test.sh|fm-review-diff.test.sh|\
+    fm-status-decision-close.test.sh|\
     fm-teardown.test.sh|fm-x-mode.test.sh)
       printf '%s\n' pr-forge
       ;;
@@ -879,8 +880,16 @@ families_for_changed_path() {
       printf '%s\n' real-herdr-gated
       ;;
     bin/fm-watch*|bin/fm-wake*|bin/fm-inactive-reconcile.sh|bin/fm-dispatch-poll.sh|\
-    bin/fm-classify-lib.sh|bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
+    bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
       printf '%s\n' watcher-wake-lock
+      ;;
+    bin/fm-classify-lib.sh)
+      # The one owner of the open/resolved status fold. It decides both the
+      # watcher/drain OPEN DECISIONS surface and bin/fm-teardown.sh's
+      # open-decision refusal, so a change here re-runs the teardown family
+      # alongside the watcher one.
+      printf '%s\n' watcher-wake-lock
+      printf '%s\n' pr-forge
       ;;
     bin/fm-afk*)
       printf '%s\n' afk
@@ -967,7 +976,15 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       printf '%s\n' live-harness-optin
       ;;
-    bin/fm-send.sh|bin/fm-harness.sh|\
+    bin/fm-send.sh)
+      # fm-send's --resolve-key is the answerer-closes half of the decision
+      # ledger; its dead-endpoint counterpart is pinned in the pr-forge family
+      # next to the teardown refusal, so a change here re-runs that one too.
+      printf '%s\n' backend-dispatch
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' pr-forge
+      ;;
+    bin/fm-harness.sh|\
     bin/fm-peek.sh|bin/fm-composer*)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit

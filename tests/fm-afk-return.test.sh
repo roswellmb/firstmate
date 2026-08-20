@@ -272,9 +272,39 @@ test_check_retries_recorded_terminal_teardown() {
   pass "check retries recorded terminal teardown and keeps catch-up gated until success"
 }
 
+# The gate's closing advice is read at the moment an operator wants the gate
+# gone. A hand-appended resolved line skips the fold check both supported
+# closers perform, so the gate must name the closers instead. It names BOTH:
+# unlike a torn-down worker, a blocker listed here may still have someone alive
+# to answer it, and answering beats declaring it moot.
+test_blocker_gate_routes_to_supported_closers() {
+  local dir out rc
+  dir="$TMP_ROOT/closer-advice"
+  install_runner "$dir"
+  seed_live_blocker "$dir" tmux synthetic-dependency
+  date +%s > "$dir/home/state/.afk"
+
+  set +e
+  out=$(run_return "$dir" begin)
+  rc=$?
+  set -e
+  [ "$rc" -eq 3 ] || fail "return begin should gate on a live blocker (rc=$rc): $out"
+  assert_contains "$out" 'bin/fm-send.sh <task> --resolve-key <key>' \
+    "the gate should name the answerer-closes path for a blocker with a live worker"
+  assert_contains "$out" 'bin/fm-status-decision-close.sh <task> --key <key>' \
+    "the gate should name the deliberate closer for a blocker with no worker left"
+  assert_contains "$out" 'durable reclassification reason' \
+    "the gate should still require a durable reclassification reason as the close substance"
+  if printf '%s' "$out" | grep -F 'close it with resolved [key=' >/dev/null; then
+    fail "the gate still advises the fold-bypassing hand-append: $out"
+  fi
+  pass "return blocker gate routes closure through both supported closers, never a hand-append"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_evidence_publication_failure_preserves_wake_for_redrain
 test_away_reentry_refuses_pending_return_gate
 test_check_retries_recorded_terminal_teardown
+test_blocker_gate_routes_to_supported_closers

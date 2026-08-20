@@ -29,6 +29,30 @@
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
 # unresolved-decision completion gate verifies its captain-held inventory.
+# Separately from that captain-hold gate, and for EVERY kind, teardown REFUSES
+# while the task's status log still holds an open keyed decision, because cleanup
+# deletes state/<task-id>.status and the question with it. Openness is folded
+# through bin/fm-classify-lib.sh's status_open_decisions, the one owner of that
+# grammar, so this refusal always agrees with the OPEN DECISIONS listing. The
+# refusal names bin/fm-status-decision-close.sh, the supported way to close such
+# a decision when no live worker is left to deliver an answer to. --force still
+# completes, and records what it discarded in data/<task-id>/discarded-decisions.md.
+# So does an UNFORCED teardown that reaches the removal with a decision open: the
+# early gate cannot see one the crew appends while teardown is still doing its git
+# and PR work, and the crew stays alive until the worktree is returned. That block
+# claims no authority nobody gave - it says only that the decisions were open when
+# the log was removed and that the gate had already passed - but the property is
+# absolute, so silence is not an option on either path.
+# The record is written at the very end of each destroying path's refusals and
+# immediately before the status log is removed - record, verify, destroy, with
+# nothing between them - so it can only ever describe a removal that is actually
+# happening, and a record that cannot be written refuses with the log still in
+# place rather than losing the question.
+# The gate covers THIS home's ledger for THIS task. A forced secondmate
+# retirement's child cleanup below discards each child home's own ledger without
+# recording its decisions, which stays a deliberate boundary: that path already
+# refuses outright without --force, and a child's decisions belong to the child
+# home's own drain rather than this one's.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -56,8 +80,9 @@
 # leased home and state in place instead of hiding a still-held lease.
 # Usage: fm-teardown.sh <task-id> [--force]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
-#   checks, and discards secondmate child work for kind=secondmate. Only use it
-#   when the captain has explicitly said to discard the work.
+#   checks, discards secondmate child work for kind=secondmate, and discards an
+#   open status-log decision after recording it. Only use it when the captain has
+#   explicitly said to discard the work.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
@@ -168,6 +193,12 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-classify-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-line-cap-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-line-cap-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -391,6 +422,7 @@ remote_secondmate_teardown() {
   fi
   remote_pending_replies_cleanup \
     || { echo "error: remote pending-reply cleanup failed; preserving the local route for retry" >&2; return 1; }
+  teardown_record_discarded_decisions || return 1
   tmp="$SECONDMATE_REG.tmp.$$"
   grep -vE "^- $ID( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv -f -- "$tmp" "$SECONDMATE_REG"
@@ -419,6 +451,125 @@ remote_secondmate_teardown_locked() {
   remote_teardown_locks_release
   return "$rc"
 }
+
+# --- open status-log decision gate ------------------------------------------
+#
+# Cleanup below removes state/<id>.status, and with it any decision still open in
+# that log. An open decision at stand-down is one of two things: already answered
+# somewhere else, in which case that answer belongs in the record instead of being
+# invented, or genuinely open, in which case it is a question nobody has put to
+# the captain yet. Dropping it silently is the only outcome that can lose a real
+# question, so this gate exists to make sure something is always written about
+# what became of it.
+#
+# The open/resolved fold is read from bin/fm-classify-lib.sh, the one owner of
+# that grammar, so this refusal can never disagree with the OPEN DECISIONS
+# listing the operator was reading a moment ago - including the case where a key
+# written after the colon of a status line folds to `default`.
+#
+# Runs before the remote-secondmate retirement below and before every local
+# destructive step, because both paths remove the status log.
+teardown_open_decisions_gate() {
+  local status="$STATE/$ID.status" open key verb note
+  open=$(status_open_decisions "$status")
+  [ -n "$open" ] || return 0
+
+  if [ "$FORCE" != "--force" ]; then
+    echo "REFUSED: task $ID still has an open decision in its status log; cleanup would erase it." >&2
+    while IFS=$'\t' read -r key verb note; do
+      [ -n "$key" ] || continue
+      fm_cap_line_var "  [key=$key] $verb: $note"
+      printf '%s\n' "$FM_LINE_CAP_LINE" >&2
+    done <<EOF
+$open
+EOF
+    echo "With a live worker, answer it: bin/fm-send.sh $ID --resolve-key <key> '<answer>'" >&2
+    echo "With no live worker, close it deliberately: bin/fm-status-decision-close.sh $ID --key <key> --answered-elsewhere '<the answer that was given>'" >&2
+    echo "  or, if it no longer needs an answer: bin/fm-status-decision-close.sh $ID --key <key> --moot '<why>'" >&2
+    echo "Then rerun teardown. --force discards the decision after explicit captain approval, and records what it discarded." >&2
+    return 1
+  fi
+
+  # --force carries explicit discard authority, so cleanup proceeds here. What
+  # became of the decision is written by teardown_record_discarded_decisions
+  # below, on the destroying path itself, not from this early gate: a record
+  # written before anyone knows whether the teardown will happen is a record
+  # that can describe a discard that never occurred.
+  return 0
+}
+
+# Write what this teardown is about to remove, next to this task's brief and
+# report where it outlives the state dir. Called at the END of a destroying path's
+# refusals and immediately before that path removes state/<id>.status, so the
+# removal it describes is certain by the time it is written, and a write that
+# cannot be completed refuses with the log still in place. The open set is folded
+# through bin/fm-classify-lib.sh here rather than carried down from the gate, so
+# the record always names what is open at the moment of destruction.
+#
+# Two blocks, because the two cases are not the same thing and a later reader has
+# to be able to tell them apart. --force is a discard somebody authorized. An
+# unforced teardown reaching here means the gate passed with nothing open and the
+# decision was appended afterwards, during the window where the crew is still
+# alive; nobody authorized anything, and the block says only that.
+teardown_record_discarded_decisions() {
+  local status="$STATE/$ID.status" open record stamp block key verb note written
+  open=$(status_open_decisions "$status")
+  [ -n "$open" ] || return 0
+
+  record="$DATA/$ID/discarded-decisions.md"
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ -L "$DATA/$ID" ] || ! mkdir -p "$DATA/$ID" 2>/dev/null; then
+    echo "REFUSED: task $ID has an open decision and its discard record directory $DATA/$ID is unusable; the status log was left in place." >&2
+    return 1
+  fi
+  if [ -L "$record" ] || { [ -e "$record" ] && [ ! -f "$record" ]; }; then
+    echo "REFUSED: task $ID has an open decision and its discard record $record is not a regular file; the status log was left in place." >&2
+    return 1
+  fi
+  # Built whole, written by ONE checked append, then read back. A block assembled
+  # inside the redirection would report only its last command's status, and a
+  # status alone does not prove the bytes landed - so the record is confirmed
+  # present before the caller is allowed to delete the log it describes.
+  block=
+  [ -s "$record" ] || block="# Discarded decisions - $ID"$'\n'
+  if [ "$FORCE" = "--force" ]; then
+    block="$block"$'\n'"## $stamp - forced teardown"$'\n'$'\n'
+    block="${block}These decisions were open in task $ID's status log when a --force teardown"$'\n'
+    block="${block}removed it. --force carried explicit discard authority, so the log and every"$'\n'
+    block="${block}decision listed below went with it; nothing answered them."$'\n'$'\n'
+  else
+    block="$block"$'\n'"## $stamp - teardown without --force"$'\n'$'\n'
+    block="${block}These decisions were open in task $ID's status log at the moment teardown"$'\n'
+    block="${block}removed it. Nobody authorized ending them: this teardown was not forced."$'\n'
+    block="${block}Teardown's decision gate found nothing open when it ran, so these were"$'\n'
+    block="${block}appended after the last point at which teardown could still have refused."$'\n'$'\n'
+  fi
+  while IFS=$'\t' read -r key verb note; do
+    [ -n "$key" ] || continue
+    block="$block- [key=$key] $verb: $note"$'\n'
+  done <<EOF
+$open
+EOF
+  if ! printf '%s' "$block" >> "$record"; then
+    echo "REFUSED: task $ID has an open decision and it could not be recorded in $record; the status log was left in place." >&2
+    return 1
+  fi
+  written=$(cat "$record" 2>/dev/null) || written=
+  case "$written" in
+    *"${block%$'\n'}") ;;
+    *)
+      echo "REFUSED: task $ID has an open decision and its discard record in $record is incomplete; the status log was left in place." >&2
+      return 1
+      ;;
+  esac
+  if [ "$FORCE" = "--force" ]; then
+    echo "teardown $ID: the open decisions --force discarded were recorded in $record" >&2
+  else
+    echo "teardown $ID: a decision was open when its status log was removed; it was recorded in $record" >&2
+  fi
+  return 0
+}
+teardown_open_decisions_gate || exit 1
 
 if remote_secondmate_teardown_locked; then
   exit 0
@@ -2616,6 +2767,7 @@ rm -rf "$STATE/.browser-refusal/$ID"
 rmdir "$STATE/.browser-refusal" 2>/dev/null || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
+teardown_record_discarded_decisions || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \

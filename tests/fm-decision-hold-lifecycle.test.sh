@@ -396,8 +396,26 @@ test_terminal_single_owner_status_decision_does_not_block_empty_inventory() {
     || fail "terminal single-owner stale status decision blocked empty inventory completion"
   run_decisions "$home" verify "$id" >/dev/null \
     || fail "terminal single-owner stale status decision blocked inventory verification"
+
+  # The two decision objects have independent gates and both must pass. The
+  # structured captain-hold inventory above is an attestation about the REPORT;
+  # it says nothing about the worker's own recorded question, and teardown
+  # deletes the status log that holds it. So teardown refuses here, and the
+  # status-log decision has to be closed on its own terms
+  # (bin/fm-status-decision-close.sh) before the source can be erased. This is
+  # what keeps the inventory gate from silently standing in for the other object.
+  if run_teardown "$home" "$id" >/dev/null 2> "$home/terminal-teardown-refused.err"; then
+    fail "teardown erased a status log that still held an open decision"
+  fi
+  assert_contains "$(cat "$home/terminal-teardown-refused.err")" 'fm-status-decision-close.sh' \
+    "the teardown refusal should name the deliberate close"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    "$ROOT/bin/fm-status-decision-close.sh" "$id" --key default \
+    --moot 'the review inventory attested no unresolved captain choice remains' >/dev/null \
+    || fail "the stale status decision could not be closed deliberately"
+
   run_teardown "$home" "$id" >/dev/null 2> "$home/terminal-teardown.err" \
-    || fail "terminal single-owner stale status decision blocked teardown: $(cat "$home/terminal-teardown.err")"
+    || fail "terminal single-owner stale status decision blocked teardown after its deliberate close: $(cat "$home/terminal-teardown.err")"
 
   secondmate=sample-secondmate
   write_origin_meta "$home" "$secondmate" secondmate

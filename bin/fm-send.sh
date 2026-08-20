@@ -53,8 +53,9 @@
 # before sending, so a mistyped key cannot deliver an answer while silently
 # orphaning the decision. A failed or unconfirmed send never closes a key; a
 # delivered answer whose closing append fails exits nonzero with the exact
-# manual close command, leaving the decision open to re-surface (the safe
-# direction). A send without the flag never closes anything: a routine steer,
+# bin/fm-status-decision-close.sh invocation that closes it, leaving the
+# decision open to re-surface (the safe direction). A send without the flag
+# never closes anything: a routine steer,
 # working:, or done: event still cannot clear a captain decision. The flag is
 # refused with --key, with an explicit backend target (no task ledger in this
 # home), and with an empty message.
@@ -376,8 +377,12 @@ if [ -n "$RESOLVE_KEYS" ]; then
 fi
 
 # Close each answered decision in this home's ledger, only after delivery is
-# fully confirmed. An append failure exits nonzero with the manual close
-# command; the decision then stays open and re-surfaces, never silently lost.
+# fully confirmed. An append failure exits nonzero naming
+# bin/fm-status-decision-close.sh, the supported closer for a decision whose
+# answer already exists elsewhere; the decision meanwhile stays open and
+# re-surfaces, never silently lost. Do not offer a hand-appended
+# "resolved [key=...]" line here: that route skips the fold check the closer
+# performs, and a key it misfiles is one nothing can later resolve.
 fm_send_close_resolved_keys() {  # <answer-text>
   local note=$1 k line
   note=$(printf '%s' "$note" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177')
@@ -385,7 +390,7 @@ fm_send_close_resolved_keys() {  # <answer-text>
     line="resolved [key=$k]: answered: $note"
     fm_cap_line_var "$line"
     if ! printf '%s\n' "$FM_LINE_CAP_LINE" >> "$RESOLVE_STATUS_FILE"; then
-      echo "error: the answer was delivered to $T, but decision key '$k' could not be closed in $RESOLVE_STATUS_FILE. Close it manually with: echo 'resolved [key=$k]: <how it was answered>' >> $RESOLVE_STATUS_FILE - do not resend the answer." >&2
+      echo "error: the answer was delivered to $T, but decision key '$k' could not be closed in $RESOLVE_STATUS_FILE. Close it with: bin/fm-status-decision-close.sh $RESOLVE_TASK_ID --key $k --answered-elsewhere '<how it was answered>' - do not resend the answer." >&2
       return 1
     fi
   done
