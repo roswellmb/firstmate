@@ -127,6 +127,10 @@ EOF
   # depends on the busy worker writing a matching resolved line (contract:
   # bin/fm-send.sh header).
   printf "OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'\n"
+  # Second closer, for the case the first cannot reach: when the worker is gone,
+  # answerer-closes has nothing to deliver to and the decision is unclosable by
+  # that path (bin/fm-status-decision-close.sh header).
+  printf "OPEN DECISIONS: no worker left to answer? close it deliberately: bin/fm-status-decision-close.sh <task> --key <key> --answered-elsewhere '<answer>' | --moot '<why>'\n"
 }
 
 # shellcheck disable=SC2317,SC2329 # Invoked by trap handlers below.

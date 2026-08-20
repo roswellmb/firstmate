@@ -275,6 +275,26 @@ _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb
   printf '%s' "$open"
 }
 
+# 0 when appending <status-line> to a log whose current open set is <open-set>
+# would CLOSE <key>; nonzero when <key> would survive the append. A thin
+# predicate over the single fold above, so a writer can PROVE its closing line
+# takes effect before appending one the fold would ignore - a reserved-namespace
+# key only transitions on its owner's vocabulary, and a line that fails that
+# rule is folded as ordinary status rather than as a resolution. Without this,
+# the only way to learn a close was ignored is to append it and re-read, which
+# leaves a misleading "resolved" line in an append-only log next to a decision
+# that is still open. Pure text transform, no file I/O.
+status_line_closes_key() {  # <open-set> <status-line> <key>
+  local open=$1 line=$2 key=$3 after resolve held
+  resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+  held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+  after=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
+  case "$after" in
+    "$key"$'\t'*|*$'\n'"$key"$'\t'*) return 1 ;;
+  esac
+  return 0
+}
+
 # Fold the WHOLE status stream into the set of decisions still open. Prints one
 # TAB-separated "<key>\t<verb>\t<summary>" line per still-open decision, in
 # most-recently-opened-last order; prints nothing when none are open. Pure read of
