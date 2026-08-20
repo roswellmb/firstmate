@@ -31,10 +31,11 @@
 #       grammar case, including the misplaced-key fold to `default` - the two are
 #       compared against the same logs rather than against each other's source.
 #   (i) --force still completes, and writes what became of the open decision.
-#   (j) --force refuses when that record cannot be written, rather than losing it.
-#   (k) a teardown that refuses AFTER that record is written leaves a record that
-#       claims only the authorization, leaves the decision open, and does not
-#       stack a duplicate block when the operator reruns.
+#   (j) --force refuses when that record cannot be written, leaving the status log
+#       and the decision in place, and writing nothing at all.
+#   (k) the record is written only on the path that actually destroys: a --force
+#       teardown that refuses for any other reason leaves NO record behind, and a
+#       later successful --force run records every open decision exactly once.
 #   (l) the substance of a deliberate close is stored whole - the durable log is
 #       the only copy - while still being exactly one line.
 set -u
@@ -522,48 +523,56 @@ test_force_refuses_when_the_record_cannot_be_written() {
   out=$(run_teardown "$case_dir" --force 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "--force discarded an open decision it could not record: $out"
   assert_contains "$out" 'REFUSED' "an unrecordable discard should refuse"
+  # The record and the log stand or fall together: the log is removed only after
+  # the record is confirmed written, so a failed write must leave the question.
   [ -f "$case_dir/home/state/task-x1.status" ] \
     || fail "an unrecordable discard removed the status log anyway"
-  [ -d "$case_dir/wt" ] || fail "an unrecordable discard removed the worktree anyway"
+  drain_entries "$case_dir/home" task-x1 | grep -Fq '[key=api-shape]' \
+    || fail "the decision should still be open after an unrecordable discard"
   pass "--force refuses when the discard record cannot be written"
 }
 
-# --- (k) the record must not claim a teardown that did not happen -----------
+# --- (k) the record is written only where the discard actually happens ------
 
-test_force_record_states_authorization_and_does_not_duplicate() {
-  local case_dir rc out record before after
-  case_dir=$(make_teardown_case force-later-refusal)
+test_force_records_only_on_the_path_that_destroys() {
+  local case_dir rc out record heading_count
+  case_dir=$(make_teardown_case force-refuses-late)
   write_status "$case_dir/home" task-x1 \
-    'needs-decision [key=api-shape]: pick REST or gRPC before the migration'
-  # The record is written before teardown's remaining refusals, on purpose: a
-  # record that cannot be written must refuse before anything is destroyed. A
-  # second window= line makes the endpoint metadata ambiguous, so teardown's own
-  # cleanup-authorization check refuses AFTER the record has landed - the case
-  # where wording that asserted a completed discard would be a lie.
+    'needs-decision [key=api-shape]: pick REST or gRPC before the migration' \
+    'blocked [key=infra]: the staging cluster is down'
+  # A second window= line makes the endpoint metadata ambiguous, so teardown
+  # refuses on its own cleanup-authorization check and never reaches a discard.
   printf 'window=firstmate:fm-task-x1-stale\n' >> "$case_dir/home/state/task-x1.meta"
 
+  record="$case_dir/home/data/task-x1/discarded-decisions.md"
   out=$(run_teardown "$case_dir" --force 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "teardown completed despite ambiguous endpoint metadata: $out"
-
-  record="$case_dir/home/data/task-x1/discarded-decisions.md"
-  [ -f "$record" ] || fail "the discard record was not written before the later refusal"
+  [ -e "$record" ] \
+    && fail "a teardown that discarded nothing still wrote a discard record: $(cat "$record")"
   [ -f "$case_dir/home/state/task-x1.status" ] \
     || fail "a teardown that refused still removed the status log"
   drain_entries "$case_dir/home" task-x1 | grep -Fq '[key=api-shape]' \
     || fail "the decision should still be open after a refused teardown"
-  if grep -Fq 'torn down with --force' "$record"; then
-    fail "the record claims a teardown that did not happen: $(cat "$record")"
-  fi
-  grep -Fq 'authorized' "$record" \
-    || fail "the record should record the discard authorization: $(cat "$record")"
 
-  before=$(cat "$record")
+  # With the metadata fixed the discard really happens, and the record appears
+  # once, whole - no leftover from the run that refused to merge with.
+  grep -v '^window=firstmate:fm-task-x1-stale$' "$case_dir/home/state/task-x1.meta" \
+    > "$case_dir/home/state/task-x1.meta.fixed"
+  mv -f "$case_dir/home/state/task-x1.meta.fixed" "$case_dir/home/state/task-x1.meta"
+
   out=$(run_teardown "$case_dir" --force 2>&1) && rc=0 || rc=$?
-  [ "$rc" -ne 0 ] || fail "the rerun completed despite ambiguous endpoint metadata: $out"
-  after=$(cat "$record")
-  [ "$before" = "$after" ] \
-    || fail "a rerun appended a second block for the same still-open set: $after"
-  pass "a --force record states the authorization, survives a later refusal, and does not duplicate"
+  [ "$rc" -eq 0 ] || fail "--force teardown did not complete after the metadata was fixed: $out"
+  [ -f "$record" ] || fail "the completed discard was not recorded"
+  [ "$(grep -cF '[key=api-shape]' "$record")" = 1 ] \
+    || fail "the first decision was not recorded exactly once: $(cat "$record")"
+  [ "$(grep -cF '[key=infra]' "$record")" = 1 ] \
+    || fail "the second decision was not recorded exactly once: $(cat "$record")"
+  heading_count=$(grep -cF 'forced teardown' "$record")
+  [ "$heading_count" = 1 ] \
+    || fail "the record holds $heading_count blocks instead of one: $(cat "$record")"
+  [ -f "$case_dir/home/state/task-x1.status" ] \
+    && fail "the completed discard left the status log behind"
+  pass "the discard record is written only where the discard happens, and exactly once"
 }
 
 # --- (l) the durable close keeps its whole substance ------------------------
@@ -637,6 +646,6 @@ test_teardown_refuses_while_a_decision_is_open
 test_refusal_agrees_with_the_fold_on_every_grammar_case
 test_force_completes_and_records_the_discarded_decision
 test_force_refuses_when_the_record_cannot_be_written
-test_force_record_states_authorization_and_does_not_duplicate
+test_force_records_only_on_the_path_that_destroys
 test_close_substance_is_stored_whole
 test_checkout_is_unchanged_after_the_suite
