@@ -24,6 +24,32 @@ jobs:
       # re-spell the shellcheck command here; keep CI and the pre-push gate on it.
       - run: bin/fm-lint.sh
 
+  # The only redaction enforcement `git commit --no-verify` cannot bypass. Local
+  # hooks are per clone; this applies the same rules to every non-merge commit
+  # that would land on the default branch. Owner: bin/fm-redaction-guard.sh.
+  redaction:
+    name: Redaction guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check every commit in the range
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -eu
+          if [ -n "${PR_BASE_SHA:-}" ]; then
+            base=$PR_BASE_SHA
+          elif [ -n "${PUSH_BEFORE_SHA:-}" ] \
+            && git rev-parse --verify --quiet "$PUSH_BEFORE_SHA^{commit}" >/dev/null; then
+            base=$PUSH_BEFORE_SHA
+          else
+            base=$(git rev-parse HEAD~1)
+          fi
+          bin/fm-redaction-guard.sh check-range "$base..HEAD"
+
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates,
   # and that the portable serial CI shards partition that serial lane exactly.
