@@ -757,6 +757,8 @@ fm_lock_acquire_wait() {  # <lockdir>
   limit=$(( budget * 10 ))
   while ! fm_lock_try_acquire "$lockdir"; do
     if fm_lock_held_by_current_process "$lockdir"; then
+      # stderr only - this process's stdout may be the wake protocol.
+      printf 'fm-lock: already held by this process, proceeding without a fresh claim: %s\n' "$lockdir" >&2
       return 0
     fi
     if [ "$waited" -ge "$limit" ]; then

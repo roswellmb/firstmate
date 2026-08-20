@@ -521,7 +521,10 @@ procevent_surface_queued() {
   local key reason
   PROCEVENT_SURFACED=
   [ -s "$FM_WAKE_QUEUE" ] || return 0
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1
+  # A contended queue lock skips this cycle rather than killing the watcher: the
+  # queued procevent keys are still queued and still unmarked, so the next poll
+  # re-surfaces exactly the same set and nothing is lost.
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 0
   while IFS= read -r key; do
     case "$key" in procevent:*) ;; *) continue ;; esac
     [ -e "$(procevent_surfaced_marker "$key")" ] && continue
@@ -790,6 +793,15 @@ watcher_cleanup() {
     && ! fm_recovery_transition "$WATCHER_DOWNTIME_MARKER" "$transition" "$WATCH_LOCK" downtime; then
     echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
     cleanup_status=1
+  fi
+  # A signal can unwind out of a queue-then-marker critical section
+  # (_fm_recovery_marker_arm_check holds both), leaving the outer queue lock held
+  # by a pid that is about to die. Release it only when this process is its
+  # recorded holder, never another's, and only after the marker above is
+  # published, so the outer lock still covers the marker write the way the
+  # interrupted section intended.
+  if [ "$(cat "$FM_WAKE_QUEUE_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   fi
   return "$cleanup_status"
 }

@@ -114,6 +114,11 @@ test_watcher_signalled_inside_its_recovery_marker_lock_still_exits() {
     || fail "the watcher did not exit after one signal delivered inside its recovery-marker lock"
   [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
     || fail "the exiting watcher left its singleton lock behind"
+  # The interrupted critical section held the queue lock as well as the marker
+  # lock, so both halves must be unwound - otherwise the next fm-wake-drain pays
+  # a stale steal instead of a clean acquire.
+  [ ! -e "$state/.wake-queue.lock" ] && [ ! -L "$state/.wake-queue.lock" ] \
+    || fail "the exiting watcher left the wake-queue lock behind"
   marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
   case "$marker" in
     pending:downtime:*) ;;
