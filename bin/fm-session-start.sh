@@ -616,8 +616,23 @@ else
   # The same fleet-level dispatch-readiness check the watcher poll runs, on the
   # same locked path and ahead of the drain, so its verdict is presented in this
   # one digest rather than arriving as a separate wake minutes later.
-  DISPATCH_OUT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-dispatch-poll.sh" scan 2>&1) || DISPATCH_OUT=
+  # The scan bounds every external call it makes and reports hitting that bound
+  # as its own verdict, so this outer bound is only a backstop for whatever
+  # those inner bounds do not cover; it sits far above any legal inner bound
+  # (bin/fm-dispatch-poll.sh's header states the derivation) so it can never
+  # preempt one. Firing it is still reported rather than swallowed, because
+  # silence here would mean "I could not tell" - the one thing this check must
+  # never say quietly.
+  DISPATCH_BACKSTOP_SECS=100
+  DISPATCH_OUT=$(fm_run_timed "$DISPATCH_BACKSTOP_SECS" \
+    env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-dispatch-poll.sh" scan 2>&1)
+  DISPATCH_RC=$?
+  if [ "$DISPATCH_RC" -eq 124 ]; then
+    DISPATCH_OUT="scan hit its ${DISPATCH_BACKSTOP_SECS}s backstop bound and was stopped, so dispatch readiness is unestablished"
+  elif [ "$DISPATCH_RC" -ne 0 ]; then
+    DISPATCH_OUT=
+  fi
   if [ -n "$DISPATCH_OUT" ]; then
     printf 'dispatch readiness: %s\n' "$DISPATCH_OUT"
   fi

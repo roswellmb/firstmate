@@ -93,7 +93,17 @@ mkdir -p "$STATE"
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# The single owner of bounded command execution. Sourced explicitly rather than
+# leaned on transitively, because the dispatch-readiness backstop below is a
+# runtime dependency on it.
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
+# Backstop bound for the fleet-level dispatch-readiness scan. That scan bounds
+# each of its own external calls at FM_DISPATCH_BUDGET_SECS (1..30) and reports
+# a timeout as a verdict; this only catches anything outside those calls, so it
+# sits above three times the largest legal per-call bound.
+DISPATCH_SCAN_BACKSTOP_SECS=100
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
 WATCHER_DOWNTIME_MARKER="$STATE/.watcher-down"
@@ -894,8 +904,16 @@ while :; do
     # can never starve the per-task checks - whereas a per-task check that keeps
     # printing on every sweep (an unauthenticated state check sitting in the
     # directory, say) would starve it indefinitely from second place.
+    # The scan bounds every external call it makes and REPORTS hitting that
+    # bound as its own verdict, so this outer bound is only a backstop for
+    # whatever those inner bounds do not cover. It is deliberately far longer
+    # than any legal inner bound (bin/fm-dispatch-poll.sh's header states the
+    # derivation) so it can never preempt one and turn a reportable timeout into
+    # silence; when it does fire, the poll loop keeps moving and the failure
+    # lands in triage like any other unavailable scan.
     dispatch_out=
-    if dispatch_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    if dispatch_out=$(fm_run_timed "$DISPATCH_SCAN_BACKSTOP_SECS" \
+      env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
       "$SCRIPT_DIR/fm-dispatch-poll.sh" scan 2>/dev/null); then
       if [ -n "$dispatch_out" ]; then
         touch "$STATE/.last-check"

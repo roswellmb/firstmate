@@ -445,6 +445,181 @@ test_watcher_sweep_surfaces_a_changed_verdict() {
   pass "the watcher check sweep runs the dispatch-readiness check and surfaces a changed verdict"
 }
 
+# --- one durable record per verdict, newest wins ----------------------------
+
+# Every dispatch verdict is queued under the CONSTANT key "dispatch", so the
+# drain's kind+key collapse keeps only the newest. A superseded verdict names a
+# ready set that no longer exists, and presenting it as its own row is exactly
+# the noise that trains a reader to ignore the signal.
+test_superseded_verdicts_collapse_to_the_latest() {
+  have_tasks_axi || { skip_case constant-wake-key "tasks-axi not found"; return 0; }
+  make_home wakekey
+  local keys shown
+  add_task alpha "first"
+  scan >/dev/null
+  add_task beta "second"
+  scan >/dev/null
+  add_task gamma "third"
+  scan >/dev/null
+  [ "$(wakes)" = 3 ] || fail "three distinct verdicts did not queue three durable records"
+  keys=$(awk -F '\t' '$3 == "check" { print $4 }' "$STATE/.wake-queue" | LC_ALL=C sort -u)
+  [ "$keys" = dispatch ] \
+    || fail "dispatch wake records did not share one key, so the drain cannot collapse them: $keys"
+  shown=$(FM_STATE_OVERRIDE="$STATE" bash -c '
+    # shellcheck disable=SC1090,SC1091
+    . "$1"
+    fm_wake_print_deduped "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$STATE/.wake-queue")
+  [ "$(printf '%s\n' "$shown" | grep -c 'dispatch ready:')" = 1 ] \
+    || fail "the drain would present more than the current verdict: $shown"
+  assert_contains "$shown" "3 dispatchable" "the drain kept a superseded verdict instead of the newest"
+  pass "superseded verdicts collapse so only the current one is ever presented"
+}
+
+# --- nothing runs unbounded -------------------------------------------------
+
+test_a_hung_backlog_tool_is_reported_not_silently_killed() {
+  make_home hungtool
+  printf '# Backlog\n\n## In flight\n## Queued\n- [ ] alpha - first (since 2026-01-01)\n## Done\n' \
+    > "$DATA/backlog.md"
+  cat > "$FAKEBIN/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$FAKEBIN/tasks-axi"
+  FM_DISPATCH_BUDGET_SECS=1 scan >/dev/null
+  expect_code 0 "$SCAN_CODE" "a bounded backlog read that timed out did not exit 0"
+  assert_contains "$SCAN_OUT" "dispatch unknown" \
+    "a backlog tool that never returned was silently killed instead of reported"
+  assert_contains "$SCAN_OUT" "backlog-tool-timed-out" "the report did not name the bound it hit"
+  [ "$(wakes)" = 1 ] || fail "a bounded read that timed out did not queue a wake"
+  pass "an external call that hits its bound is reported, never silently killed"
+}
+
+test_an_unusable_budget_reports_rather_than_defaulting() {
+  make_home badbudget
+  printf '# Backlog\n\n## In flight\n## Queued\n- [ ] alpha - first (since 2026-01-01)\n## Done\n' \
+    > "$DATA/backlog.md"
+  FM_DISPATCH_BUDGET_SECS=not-a-number scan >/dev/null
+  assert_contains "$SCAN_OUT" "budget-invalid" "a non-numeric per-call bound was silently defaulted"
+  # Zero is not a bound: it disables the deadline outright in every mechanism
+  # bin/fm-timeout-lib.sh selects, so it must be rejected with the rest.
+  RESURFACE_SECS=0 FM_DISPATCH_BUDGET_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "budget-invalid" "a zero per-call bound was accepted as a bound"
+  RESURFACE_SECS=0 FM_DISPATCH_BUDGET_SECS=31 scan >/dev/null
+  assert_contains "$SCAN_OUT" "budget-invalid" "an out-of-range per-call bound was accepted"
+  pass "an unusable per-call bound reports rather than silently defaulting"
+}
+
+# --- one scan at a time -----------------------------------------------------
+
+test_a_scan_that_finds_the_lock_held_stays_silent() {
+  have_tasks_axi || { skip_case scan-lock "tasks-axi not found"; return 0; }
+  make_home scanlock
+  local holder
+  add_task alpha "first"
+  mkdir -p "$STATE/.dispatch-poll.lock"
+  sleep 30 &
+  holder=$!
+  printf '%s\n' "$holder" > "$STATE/.dispatch-poll.lock/pid"
+  scan >/dev/null
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  rm -rf "$STATE/.dispatch-poll.lock"
+  expect_code 0 "$SCAN_CODE" "a scan that found the lock held did not exit 0"
+  [ -z "$SCAN_OUT" ] || fail "a scan that found the lock held printed a line: $SCAN_OUT"
+  [ "$(wakes)" = 0 ] || fail "a scan that found the lock held duplicated the holder's wake"
+  assert_absent "$STATE/.dispatch-poll" "a scan that found the lock held rewrote the verdict record"
+  # The lock must not outlive a scan that took it, or the check would wedge shut.
+  scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch ready:" "the scan lock was not released for the next scan"
+  pass "a concurrent scan exits silently rather than queueing a second wake for one verdict"
+}
+
+# --- an unreadable brief is an inability, not an answer ---------------------
+
+test_unreadable_brief_reports_rather_than_claiming_intake() {
+  have_tasks_axi || { skip_case unreadable-brief "tasks-axi not found"; return 0; }
+  make_home unreadablebrief
+  add_task alpha "first"
+  give_brief alpha
+  chmod 000 "$DATA/alpha/brief.md"
+  scan >/dev/null
+  chmod 644 "$DATA/alpha/brief.md"
+  assert_contains "$SCAN_OUT" "dispatch unknown" \
+    "a brief that exists but cannot be read was not reported as an inability"
+  assert_contains "$SCAN_OUT" "brief-unreadable" "the report did not name why it could not evaluate"
+  assert_contains "$SCAN_OUT" "$DATA/alpha/brief.md" "the report did not name the unreadable brief"
+  assert_not_contains "$SCAN_OUT" "needs intake" \
+    "an unreadable brief was reported as a task needing a brief that already exists"
+  pass "a brief that exists but cannot be read reports rather than claiming the task needs intake"
+}
+
+# --- the capacity deadband --------------------------------------------------
+
+# A dispatch costs roughly one isolated copy, so the boundary moves in that same
+# unit: entering blocked is the plain test, leaving it needs one more copy of
+# room. Driven through the executable interface with a real pool directory of
+# measured size, and with generous margins so a few KiB of drift cannot flake it.
+test_blocked_verdict_holds_until_a_whole_clone_of_room_returns() {
+  have_tasks_axi || { skip_case capacity-deadband "tasks-axi not found"; return 0; }
+  make_home deadband
+  local pool clone_kb free_kb reserve_mb
+  pool="$HOME_DIR/pool"
+  mkdir -p "$pool/copy"
+  dd if=/dev/urandom of="$pool/copy/blob" bs=1048576 count=64 2>/dev/null \
+    || fail "fixture: could not write a measurable isolated copy"
+  add_task alpha "first"
+  clone_kb=$(du -sk "$pool/copy" | awk 'NR == 1 {print $1}')
+  free_kb=$(df -Pk "$pool" | awk 'NR == 2 {print $4}')
+  case "$clone_kb$free_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
+  [ "$clone_kb" -gt 32768 ] || fail "fixture: the measured copy is too small to damp with"
+
+  # 1. Free space below the floor: blocked, on the plain test.
+  reserve_mb=$(( free_kb / 1024 + 1024 ))
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch blocked:" "an exhausted disk did not block"
+  assert_contains "$SCAN_OUT" "release threshold" \
+    "the blocked verdict did not name how much room is needed to clear it"
+  [ "$(wakes)" = 1 ] || fail "the first blocked verdict did not queue a wake"
+
+  # 2. Free space back above the floor but not by a whole copy: still blocked,
+  #    and still silent, which is the entire point of the deadband.
+  reserve_mb=$(( (free_kb - clone_kb) / 1024 - 16 ))
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "a verdict inside the deadband woke firstmate again: $SCAN_OUT"
+  [ "$(wakes)" = 1 ] || fail "a verdict inside the deadband queued a second wake"
+  assert_grep 'verdict=blocked' "$STATE/.dispatch-poll" \
+    "free space barely above the floor released the blocked verdict"
+
+  # 3. Free space above the floor by a whole copy: released, and worth a wake.
+  reserve_mb=$(( (free_kb - 2 * clone_kb) / 1024 - 64 ))
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch ready:" \
+    "a whole copy of room above the floor did not release the blocked verdict"
+  [ "$(wakes)" = 2 ] || fail "releasing the blocked verdict did not queue a wake"
+  pass "a blocked verdict holds until a whole isolated copy of room returns"
+}
+
+# A home that has never made an isolated copy has no measured per-copy cost. The
+# honest answer is zero - not an inability, and not an invented number - which
+# degrades the floor to the operating-system reserve and the deadband to nothing.
+test_a_pool_with_no_copies_uses_the_plain_comparison() {
+  have_tasks_axi || { skip_case empty-pool "tasks-axi not found"; return 0; }
+  make_home emptypool
+  local pool
+  pool="$HOME_DIR/pool"
+  mkdir -p "$pool"
+  add_task alpha "first"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB=7 scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch ready:" "an empty pool did not evaluate the plain comparison"
+  assert_contains "$SCAN_OUT" "clone reserve 0 MiB" \
+    "an empty pool did not report a zero clone reserve, so a reader cannot see which case applied"
+  assert_contains "$SCAN_OUT" "against a 7 MiB floor" \
+    "an empty pool did not degrade the floor to the operating-system reserve alone"
+  pass "a pool with no isolated copy reports a zero clone reserve and the plain comparison"
+}
+
 # --- usage ------------------------------------------------------------------
 
 test_rejects_an_unknown_verb() {
@@ -477,5 +652,12 @@ test_unreadable_task_record_reports_rather_than_passes
 test_invalid_capacity_configuration_reports_rather_than_passes
 test_persisting_fault_resurfaces_on_a_bounded_cadence
 test_ready_verdict_never_resurfaces_on_cadence
+test_superseded_verdicts_collapse_to_the_latest
+test_a_hung_backlog_tool_is_reported_not_silently_killed
+test_an_unusable_budget_reports_rather_than_defaulting
+test_a_scan_that_finds_the_lock_held_stays_silent
+test_unreadable_brief_reports_rather_than_claiming_intake
+test_blocked_verdict_holds_until_a_whole_clone_of_room_returns
+test_a_pool_with_no_copies_uses_the_plain_comparison
 test_watcher_sweep_surfaces_a_changed_verdict
 test_rejects_an_unknown_verb

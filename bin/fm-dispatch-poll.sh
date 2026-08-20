@@ -42,6 +42,15 @@
 #   dispatch blocked: work is dispatchable but the machine has no room
 #   dispatch unknown: the answer could not be established, with the reason class
 #
+# ONE SCAN AT A TIME. The whole scan runs under a per-home lock in the state
+# directory, because surfacing a verdict is a read-modify-write of
+# state/.dispatch-poll and two concurrent scans would both read the same stale
+# signature and both queue a wake for one verdict. The lock is NON-blocking: a
+# scan that finds it held exits 0 silently, because the holder is computing the
+# identical verdict and a second wake for it is exactly the duplicate this check
+# exists to avoid. Neither the watcher poll loop nor the synchronous session
+# start ever waits on it.
+#
 # NO REPEATS. A verdict is surfaced only when its signature differs from the one
 # last surfaced (state/.dispatch-poll). "Changed" means the set of dispatchable
 # task ids changed, or one of them gained or lost a usable brief - the two facts
@@ -49,7 +58,20 @@
 # titles or notes, so editing a note is not a wake. A blocked or unknown verdict
 # additionally re-surfaces once per FM_DISPATCH_RESURFACE_SECS, because a fault
 # that goes quiet forever is how a fault rots invisibly; an unchanged ready set
-# never re-surfaces on that cadence.
+# never re-surfaces on that cadence. The durable wake record is keyed by the
+# CONSTANT string "dispatch", not by the signature, so the drain's kind+key
+# collapse keeps only the newest verdict: a superseded verdict describes a ready
+# set that no longer exists and must never be presented as its own row.
+#
+# NOTHING RUNS UNBOUNDED. Every external call that can hang - the two tasks-axi
+# reads and each directory walk in the clone measurement - runs under
+# FM_DISPATCH_BUDGET_SECS through bin/fm-timeout-lib.sh, and hitting the bound
+# is REPORTED as its own inability class (backlog-tool-timed-out,
+# copy-reserve-timed-out) rather than silently killed. The two call sites
+# (bin/fm-watch.sh and bin/fm-session-start.sh) additionally wrap the whole scan
+# in a 100-second backstop for anything those inner bounds do not cover; that is
+# more than three times the largest legal per-call bound, so the backstop can
+# never preempt an inner bound and turn a reportable timeout into silence.
 #
 # WHERE THE CAPACITY NUMBERS COME FROM. The gate is the machine, and only the
 # machine. Both terms of the floor are measured from sources that do not depend
@@ -61,10 +83,26 @@
 #      or not firstmate dispatches anything, so it is never space a worker may
 #      have. It is a property of the machine, read from the machine.
 #   2. The cost of one more isolated working copy, taken as the largest single
-#      project clone under $FM_HOME/projects. A clone's size is a property of
-#      the repository, not of the fleet, and those clones exist whether or not
-#      anything is dispatched. Measured at most once per
+#      entry in the isolated-copy pool on disk: the largest directory under the
+#      resolved pool root, and the largest project clone under
+#      $FM_HOME/projects, whichever is bigger. A live pool worktree carries
+#      build output that a bare clone does not, so the pool is the truer measure
+#      of what one more copy costs; projects/ is the fallback that still yields
+#      a number on a machine that has never dispatched anything. Taking the
+#      maximum means neither an empty pool nor an empty projects directory can
+#      silently produce a zero. Measured at most once per
 #      FM_DISPATCH_COPY_MEASURE_SECS and cached, so the ordinary scan is a df.
+#      A directory that yields no number at all from du is an inability, never a
+#      zero. When the pool root is only the $FM_HOME fallback - no configured
+#      pool root and no $HOME/.treehouse - its children are the home's own
+#      directories rather than isolated copies, so only projects/ is measured
+#      there; a fallback pool root is a filesystem handle for df, not a pool.
+#      If BOTH sources hold no measurable copy the clone reserve is 0, the floor
+#      degrades to the operating-system reserve alone, and the deadband below
+#      degrades to zero. That is the honest answer for a home that has never
+#      made an isolated copy, not an inability: there is no measured per-copy
+#      cost to report and the check must not invent one. The reported evidence
+#      names the clone reserve in every verdict, so a reader can see the zero.
 # There is deliberately NO cap on the number of live workers. AGENTS.md section
 # 7 already forbids a concurrency cap for independently validatable work, so a
 # number here would be firstmate policy smuggled into a shell script - and a
@@ -72,9 +110,21 @@
 # design is meant to avoid. The live-worker count is reported as evidence and
 # gates nothing.
 #
+# THE CAPACITY DEADBAND. A bare comparison against the floor flaps: a build or a
+# pool warm cycle pushes free space across the line and back, and every crossing
+# is a genuine signature change that costs a firstmate turn with nothing new to
+# do. The verdict is therefore sticky in one direction. ENTERING blocked keeps
+# the plain test, free below the floor. LEAVING it requires free space to exceed
+# the floor by one more clone, so the release threshold is floor plus clone.
+# That unit is measured from the pool rather than chosen, because one dispatch
+# costs roughly one isolated copy - the deadband moves in the same unit as the
+# thing it is damping. A previous verdict of ready, none, unknown, or no record
+# at all uses the plain test.
+#
 # Environment overrides (all optional):
 #   FM_DISPATCH_POOL_ROOT           path whose filesystem hosts isolated copies
 #   FM_DISPATCH_OS_RESERVE_MB       operating-system reserve, in MiB
+#   FM_DISPATCH_BUDGET_SECS         per-external-call bound, 1..30, default 20
 #   FM_DISPATCH_RESURFACE_SECS      bounded re-surface for blocked/unknown
 #   FM_DISPATCH_COPY_MEASURE_SECS   cache lifetime for the clone measurement
 #   FM_DISPATCH_LIST_LIMIT          identifiers named per group before "+N more"
@@ -88,9 +138,12 @@ DATA="$FM_HOME/data"
 BACKLOG="$DATA/backlog.md"
 RECORD="$STATE/.dispatch-poll"
 COPY_CACHE="$STATE/.dispatch-copy-reserve"
+SCAN_LOCK="$STATE/.dispatch-poll.lock"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 RESURFACE_SECS=${FM_DISPATCH_RESURFACE_SECS:-21600}
 case "$RESURFACE_SECS" in
@@ -156,6 +209,20 @@ record_write() { # <verdict> <signature> <epoch>
   mv -f "$tmp" "$RECORD" || { rm -f "$tmp"; return 1; }
 }
 
+# --- one scan at a time -----------------------------------------------------
+#
+# Taken before the previous verdict is read, so the read-decide-write cycle
+# below observes a record no other scan can move underneath it.
+fm_lock_try_acquire "$SCAN_LOCK" || exit 0
+trap 'fm_lock_release "$SCAN_LOCK"' EXIT
+
+# The previous verdict is read ONCE, here, and reused by both the capacity
+# deadband and the surface decision; two reads could straddle a record rewrite.
+PREV_VERDICT=$(record_value verdict)
+PREV_SIG=$(record_value signature)
+PREV_EPOCH=$(record_value surfaced_epoch)
+case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+
 # --- verdict assembly -------------------------------------------------------
 #
 # Each stage either establishes its fact or hands control to `undecidable`,
@@ -175,37 +242,51 @@ undecidable() { # <class> <reason>
 }
 
 surface() {
-  local prev_verdict prev_sig prev_epoch epoch age key
+  local epoch age
   epoch=$(now_epoch)
-  prev_verdict=$(record_value verdict)
-  prev_sig=$(record_value signature)
-  prev_epoch=$(record_value surfaced_epoch)
-  case "$prev_epoch" in ''|*[!0-9]*) prev_epoch=0 ;; esac
 
   if [ "$VERDICT" = none ]; then
     # Nothing to say, and nothing to remember either: a home that has never
     # surfaced a verdict stays untouched rather than acquiring a record that
     # only says "still quiet".
-    if [ -n "$prev_verdict" ] && [ "$prev_verdict" != none ]; then
+    if [ -n "$PREV_VERDICT" ] && [ "$PREV_VERDICT" != none ]; then
       record_write none "$SIGNATURE" "$epoch" || exit 1
     fi
     return 0
   fi
 
-  if [ "$SIGNATURE" = "$prev_sig" ] && [ -n "$prev_sig" ]; then
+  if [ "$SIGNATURE" = "$PREV_SIG" ] && [ -n "$PREV_SIG" ]; then
     # An unchanged ready set is never repeated. A persisting fault or a
     # persisting lack of room re-surfaces only on the bounded cadence.
     [ "$VERDICT" = ready ] && return 0
-    age=$((epoch - prev_epoch))
+    age=$((epoch - PREV_EPOCH))
     [ "$age" -ge 0 ] || age=0
     [ "$age" -ge "$RESURFACE_SECS" ] || return 0
   fi
 
-  key="dispatch:$(printf '%s' "$SIGNATURE" | cut -c1-12)"
-  fm_wake_append check "$key" "$PAYLOAD" || exit 1
+  # The key is constant on purpose. fm_wake_print_deduped collapses queued
+  # records on kind+key and keeps the newest per key, which is exactly right
+  # here: only the latest verdict is true. The signature stays in the record
+  # above, where it belongs, as the change detector.
+  fm_wake_append check dispatch "$PAYLOAD" || exit 1
   record_write "$VERDICT" "$SIGNATURE" "$epoch" || exit 1
   printf 'actionable: %s\n' "$PAYLOAD"
 }
+
+# --- 0. the per-call bound --------------------------------------------------
+#
+# An unusable bound is rejected rather than quietly replaced by the default: a
+# bound that is not what the operator asked for is a fact this check could not
+# establish, and every one of those is reported. A non-positive value is not a
+# bound at all - `timeout 0` and the perl fallback's `alarm 0` both disable the
+# deadline outright - so zero is rejected with the rest.
+BUDGET_SECS=${FM_DISPATCH_BUDGET_SECS:-20}
+case "$BUDGET_SECS" in
+  ''|*[!0-9]*|0) undecidable budget-invalid \
+    "FM_DISPATCH_BUDGET_SECS must be a whole number of seconds from 1 to 30: $BUDGET_SECS" ;;
+esac
+[ "$BUDGET_SECS" -le 30 ] || undecidable budget-invalid \
+  "FM_DISPATCH_BUDGET_SECS must be a whole number of seconds from 1 to 30: $BUDGET_SECS"
 
 # --- 1. the backlog file ----------------------------------------------------
 #
@@ -238,7 +319,11 @@ cat "$BACKLOG" > /dev/null 2>&1 || undecidable backlog-unreadable \
 command -v tasks-axi >/dev/null 2>&1 || undecidable tasks-axi-unavailable \
   "tasks-axi is not on PATH, so dispatchable work cannot be established"
 
-READY_OUT=$(tasks-axi ready --file "$BACKLOG" 2>&1) || undecidable tasks-axi-failed \
+READY_OUT=$(fm_run_timed "$BUDGET_SECS" tasks-axi ready --file "$BACKLOG" 2>&1)
+READY_RC=$?
+[ "$READY_RC" -ne 124 ] || undecidable backlog-tool-timed-out \
+  "tasks-axi ready did not finish within ${BUDGET_SECS}s and was stopped"
+[ "$READY_RC" -eq 0 ] || undecidable tasks-axi-failed \
   "tasks-axi ready failed: $(printf '%s' "$READY_OUT" | head -1)"
 case "$READY_OUT" in
   error:*|*$'\n'error:*) undecidable tasks-axi-failed \
@@ -285,7 +370,11 @@ if [ "$READY_DECLARED" -eq 0 ]; then
   ITEM_LINES=$(grep -c '^[-*][[:space:]]' "$BACKLOG" 2>/dev/null || printf '0')
   case "$ITEM_LINES" in ''|*[!0-9]*) ITEM_LINES=0 ;; esac
   if [ "$ITEM_LINES" -gt 0 ]; then
-    LIST_OUT=$(tasks-axi list --file "$BACKLOG" 2>&1) || undecidable tasks-axi-failed \
+    LIST_OUT=$(fm_run_timed "$BUDGET_SECS" tasks-axi list --file "$BACKLOG" 2>&1)
+    LIST_RC=$?
+    [ "$LIST_RC" -ne 124 ] || undecidable backlog-tool-timed-out \
+      "tasks-axi list did not finish within ${BUDGET_SECS}s while cross-checking an empty ready set"
+    [ "$LIST_RC" -eq 0 ] || undecidable tasks-axi-failed \
       "tasks-axi list failed while cross-checking an empty ready set"
     LIST_TOTAL=$(printf '%s\n' "$LIST_OUT" | sed -n 's/^count: \([0-9][0-9]*\)$/\1/p' | head -1)
     case "$LIST_TOTAL" in
@@ -338,11 +427,17 @@ if [ -z "$DISPATCHABLE" ]; then
 fi
 
 # --- 5. ready to go, or needs intake first ----------------------------------
-
+#
+# An absent brief and an empty brief are genuine answers: there is no brief, so
+# the task needs intake. A brief that EXISTS and cannot be read is neither - it
+# is an inability to establish the fact, and calling it "needs intake" would
+# tell firstmate to write a brief that already exists while never naming the
+# unreadable file. The caller routes that third answer to `undecidable`, which
+# is why this prints a state rather than deciding one.
 brief_state() { # <id>
   local brief="$DATA/$1/brief.md" text
   [ -f "$brief" ] || { printf intake; return; }
-  text=$(cat "$brief" 2>/dev/null) || { printf intake; return; }
+  text=$(cat "$brief" 2>/dev/null) || { printf unreadable; return; }
   [ -n "$text" ] || { printf intake; return; }
   # A scaffold whose {TASK} placeholder is still unreplaced is not a brief: it
   # carries no task, and AGENTS.md section 11 makes replacing it part of intake.
@@ -361,6 +456,8 @@ SIG_BODY=
 for id in $DISPATCHABLE; do
   COUNT=$((COUNT + 1))
   state=$(brief_state "$id")
+  [ "$state" != unreadable ] || undecidable brief-unreadable \
+    "a brief exists but cannot be read: $DATA/$id/brief.md"
   SIG_BODY="$SIG_BODY$id	$state
 "
   if [ "$state" = briefed ]; then
@@ -403,12 +500,18 @@ else
   fi
 fi
 
+# A configured pool root, or the real one, is a directory OF isolated copies and
+# its children are the right thing to measure. The $FM_HOME fallback is not: it
+# is only a filesystem handle so df has a path, and its children are the home's
+# own state, data, and projects directories rather than copies.
 POOL_ROOT=${FM_DISPATCH_POOL_ROOT:-}
+POOL_HOLDS_COPIES=1
 if [ -z "$POOL_ROOT" ]; then
   if [ -n "${HOME:-}" ] && [ -d "$HOME/.treehouse" ]; then
     POOL_ROOT="$HOME/.treehouse"
   else
     POOL_ROOT="$FM_HOME"
+    POOL_HOLDS_COPIES=0
   fi
 fi
 [ -d "$POOL_ROOT" ] || undecidable disk-unmeasurable \
@@ -420,6 +523,29 @@ case "$FREE_KB" in
   ''|*[!0-9]*) undecidable disk-unmeasurable \
     "free space on $POOL_ROOT could not be read from df output" ;;
 esac
+
+# Raise MEASURED_KB to the largest immediate child of <parent>. du reports its
+# total even when it could not stat everything underneath, and a live copy
+# churns while it is walked, so the number is what matters here; producing no
+# number at all is the genuine inability, and so is failing to finish.
+MEASURED_KB=0
+measure_largest() { # <parent>
+  local parent=$1 entry entry_kb du_out du_rc
+  [ -d "$parent" ] || return 0
+  for entry in "$parent"/*/; do
+    [ -d "$entry" ] || continue
+    du_out=$(fm_run_timed "$BUDGET_SECS" du -sk "$entry" 2>/dev/null)
+    du_rc=$?
+    [ "$du_rc" -ne 124 ] || undecidable copy-reserve-timed-out \
+      "measuring the isolated copy at $entry did not finish within ${BUDGET_SECS}s"
+    entry_kb=$(printf '%s\n' "$du_out" | awk 'NR == 1 {print $1}')
+    case "$entry_kb" in
+      ''|*[!0-9]*) undecidable copy-reserve-unmeasurable \
+        "the size of the isolated copy at $entry could not be measured" ;;
+    esac
+    [ "$entry_kb" -le "$MEASURED_KB" ] || MEASURED_KB=$entry_kb
+  done
+}
 
 # The clone measurement is cached because it is the one part of the floor that
 # walks the disk; everything else in a scan is a handful of stats.
@@ -442,19 +568,11 @@ if [ -f "$COPY_CACHE" ]; then
   esac
 fi
 if [ -z "$COPY_KB" ]; then
-  COPY_KB=0
-  for clone in "$FM_HOME"/projects/*/; do
-    [ -d "$clone" ] || continue
-    # du reports its total even when it could not stat everything underneath, and
-    # a live clone churns while it is walked, so the number is what matters here;
-    # producing no number at all is the genuine inability.
-    CLONE_KB=$(du -sk "$clone" 2>/dev/null | awk 'NR == 1 {print $1}')
-    case "$CLONE_KB" in
-      ''|*[!0-9]*) undecidable copy-reserve-unmeasurable \
-        "the size of the project clone at $clone could not be measured" ;;
-    esac
-    [ "$CLONE_KB" -le "$COPY_KB" ] || COPY_KB=$CLONE_KB
-  done
+  if [ "$POOL_HOLDS_COPIES" -eq 1 ]; then
+    measure_largest "$POOL_ROOT"
+  fi
+  measure_largest "$FM_HOME/projects"
+  COPY_KB=$MEASURED_KB
   TMP_CACHE=$(umask 077; mktemp "$STATE/.dispatch-copy-reserve.XXXXXX") || TMP_CACHE=
   if [ -n "$TMP_CACHE" ]; then
     if printf '%s\n' "$COPY_KB" > "$TMP_CACHE"; then
@@ -466,19 +584,31 @@ if [ -z "$COPY_KB" ]; then
 fi
 
 FLOOR_KB=$((OS_RESERVE_KB + COPY_KB))
+# One more clone of room above the floor before a blocked verdict is released.
+# With no measurable copy anywhere the deadband is zero and the test below is
+# the plain one.
+RELEASE_KB=$((FLOOR_KB + COPY_KB))
 FREE_MIB=$((FREE_KB / 1024))
 FLOOR_MIB=$((FLOOR_KB / 1024))
+RELEASE_MIB=$((RELEASE_KB / 1024))
+COPY_MIB=$((COPY_KB / 1024))
 
 # --- 7. the verdict ---------------------------------------------------------
 
-if [ "$FREE_KB" -lt "$FLOOR_KB" ]; then
+if [ "$PREV_VERDICT" = blocked ]; then
+  THRESHOLD_KB=$RELEASE_KB
+else
+  THRESHOLD_KB=$FLOOR_KB
+fi
+
+if [ "$FREE_KB" -lt "$THRESHOLD_KB" ]; then
   VERDICT=blocked
   SIGNATURE=$(printf 'blocked\n' | sig_hash)
-  PAYLOAD="dispatch blocked: $COUNT dispatchable but no room for another isolated copy; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor; live workers $LIVE_WORKERS"
+  PAYLOAD="dispatch blocked: $COUNT dispatchable but no room for another isolated copy; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor, and $RELEASE_MIB MiB is the release threshold; clone reserve $COPY_MIB MiB; live workers $LIVE_WORKERS"
 else
   VERDICT=ready
   SIGNATURE=$(printf 'ready\n%s' "$SIG_BODY" | sig_hash)
-  PAYLOAD="dispatch ready: $COUNT dispatchable ($BRIEFED_N briefed, $INTAKE_N need intake); briefed: $BRIEFED; needs intake: $INTAKE; live workers $LIVE_WORKERS; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor; full list: tasks-axi ready --file $BACKLOG"
+  PAYLOAD="dispatch ready: $COUNT dispatchable ($BRIEFED_N briefed, $INTAKE_N need intake); briefed: $BRIEFED; needs intake: $INTAKE; live workers $LIVE_WORKERS; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor; clone reserve $COPY_MIB MiB; full list: tasks-axi ready --file $BACKLOG"
 fi
 surface
 exit 0
