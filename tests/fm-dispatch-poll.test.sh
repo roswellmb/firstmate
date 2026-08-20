@@ -67,6 +67,12 @@ scan() {
   printf '%s' "$SCAN_OUT"
 }
 
+# free_kb_of <path>: the volume's own free space, read with its own df so a case
+# can size a floor against the real number rather than a guess.
+free_kb_of() {
+  df -Pk "$1" | awk 'NR == 2 {print $4}'
+}
+
 wakes() { # count queued wake records mentioning dispatch
   grep -c 'dispatch' "$STATE/.wake-queue" 2>/dev/null || printf '0\n'
 }
@@ -419,6 +425,175 @@ test_ready_verdict_never_resurfaces_on_cadence() {
   pass "the bounded re-surface cadence never applies to an unchanged ready set"
 }
 
+# --- the copy measurement reads copies, not pools ---------------------------
+
+# Treehouse lays the pool out as <pool-root>/<repo>-<hash>/<N>, so a pool-root
+# child is a per-repo POOL holding several worktrees and one isolated copy is
+# the numbered directory below it. Measuring the child would report the sum of
+# every worktree as the cost of one copy.
+test_pool_copies_are_measured_below_the_per_repo_pool() {
+  have_tasks_axi || { skip_case pool-depth "tasks-axi not found"; return 0; }
+  make_home pooldepth
+  local pool copy_kb pool_kb reserve_mb
+  pool="$HOME_DIR/pool"
+  mkdir -p "$pool/repo-abc123/1" "$pool/repo-abc123/2"
+  dd if=/dev/urandom of="$pool/repo-abc123/1/blob" bs=1048576 count=48 2>/dev/null \
+    || fail "fixture: could not write the first worktree"
+  dd if=/dev/urandom of="$pool/repo-abc123/2/blob" bs=1048576 count=48 2>/dev/null \
+    || fail "fixture: could not write the second worktree"
+  printf '{}\n' > "$pool/repo-abc123/treehouse-state.json"
+  add_task alpha "first"
+  copy_kb=$(du -sk "$pool/repo-abc123/1" | awk 'NR == 1 {print $1}')
+  pool_kb=$(du -sk "$pool/repo-abc123" | awk 'NR == 1 {print $1}')
+  case "$copy_kb$pool_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
+  [ "$pool_kb" -gt "$((copy_kb + copy_kb / 2))" ] \
+    || fail "fixture: the pool is not meaningfully larger than one worktree"
+
+  # Both numbers the capacity rule is computed from are in the payload, so the
+  # depth is observable through the executable interface rather than inferred:
+  # the clone reserve must be ONE worktree, and the floor must be the reserve
+  # plus that same one worktree, not the reserve plus the whole pool.
+  reserve_mb=7
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_contains "$SCAN_OUT" "clone reserve $((copy_kb / 1024)) MiB" \
+    "the reported clone reserve is the sum of every worktree in the pool, not one isolated copy"
+  assert_contains "$SCAN_OUT" "against a $(( (reserve_mb * 1024 + copy_kb) / 1024 )) MiB floor" \
+    "the capacity floor was built from pool depth rather than from one isolated copy"
+  assert_not_contains "$SCAN_OUT" "clone reserve $((pool_kb / 1024)) MiB" \
+    "the clone reserve matched the whole pool"
+  pass "the pool is read one level down, so the clone reserve is one copy and not a whole pool"
+}
+
+# A pool root that holds copies directly, with no per-repo level, must still
+# yield a number rather than silently measuring nothing.
+test_a_pool_root_holding_copies_directly_still_measures() {
+  have_tasks_axi || { skip_case pool-depth-fallback "tasks-axi not found"; return 0; }
+  make_home pooldirect
+  local pool copy_kb reserve_mb
+  pool="$HOME_DIR/pool"
+  mkdir -p "$pool/lone-copy"
+  dd if=/dev/urandom of="$pool/lone-copy/blob" bs=1048576 count=48 2>/dev/null \
+    || fail "fixture: could not write the copy"
+  add_task alpha "first"
+  copy_kb=$(du -sk "$pool/lone-copy" | awk 'NR == 1 {print $1}')
+  reserve_mb=7
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_contains "$SCAN_OUT" "clone reserve $((copy_kb / 1024)) MiB" \
+    "a pool root holding copies directly did not fall back to measuring the child itself"
+  pass "a pool root that holds copies directly still yields a clone reserve"
+}
+
+test_the_copy_measurement_shares_one_deadline() {
+  make_home copydeadline
+  local pool i
+  printf '# Backlog\n\n## In flight\n## Queued\n- [ ] alpha - first (since 2026-01-01)\n## Done\n' \
+    > "$DATA/backlog.md"
+  pool="$HOME_DIR/pool"
+  for i in 1 2 3 4 5 6; do
+    mkdir -p "$pool/repo-$i/1"
+  done
+  # Each du individually finishes well inside the per-unit bound, so only a
+  # SHARED deadline can stop the walk; a per-directory bound would let six legal
+  # walks add up past the caller's backstop and report nothing at all.
+  cat > "$FAKEBIN/du" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+printf '1024	%s
+' "${!#}"
+SH
+  chmod +x "$FAKEBIN/du"
+  cat > "$FAKEBIN/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+printf 'ready[1]{id,state,kind,repo,title}
+'
+printf '  alpha,queued,ship,none,first
+'
+SH
+  chmod +x "$FAKEBIN/tasks-axi"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 scan >/dev/null
+  expect_code 0 "$SCAN_CODE" "an exhausted measurement deadline did not exit 0"
+  assert_contains "$SCAN_OUT" "dispatch unknown" \
+    "a copy measurement that ran past its shared deadline was not reported"
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
+    "the report did not name the measurement budget it exhausted"
+  [ "$(wakes)" = 1 ] || fail "an exhausted measurement deadline did not queue a wake"
+  pass "the copy measurement shares one deadline rather than multiplying a per-directory bound"
+}
+
+# --- the deadband survives an intervening verdict ---------------------------
+
+# The blocked boundary lives in its own record field, so a verdict that does not
+# evaluate capacity carries it through instead of erasing it. Reading the
+# verdict field instead would let an emptied ready set, or one transient
+# timeout, release the boundary with the disk unchanged.
+deadband_holds_across() { # <label> <how-to-produce-the-intervening-verdict>
+  local label=$1 intervene=$2 pool copy_kb free_kb reserve_mb
+  make_home "deadband-$label"
+  pool="$HOME_DIR/pool"
+  mkdir -p "$pool/repo-abc/1"
+  dd if=/dev/urandom of="$pool/repo-abc/1/blob" bs=1048576 count=64 2>/dev/null \
+    || fail "fixture: could not write a measurable isolated copy"
+  add_task alpha "first"
+  copy_kb=$(du -sk "$pool/repo-abc/1" | awk 'NR == 1 {print $1}')
+  free_kb=$(free_kb_of "$pool")
+  case "$copy_kb$free_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
+
+  reserve_mb=$(( free_kb / 1024 + 1024 ))
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch blocked:" "the boundary was never entered"
+  assert_grep 'capacity_blocked=yes' "$STATE/.dispatch-poll" \
+    "entering the blocked boundary did not record it in its own field"
+
+  "$intervene"
+  assert_grep 'capacity_blocked=yes' "$STATE/.dispatch-poll" \
+    "an intervening $label verdict erased the blocked boundary"
+
+  # Free space back above the floor but not by a whole copy. The boundary must
+  # still hold, which it can only do if the intervening verdict carried it.
+  reserve_mb=$(( (free_kb - copy_kb) / 1024 - 16 ))
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_not_contains "$SCAN_OUT" "dispatch ready:" \
+    "an intervening $label verdict let the deadband release with the disk unchanged"
+  assert_grep 'capacity_blocked=yes' "$STATE/.dispatch-poll" \
+    "the blocked boundary did not survive an intervening $label verdict"
+
+  # And it still releases for real once a whole copy of room returns.
+  reserve_mb=$(( (free_kb - 2 * copy_kb) / 1024 - 64 ))
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch ready:" \
+    "a whole copy of room above the floor did not release the boundary"
+  assert_grep 'capacity_blocked=no' "$STATE/.dispatch-poll" \
+    "releasing the boundary did not clear its field"
+}
+
+test_deadband_survives_an_intervening_none_verdict() {
+  have_tasks_axi || { skip_case deadband-none "tasks-axi not found"; return 0; }
+  deadband_holds_across none intervene_with_none
+  pass "an emptied ready set does not release the capacity deadband"
+}
+
+intervene_with_none() {
+  tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not start alpha"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$HOME_DIR/pool" scan >/dev/null
+  assert_grep 'verdict=none' "$STATE/.dispatch-poll" "the intervening verdict was not none"
+  tasks-axi reopen alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not reopen alpha"
+}
+
+test_deadband_survives_an_intervening_unknown_verdict() {
+  have_tasks_axi || { skip_case deadband-unknown "tasks-axi not found"; return 0; }
+  deadband_holds_across unknown intervene_with_unknown
+  pass "a transient inability does not release the capacity deadband"
+}
+
+intervene_with_unknown() {
+  chmod 000 "$DATA/backlog.md"
+  RESURFACE_SECS=0 FM_DISPATCH_POOL_ROOT_OVERRIDE="$HOME_DIR/pool" scan >/dev/null
+  chmod 644 "$DATA/backlog.md"
+  assert_grep 'verdict=unknown' "$STATE/.dispatch-poll" "the intervening verdict was not unknown"
+}
+
 # --- the watcher actually runs it -------------------------------------------
 
 test_watcher_sweep_surfaces_a_changed_verdict() {
@@ -571,7 +746,7 @@ test_blocked_verdict_holds_until_a_whole_clone_of_room_returns() {
     || fail "fixture: could not write a measurable isolated copy"
   add_task alpha "first"
   clone_kb=$(du -sk "$pool/copy" | awk 'NR == 1 {print $1}')
-  free_kb=$(df -Pk "$pool" | awk 'NR == 2 {print $4}')
+  free_kb=$(free_kb_of "$pool")
   case "$clone_kb$free_kb" in *[!0-9]*|'') fail "fixture: could not size the pool" ;; esac
   [ "$clone_kb" -gt 32768 ] || fail "fixture: the measured copy is too small to damp with"
 
@@ -659,5 +834,10 @@ test_a_scan_that_finds_the_lock_held_stays_silent
 test_unreadable_brief_reports_rather_than_claiming_intake
 test_blocked_verdict_holds_until_a_whole_clone_of_room_returns
 test_a_pool_with_no_copies_uses_the_plain_comparison
+test_pool_copies_are_measured_below_the_per_repo_pool
+test_a_pool_root_holding_copies_directly_still_measures
+test_the_copy_measurement_shares_one_deadline
+test_deadband_survives_an_intervening_none_verdict
+test_deadband_survives_an_intervening_unknown_verdict
 test_watcher_sweep_surfaces_a_changed_verdict
 test_rejects_an_unknown_verb

@@ -63,15 +63,28 @@
 # collapse keeps only the newest verdict: a superseded verdict describes a ready
 # set that no longer exists and must never be presented as its own row.
 #
-# NOTHING RUNS UNBOUNDED. Every external call that can hang - the two tasks-axi
-# reads and each directory walk in the clone measurement - runs under
-# FM_DISPATCH_BUDGET_SECS through bin/fm-timeout-lib.sh, and hitting the bound
-# is REPORTED as its own inability class (backlog-tool-timed-out,
-# copy-reserve-timed-out) rather than silently killed. The two call sites
-# (bin/fm-watch.sh and bin/fm-session-start.sh) additionally wrap the whole scan
-# in a 100-second backstop for anything those inner bounds do not cover; that is
-# more than three times the largest legal per-call bound, so the backstop can
-# never preempt an inner bound and turn a reportable timeout into silence.
+# NOTHING RUNS UNBOUNDED, AND THE BOUNDS DO NOT COMPOSE. A scan performs exactly
+# THREE bounded units of work, each capped at FM_DISPATCH_BUDGET_SECS through
+# bin/fm-timeout-lib.sh: the tasks-axi ready read, the tasks-axi list
+# cross-check, and the whole copy measurement. The copy measurement walks an
+# unbounded number of directories, so it gets ONE AGGREGATE deadline rather than
+# a bound per directory: the deadline is computed once, and each du runs under
+# whatever remains of it. A per-directory bound would multiply without limit and
+# let many individually-legal walks add up past the caller's backstop, which
+# would turn a reportable timeout back into silence. Hitting any of the three is
+# REPORTED as its own inability class (backlog-tool-timed-out,
+# copy-reserve-timed-out) rather than silently killed.
+#
+# The two call sites bound the whole scan as well, and they size that backstop
+# differently on purpose. bin/fm-watch.sh has no enclosing deadline, so its
+# backstop sits above three times the largest legal FM_DISPATCH_BUDGET_SECS and
+# therefore cannot preempt an inner bound. bin/fm-session-start.sh runs inside
+# its own total startup budget at an early stage, so a backstop long enough to
+# never preempt an inner bound would instead let a hung scan truncate the whole
+# digest; it deliberately takes a short bound derived from that enclosing budget,
+# accepting that it can cut a slow scan short. Nothing is lost when it does: the
+# scan is idempotent, holds no lock afterwards, and the watcher runs the same
+# scan on its own cadence where the inner bound gets to report.
 #
 # WHERE THE CAPACITY NUMBERS COME FROM. The gate is the machine, and only the
 # machine. Both terms of the floor are measured from sources that do not depend
@@ -82,21 +95,32 @@
 #      pager with swap on the same data volume, and that demand exists whether
 #      or not firstmate dispatches anything, so it is never space a worker may
 #      have. It is a property of the machine, read from the machine.
-#   2. The cost of one more isolated working copy, taken as the largest single
-#      entry in the isolated-copy pool on disk: the largest directory under the
-#      resolved pool root, and the largest project clone under
-#      $FM_HOME/projects, whichever is bigger. A live pool worktree carries
-#      build output that a bare clone does not, so the pool is the truer measure
-#      of what one more copy costs; projects/ is the fallback that still yields
-#      a number on a machine that has never dispatched anything. Taking the
-#      maximum means neither an empty pool nor an empty projects directory can
-#      silently produce a zero. Measured at most once per
-#      FM_DISPATCH_COPY_MEASURE_SECS and cached, so the ordinary scan is a df.
-#      A directory that yields no number at all from du is an inability, never a
-#      zero. When the pool root is only the $FM_HOME fallback - no configured
-#      pool root and no $HOME/.treehouse - its children are the home's own
-#      directories rather than isolated copies, so only projects/ is measured
-#      there; a fallback pool root is a filesystem handle for df, not a pool.
+#   2. The cost of ONE more isolated working copy, taken as the largest single
+#      copy on disk across two sources, whichever is bigger. A live pool
+#      worktree carries build output that a bare clone does not, so the pool is
+#      the truer measure of what one more copy costs; projects/ is the fallback
+#      that still yields a number on a machine that has never dispatched
+#      anything. Taking the maximum means neither an empty pool nor an empty
+#      projects directory can silently produce a zero.
+#
+#      THE TWO SOURCES ARE READ AT DIFFERENT DEPTHS, because a copy sits at a
+#      different depth in each. Under $FM_HOME/projects a clone IS the immediate
+#      child, so that source is read at CHILD depth. Under the pool root the
+#      layout is <pool-root>/<repo>-<hash>/<N>: the immediate child is a per-repo
+#      POOL holding several worktrees, and one isolated copy is the numbered
+#      directory below it, so that source is read at GRANDCHILD depth. Measuring
+#      a pool would report the sum of every worktree in it as the cost of one
+#      copy, which on this fleet overstates it by more than half and widens the
+#      deadband below by the same factor. A pool-root child that holds no
+#      subdirectory of its own is taken as a copy itself, so a pool root that
+#      holds copies directly still yields a number.
+#
+#      Measured at most once per FM_DISPATCH_COPY_MEASURE_SECS and cached, so
+#      the ordinary scan is a df. A directory that yields no number at all from
+#      du is an inability, never a zero. When the pool root is only the $FM_HOME
+#      fallback - no configured pool root and no $HOME/.treehouse - its children
+#      are the home's own directories rather than a pool, so only projects/ is
+#      measured there; a fallback pool root is a filesystem handle for df.
 #      If BOTH sources hold no measurable copy the clone reserve is 0, the floor
 #      degrades to the operating-system reserve alone, and the deadband below
 #      degrades to zero. That is the honest answer for a home that has never
@@ -113,18 +137,28 @@
 # THE CAPACITY DEADBAND. A bare comparison against the floor flaps: a build or a
 # pool warm cycle pushes free space across the line and back, and every crossing
 # is a genuine signature change that costs a firstmate turn with nothing new to
-# do. The verdict is therefore sticky in one direction. ENTERING blocked keeps
+# do. The boundary is therefore sticky in one direction. ENTERING blocked keeps
 # the plain test, free below the floor. LEAVING it requires free space to exceed
-# the floor by one more clone, so the release threshold is floor plus clone.
-# That unit is measured from the pool rather than chosen, because one dispatch
-# costs roughly one isolated copy - the deadband moves in the same unit as the
-# thing it is damping. A previous verdict of ready, none, unknown, or no record
-# at all uses the plain test.
+# the floor by one more copy, so the release threshold is floor plus copy. That
+# unit is measured from the pool rather than chosen, because one dispatch costs
+# roughly one isolated copy - the deadband moves in the same unit as the thing
+# it is damping.
+#
+# The boundary has its OWN durable field, capacity_blocked, and the deadband
+# reads that field and never the verdict field. The verdict is overwritten by
+# every none and every unknown, and reading it would mean an emptied ready set
+# or one transient timeout silently erased the boundary and let the next scan
+# flip to ready with the disk in the state that was blocked a minute earlier.
+# capacity_blocked is set only when a CAPACITY evaluation concludes blocked, is
+# cleared only when a capacity evaluation concludes ready - which means free
+# space genuinely cleared floor plus one copy - and is carried through unchanged
+# by every record write that does not evaluate capacity.
 #
 # Environment overrides (all optional):
-#   FM_DISPATCH_POOL_ROOT           path whose filesystem hosts isolated copies
+#   FM_DISPATCH_POOL_ROOT           pool root: df'd for free space, and walked
+#                                   at grandchild depth for the copy size
 #   FM_DISPATCH_OS_RESERVE_MB       operating-system reserve, in MiB
-#   FM_DISPATCH_BUDGET_SECS         per-external-call bound, 1..30, default 20
+#   FM_DISPATCH_BUDGET_SECS         bound per bounded unit, 1..30, default 20
 #   FM_DISPATCH_RESURFACE_SECS      bounded re-surface for blocked/unknown
 #   FM_DISPATCH_COPY_MEASURE_SECS   cache lifetime for the clone measurement
 #   FM_DISPATCH_LIST_LIMIT          identifiers named per group before "+N more"
@@ -201,10 +235,11 @@ record_write() { # <verdict> <signature> <epoch>
   local tmp
   tmp=$(umask 077; mktemp "$STATE/.dispatch-poll.XXXXXX") || return 1
   {
-    printf 'schema=fm-dispatch-poll.v1\n'
+    printf 'schema=fm-dispatch-poll.v2\n'
     printf 'verdict=%s\n' "$1"
     printf 'signature=%s\n' "$2"
     printf 'surfaced_epoch=%s\n' "$3"
+    printf 'capacity_blocked=%s\n' "$CAPACITY_BLOCKED"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$RECORD" || { rm -f "$tmp"; return 1; }
 }
@@ -216,12 +251,17 @@ record_write() { # <verdict> <signature> <epoch>
 fm_lock_try_acquire "$SCAN_LOCK" || exit 0
 trap 'fm_lock_release "$SCAN_LOCK"' EXIT
 
-# The previous verdict is read ONCE, here, and reused by both the capacity
-# deadband and the surface decision; two reads could straddle a record rewrite.
+# The previous record is read ONCE, here; two reads could straddle a rewrite.
+# CAPACITY_BLOCKED starts as whatever the last capacity evaluation concluded and
+# is changed ONLY by another capacity evaluation, so every record written by a
+# none or unknown verdict carries the boundary through untouched. A record
+# predating this field, or no record at all, means no boundary is in force.
 PREV_VERDICT=$(record_value verdict)
 PREV_SIG=$(record_value signature)
 PREV_EPOCH=$(record_value surfaced_epoch)
 case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+CAPACITY_BLOCKED=$(record_value capacity_blocked)
+[ "$CAPACITY_BLOCKED" = yes ] || CAPACITY_BLOCKED=no
 
 # --- verdict assembly -------------------------------------------------------
 #
@@ -500,10 +540,10 @@ else
   fi
 fi
 
-# A configured pool root, or the real one, is a directory OF isolated copies and
-# its children are the right thing to measure. The $FM_HOME fallback is not: it
-# is only a filesystem handle so df has a path, and its children are the home's
-# own state, data, and projects directories rather than copies.
+# A configured pool root, or the real one, is a pool directory whose contents are
+# measured as isolated copies at the depth rule the header states. The $FM_HOME
+# fallback is not: it is only a filesystem handle so df has a path, and its
+# children are the home's own state, data, and projects directories.
 POOL_ROOT=${FM_DISPATCH_POOL_ROOT:-}
 POOL_HOLDS_COPIES=1
 if [ -z "$POOL_ROOT" ]; then
@@ -524,26 +564,56 @@ case "$FREE_KB" in
     "free space on $POOL_ROOT could not be read from df output" ;;
 esac
 
-# Raise MEASURED_KB to the largest immediate child of <parent>. du reports its
-# total even when it could not stat everything underneath, and a live copy
-# churns while it is walked, so the number is what matters here; producing no
-# number at all is the genuine inability, and so is failing to finish.
+# The whole measurement shares ONE deadline, set once below, and each du runs
+# under whatever remains of it. du reports its total even when it could not stat
+# everything underneath, and a live copy churns while it is walked, so the
+# number is what matters here; producing no number at all is the genuine
+# inability, and so is running the shared deadline out.
 MEASURED_KB=0
-measure_largest() { # <parent>
-  local parent=$1 entry entry_kb du_out du_rc
+COPY_DEADLINE=0
+measure_copy() { # <copy-dir>
+  local copy=$1 copy_kb du_out du_rc remaining
+  remaining=$((COPY_DEADLINE - $(now_epoch)))
+  [ "$remaining" -gt 0 ] || undecidable copy-reserve-timed-out \
+    "measuring the isolated copies did not finish within ${BUDGET_SECS}s; stopped at $copy"
+  du_out=$(fm_run_timed "$remaining" du -sk "$copy" 2>/dev/null)
+  du_rc=$?
+  [ "$du_rc" -ne 124 ] || undecidable copy-reserve-timed-out \
+    "measuring the isolated copy at $copy did not finish within the ${BUDGET_SECS}s measurement budget"
+  copy_kb=$(printf '%s\n' "$du_out" | awk 'NR == 1 {print $1}')
+  case "$copy_kb" in
+    ''|*[!0-9]*) undecidable copy-reserve-unmeasurable \
+      "the size of the isolated copy at $copy could not be measured" ;;
+  esac
+  [ "$copy_kb" -le "$MEASURED_KB" ] || MEASURED_KB=$copy_kb
+}
+
+# A project clone IS the immediate child of $FM_HOME/projects.
+measure_project_clones() { # <projects-dir>
+  local parent=$1 clone
   [ -d "$parent" ] || return 0
-  for entry in "$parent"/*/; do
-    [ -d "$entry" ] || continue
-    du_out=$(fm_run_timed "$BUDGET_SECS" du -sk "$entry" 2>/dev/null)
-    du_rc=$?
-    [ "$du_rc" -ne 124 ] || undecidable copy-reserve-timed-out \
-      "measuring the isolated copy at $entry did not finish within ${BUDGET_SECS}s"
-    entry_kb=$(printf '%s\n' "$du_out" | awk 'NR == 1 {print $1}')
-    case "$entry_kb" in
-      ''|*[!0-9]*) undecidable copy-reserve-unmeasurable \
-        "the size of the isolated copy at $entry could not be measured" ;;
-    esac
-    [ "$entry_kb" -le "$MEASURED_KB" ] || MEASURED_KB=$entry_kb
+  for clone in "$parent"/*/; do
+    [ -d "$clone" ] || continue
+    measure_copy "$clone"
+  done
+}
+
+# A pool-root child is a per-repo POOL, and one isolated copy is the numbered
+# directory below it, so this reads a level deeper. A child holding no
+# subdirectory of its own is taken as a copy itself, so a pool root that holds
+# copies directly still yields a number.
+measure_pool_copies() { # <pool-root>
+  local parent=$1 pool copy found
+  [ -d "$parent" ] || return 0
+  for pool in "$parent"/*/; do
+    [ -d "$pool" ] || continue
+    found=0
+    for copy in "$pool"*/; do
+      [ -d "$copy" ] || continue
+      found=1
+      measure_copy "$copy"
+    done
+    [ "$found" -eq 1 ] || measure_copy "$pool"
   done
 }
 
@@ -568,10 +638,11 @@ if [ -f "$COPY_CACHE" ]; then
   esac
 fi
 if [ -z "$COPY_KB" ]; then
+  COPY_DEADLINE=$(( $(now_epoch) + BUDGET_SECS ))
   if [ "$POOL_HOLDS_COPIES" -eq 1 ]; then
-    measure_largest "$POOL_ROOT"
+    measure_pool_copies "$POOL_ROOT"
   fi
-  measure_largest "$FM_HOME/projects"
+  measure_project_clones "$FM_HOME/projects"
   COPY_KB=$MEASURED_KB
   TMP_CACHE=$(umask 077; mktemp "$STATE/.dispatch-copy-reserve.XXXXXX") || TMP_CACHE=
   if [ -n "$TMP_CACHE" ]; then
@@ -584,7 +655,7 @@ if [ -z "$COPY_KB" ]; then
 fi
 
 FLOOR_KB=$((OS_RESERVE_KB + COPY_KB))
-# One more clone of room above the floor before a blocked verdict is released.
+# One more copy of room above the floor before a blocked boundary is released.
 # With no measurable copy anywhere the deadband is zero and the test below is
 # the plain one.
 RELEASE_KB=$((FLOOR_KB + COPY_KB))
@@ -595,17 +666,19 @@ COPY_MIB=$((COPY_KB / 1024))
 
 # --- 7. the verdict ---------------------------------------------------------
 
-if [ "$PREV_VERDICT" = blocked ]; then
+if [ "$CAPACITY_BLOCKED" = yes ]; then
   THRESHOLD_KB=$RELEASE_KB
 else
   THRESHOLD_KB=$FLOOR_KB
 fi
 
 if [ "$FREE_KB" -lt "$THRESHOLD_KB" ]; then
+  CAPACITY_BLOCKED=yes
   VERDICT=blocked
   SIGNATURE=$(printf 'blocked\n' | sig_hash)
   PAYLOAD="dispatch blocked: $COUNT dispatchable but no room for another isolated copy; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor, and $RELEASE_MIB MiB is the release threshold; clone reserve $COPY_MIB MiB; live workers $LIVE_WORKERS"
 else
+  CAPACITY_BLOCKED=no
   VERDICT=ready
   SIGNATURE=$(printf 'ready\n%s' "$SIG_BODY" | sig_hash)
   PAYLOAD="dispatch ready: $COUNT dispatchable ($BRIEFED_N briefed, $INTAKE_N need intake); briefed: $BRIEFED; needs intake: $INTAKE; live workers $LIVE_WORKERS; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor; clone reserve $COPY_MIB MiB; full list: tasks-axi ready --file $BACKLOG"

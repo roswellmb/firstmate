@@ -240,12 +240,15 @@ stage() {  # <stage-name>: breadcrumb for the parent's truncation banner
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
 
+# A non-positive or non-numeric budget is not a budget (`timeout 0` disables the
+# deadline outright), so an unusable value falls back to the default rather than
+# silently removing the bound. Resolved on BOTH sides of the re-exec below: the
+# parent bounds the child with it, and the child sizes its own per-stage bounds
+# from it, so no stage can be given a bound its enclosing budget cannot honour.
+SESSION_START_BUDGET=${FM_SESSION_START_TIMEOUT:-120}
+case "$SESSION_START_BUDGET" in ''|*[!0-9]*|0) SESSION_START_BUDGET=120 ;; esac
+
 if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
-  SESSION_START_BUDGET=${FM_SESSION_START_TIMEOUT:-120}
-  # A non-positive or non-numeric budget is not a budget (`timeout 0` disables
-  # the deadline outright), so an unusable value falls back to the default
-  # rather than silently removing the bound.
-  case "$SESSION_START_BUDGET" in ''|*[!0-9]*|0) SESSION_START_BUDGET=120 ;; esac
   SESSION_START_STAGE_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-session-start-stage.XXXXXX" 2>/dev/null) || SESSION_START_STAGE_FILE=
   if [ -z "$SESSION_START_STAGE_FILE" ]; then
     # Without a breadcrumb the bound still holds; only the banner's precision
@@ -254,6 +257,7 @@ if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
   fi
   fm_run_timed "$SESSION_START_BUDGET" \
     env FM_SESSION_START_STAGE_FILE="$SESSION_START_STAGE_FILE" \
+    FM_SESSION_START_TIMEOUT="$SESSION_START_BUDGET" \
     "$SCRIPT_DIR/fm-session-start.sh" "$@"
   SESSION_START_RC=$?
   if [ "$SESSION_START_RC" -eq 124 ]; then
@@ -616,20 +620,26 @@ else
   # The same fleet-level dispatch-readiness check the watcher poll runs, on the
   # same locked path and ahead of the drain, so its verdict is presented in this
   # one digest rather than arriving as a separate wake minutes later.
-  # The scan bounds every external call it makes and reports hitting that bound
-  # as its own verdict, so this outer bound is only a backstop for whatever
-  # those inner bounds do not cover; it sits far above any legal inner bound
-  # (bin/fm-dispatch-poll.sh's header states the derivation) so it can never
-  # preempt one. Firing it is still reported rather than swallowed, because
-  # silence here would mean "I could not tell" - the one thing this check must
-  # never say quietly.
-  DISPATCH_BACKSTOP_SECS=100
-  DISPATCH_OUT=$(fm_run_timed "$DISPATCH_BACKSTOP_SECS" \
+  # This bound is sized from session start's OWN budget, not from the scan's
+  # inner bounds, and it is deliberately short enough that it can cut a slow
+  # scan off before that scan's own timeout classes get to report. The
+  # alternative is worse: a backstop long enough to never preempt an inner bound
+  # would be most of the startup budget, spent at the third of nine stages, so
+  # the enclosing bound would fire first and truncate the digest at wake-queue -
+  # losing the drain, the supervision instructions, and the fleet state. A hung
+  # scan must cost one stage, not the whole digest. Nothing is lost by cutting
+  # it: the scan is idempotent and holds no lock afterwards, and the watcher
+  # runs the identical scan on its own cadence with a backstop that cannot
+  # preempt an inner bound. Firing here is still reported, never swallowed.
+  DISPATCH_STAGE_BACKSTOP_SECS=$((SESSION_START_BUDGET / 8))
+  [ "$DISPATCH_STAGE_BACKSTOP_SECS" -ge 5 ] || DISPATCH_STAGE_BACKSTOP_SECS=5
+  [ "$DISPATCH_STAGE_BACKSTOP_SECS" -le 30 ] || DISPATCH_STAGE_BACKSTOP_SECS=30
+  DISPATCH_OUT=$(fm_run_timed "$DISPATCH_STAGE_BACKSTOP_SECS" \
     env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
     "$SCRIPT_DIR/fm-dispatch-poll.sh" scan 2>&1)
   DISPATCH_RC=$?
   if [ "$DISPATCH_RC" -eq 124 ]; then
-    DISPATCH_OUT="scan hit its ${DISPATCH_BACKSTOP_SECS}s backstop bound and was stopped, so dispatch readiness is unestablished"
+    DISPATCH_OUT="scan hit this stage's ${DISPATCH_STAGE_BACKSTOP_SECS}s bound and was stopped, so dispatch readiness is unestablished here; the watcher sweep re-runs it unbounded by the startup budget"
   elif [ "$DISPATCH_RC" -ne 0 ]; then
     DISPATCH_OUT=
   fi
