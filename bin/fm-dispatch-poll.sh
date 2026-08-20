@@ -38,30 +38,79 @@
 #
 # The three verdicts, each printed with the "actionable: " prefix the watcher
 # poll loop already expects from a scan of this shape:
-#   dispatch ready:   work is dispatchable and the machine has room for it
+#   dispatch ready:   newly briefed work is dispatchable and the machine has
+#                     room for it
 #   dispatch blocked: work is dispatchable but the machine has no room
 #   dispatch unknown: the answer could not be established, with the reason class
 #
 # ONE SCAN AT A TIME. The whole scan runs under a per-home lock in the state
 # directory, because surfacing a verdict is a read-modify-write of
 # state/.dispatch-poll and two concurrent scans would both read the same stale
-# signature and both queue a wake for one verdict. The lock is NON-blocking: a
+# record and both queue a wake for one verdict. The lock is NON-blocking: a
 # scan that finds it held exits 0 silently, because the holder is computing the
 # identical verdict and a second wake for it is exactly the duplicate this check
 # exists to avoid. Neither the watcher poll loop nor the synchronous session
 # start ever waits on it.
 #
-# NO REPEATS. A verdict is surfaced only when its signature differs from the one
-# last surfaced (state/.dispatch-poll). "Changed" means the set of dispatchable
-# task ids changed, or one of them gained or lost a usable brief - the two facts
-# that change what firstmate would actually do. It deliberately does NOT include
-# titles or notes, so editing a note is not a wake. A blocked or unknown verdict
-# additionally re-surfaces once per FM_DISPATCH_RESURFACE_SECS, because a fault
-# that goes quiet forever is how a fault rots invisibly; an unchanged ready set
-# never re-surfaces on that cadence. The durable wake record is keyed by the
-# CONSTANT string "dispatch", not by the signature, so the drain's kind+key
-# collapse keeps only the newest verdict: a superseded verdict describes a ready
-# set that no longer exists and must never be presented as its own row.
+# WHAT COUNTS AS ACTIONABLE. This is the single definition, and every surfacing
+# decision below reads it rather than restating it:
+#
+#   ready:   the DISPATCHABLE-AND-BRIEFED set GAINED at least one task id since
+#            the last scan that could establish it.
+#   blocked: the machine has only just run out of room, or the shortage has
+#            persisted past FM_DISPATCH_RESURFACE_SECS.
+#   unknown: this inability class is new, or has persisted past that same bound.
+#
+# A ready verdict is actionable only on a GAIN, and only in the BRIEFED set,
+# because that is the only movement that changes what firstmate could do next: a
+# briefed dispatchable task is one it can spawn immediately. No other movement of
+# the ready set is news. Dispatching work SHRINKS the set and leaves nothing new
+# to act on; a task arriving without a brief joins a queue firstmate has already
+# seen and has not intaken, and re-announcing that standing pile every time the
+# total moves is exactly the cry-wolf this check exists to avoid. A wake that
+# fires when there is nothing useful to do is worse than silence, because it
+# trains the reader to ignore it. Titles and notes are not read either, so
+# editing a note is not a wake.
+#
+# The consequence is deliberate: a home whose ready queue is entirely unbriefed
+# never wakes on its own. That queue is not lost - session start prints the whole
+# backlog every time - it is simply not an interruption.
+#
+# A blocked or unknown verdict re-surfaces once per FM_DISPATCH_RESURFACE_SECS,
+# because a fault that goes quiet forever is how a fault rots invisibly. A ready
+# verdict never uses that cadence: it has already said everything it knows.
+#
+# WHAT THE RECORD REMEMBERS. state/.dispatch-poll has two halves, and one
+# invariant each. There is no per-verdict rule: every path obeys these two by
+# construction, so a verdict added later cannot pick a wrong side by omission.
+#
+#   INVARIANT 1 - the ANNOUNCED half (announced_verdict, announced_signature,
+#   announced_epoch) moves ONLY in the act that actually spoke: printed the
+#   payload and queued the wake. A scan that surfaces nothing leaves it exactly
+#   where the last speaking scan left it. That half is the sole input to the
+#   bounded re-surface cadence, so any silent scan allowed to stamp itself over
+#   it would reset the no-repeat baseline of a fault that had already spoken and
+#   let that same fault wake twice inside FM_DISPATCH_RESURFACE_SECS.
+#
+#   INVARIANT 2 - the OBSERVED half (dispatchable_briefed, capacity_blocked) is
+#   what the scan SAW, and dispatchable_briefed may GAIN an id only in the same
+#   act that announces it. The announcing ready verdict records the whole
+#   observed briefed set, because its payload has just named every id it is
+#   adding. Every other write is remove-only: the ids the record already held
+#   that this scan still observed to be dispatchable and briefed. A scan that
+#   observed nothing removes nothing and carries the previous set through.
+#
+# Together they make the gain honest in both directions. Ids that LEFT are
+# dropped by any scan that saw them leave, so their re-arrival counts as a gain
+# again rather than being measured against a set they never left. Ids that
+# ARRIVED are never absorbed by a scan that did not tell anyone about them, so
+# work that becomes dispatchable during a disk timeout still surfaces once the
+# machine can be measured again.
+#
+# The durable wake record is keyed by the CONSTANT string "dispatch", not by the
+# verdict, so the drain's kind+key collapse keeps only the newest: a superseded
+# verdict describes a ready set that no longer exists and must never be presented
+# as its own row.
 #
 # NOTHING RUNS UNBOUNDED, AND THE BOUNDS DO NOT COMPOSE. A scan performs exactly
 # THREE bounded units of work, each capped at FM_DISPATCH_BUDGET_SECS through
@@ -189,8 +238,9 @@ case "$COPY_MEASURE_SECS" in
 esac
 # One wake payload is one line, and a home can hold dozens of dispatchable
 # items, so the identifier lists are bounded. What is cut is always stated -
-# never silently dropped - and the change signature covers the WHOLE set, so an
-# item beyond the display limit still wakes when it appears.
+# never silently dropped - and the gain is computed over the WHOLE briefed set
+# rather than over these lists, so an item beyond the display limit still wakes
+# when it appears.
 LIST_LIMIT=${FM_DISPATCH_LIST_LIMIT:-12}
 case "$LIST_LIMIT" in
   ''|*[!0-9]*|0) LIST_LIMIT=12 ;;
@@ -231,17 +281,36 @@ record_value() { # <key>
   sed -n "s/^$1=//p" "$RECORD" 2>/dev/null | tail -1
 }
 
-record_write() { # <verdict> <signature> <epoch>
+# Both halves are written from the variables that hold them, and this function
+# takes no arguments at all, so there is no way to move the announced half
+# without assigning ANNOUNCED_*. Only the announcing block in `surface` does
+# that, which is invariant 1 enforced by shape rather than by discipline.
+record_write() {
   local tmp
   tmp=$(umask 077; mktemp "$STATE/.dispatch-poll.XXXXXX") || return 1
   {
-    printf 'schema=fm-dispatch-poll.v2\n'
-    printf 'verdict=%s\n' "$1"
-    printf 'signature=%s\n' "$2"
-    printf 'surfaced_epoch=%s\n' "$3"
+    printf 'schema=fm-dispatch-poll.v4\n'
+    printf 'announced_verdict=%s\n' "$ANNOUNCED_VERDICT"
+    printf 'announced_signature=%s\n' "$ANNOUNCED_SIG"
+    printf 'announced_epoch=%s\n' "$ANNOUNCED_EPOCH"
     printf 'capacity_blocked=%s\n' "$CAPACITY_BLOCKED"
+    printf 'dispatchable_briefed=%s\n' "$BRIEFED_RECORD"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$RECORD" || { rm -f "$tmp"; return 1; }
+}
+
+# The write every scan performs, announcing or not. A scan that changed nothing
+# writes nothing, which is what keeps a home that has never surfaced a verdict
+# from acquiring a record that only says "still quiet".
+record_store() {
+  if [ "$ANNOUNCED_VERDICT" = "$PREV_ANNOUNCED_VERDICT" ] \
+    && [ "$ANNOUNCED_SIG" = "$PREV_ANNOUNCED_SIG" ] \
+    && [ "$ANNOUNCED_EPOCH" = "$PREV_ANNOUNCED_EPOCH" ] \
+    && [ "$CAPACITY_BLOCKED" = "$PREV_CAPACITY_BLOCKED" ] \
+    && [ "$BRIEFED_RECORD" = "$PREV_BRIEFED" ]; then
+    return 0
+  fi
+  record_write
 }
 
 # --- one scan at a time -----------------------------------------------------
@@ -252,16 +321,23 @@ fm_lock_try_acquire "$SCAN_LOCK" || exit 0
 trap 'fm_lock_release "$SCAN_LOCK"' EXIT
 
 # The previous record is read ONCE, here; two reads could straddle a rewrite.
-# CAPACITY_BLOCKED starts as whatever the last capacity evaluation concluded and
-# is changed ONLY by another capacity evaluation, so every record written by a
-# none or unknown verdict carries the boundary through untouched. A record
-# predating this field, or no record at all, means no boundary is in force.
-PREV_VERDICT=$(record_value verdict)
-PREV_SIG=$(record_value signature)
-PREV_EPOCH=$(record_value surfaced_epoch)
-case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
-CAPACITY_BLOCKED=$(record_value capacity_blocked)
-[ "$CAPACITY_BLOCKED" = yes ] || CAPACITY_BLOCKED=no
+# Every field starts as whatever the last scan that could establish it
+# concluded, and is changed only by a scan that establishes it again, so a
+# verdict that did not look carries it through untouched. A record predating a
+# field, or no record at all, means no boundary is in force, nothing briefed has
+# been seen yet, and nothing has ever been announced.
+PREV_ANNOUNCED_VERDICT=$(record_value announced_verdict)
+PREV_ANNOUNCED_SIG=$(record_value announced_signature)
+PREV_ANNOUNCED_EPOCH=$(record_value announced_epoch)
+case "$PREV_ANNOUNCED_EPOCH" in ''|*[!0-9]*) PREV_ANNOUNCED_EPOCH=0 ;; esac
+ANNOUNCED_VERDICT=$PREV_ANNOUNCED_VERDICT
+ANNOUNCED_SIG=$PREV_ANNOUNCED_SIG
+ANNOUNCED_EPOCH=$PREV_ANNOUNCED_EPOCH
+PREV_CAPACITY_BLOCKED=$(record_value capacity_blocked)
+[ "$PREV_CAPACITY_BLOCKED" = yes ] || PREV_CAPACITY_BLOCKED=no
+CAPACITY_BLOCKED=$PREV_CAPACITY_BLOCKED
+PREV_BRIEFED=$(record_value dispatchable_briefed)
+BRIEFED_RECORD=$PREV_BRIEFED
 
 # --- verdict assembly -------------------------------------------------------
 #
@@ -272,6 +348,27 @@ CAPACITY_BLOCKED=$(record_value capacity_blocked)
 VERDICT=
 SIGNATURE=
 PAYLOAD=
+# The briefed ids this scan found that the last scan did not. Computed in
+# section 5 as soon as the briefed set is established, so it is populated before
+# any verdict is known; only the ready path acts on it, and the blocked path
+# clears it because with no room nothing gained anything.
+BRIEFED_GAINED=
+
+# Invariant 2's remove-only rule, in the one place it exists. Every stage that
+# establishes what is dispatchable AND briefed reports it here - the empty set
+# included, because "nothing is dispatchable" is an observation and not a
+# failure to look. A stage that could not establish it simply never calls this,
+# and BRIEFED_RECORD stays at the previous set: nothing seen, nothing removed.
+observed() { # <the dispatchable-and-briefed ids this scan established>
+  local id retained=
+  OBSERVED_BRIEFED=$1
+  for id in $PREV_BRIEFED; do
+    case " $OBSERVED_BRIEFED " in
+      *" $id "*) retained="$retained $id" ;;
+    esac
+  done
+  BRIEFED_RECORD=${retained# }
+}
 
 undecidable() { # <class> <reason>
   VERDICT=unknown
@@ -283,33 +380,42 @@ undecidable() { # <class> <reason>
 
 surface() {
   local epoch age
-  epoch=$(now_epoch)
 
-  if [ "$VERDICT" = none ]; then
-    # Nothing to say, and nothing to remember either: a home that has never
-    # surfaced a verdict stays untouched rather than acquiring a record that
-    # only says "still quiet".
-    if [ -n "$PREV_VERDICT" ] && [ "$PREV_VERDICT" != none ]; then
-      record_write none "$SIGNATURE" "$epoch" || exit 1
-    fi
+  # A verdict with nothing to say still records what it saw, and nothing more.
+  if [ "$VERDICT" = none ] || { [ "$VERDICT" = ready ] && [ -z "$BRIEFED_GAINED" ]; }; then
+    record_store || exit 1
     return 0
   fi
 
-  if [ "$SIGNATURE" = "$PREV_SIG" ] && [ -n "$PREV_SIG" ]; then
-    # An unchanged ready set is never repeated. A persisting fault or a
-    # persisting lack of room re-surfaces only on the bounded cadence.
-    [ "$VERDICT" = ready ] && return 0
-    age=$((epoch - PREV_EPOCH))
+  epoch=$(now_epoch)
+
+  # A persisting fault or a persisting lack of room re-surfaces only on the
+  # bounded cadence, so it can never rot invisibly and can never chatter. It is
+  # measured against the last thing ANNOUNCED, never against what some silent
+  # scan in between happened to observe. A ready gain never takes this path: it
+  # has news, and it has already said everything it knows.
+  if [ "$VERDICT" != ready ] && [ -n "$PREV_ANNOUNCED_SIG" ] \
+    && [ "$SIGNATURE" = "$PREV_ANNOUNCED_SIG" ]; then
+    age=$((epoch - PREV_ANNOUNCED_EPOCH))
     [ "$age" -ge 0 ] || age=0
-    [ "$age" -ge "$RESURFACE_SECS" ] || return 0
+    if [ "$age" -lt "$RESURFACE_SECS" ]; then
+      record_store || exit 1
+      return 0
+    fi
   fi
 
-  # The key is constant on purpose. fm_wake_print_deduped collapses queued
-  # records on kind+key and keeps the newest per key, which is exactly right
-  # here: only the latest verdict is true. The signature stays in the record
-  # above, where it belongs, as the change detector.
+  # The only announcing write there is, so by invariant 1 the only place the
+  # announced half moves, and by invariant 2 the only place the baseline may
+  # GAIN ids - and only for ready, whose payload has just named every one of
+  # them. The wake key is constant on purpose: fm_wake_print_deduped collapses
+  # queued records on kind+key and keeps the newest, which is exactly right
+  # here, because only the latest verdict is true.
+  [ "$VERDICT" != ready ] || BRIEFED_RECORD=$OBSERVED_BRIEFED
   fm_wake_append check dispatch "$PAYLOAD" || exit 1
-  record_write "$VERDICT" "$SIGNATURE" "$epoch" || exit 1
+  ANNOUNCED_VERDICT=$VERDICT
+  ANNOUNCED_SIG=$SIGNATURE
+  ANNOUNCED_EPOCH=$epoch
+  record_write || exit 1
   printf 'actionable: %s\n' "$PAYLOAD"
 }
 
@@ -341,6 +447,7 @@ esac
 [ -e "$BACKLOG" ] || {
   VERDICT=none
   SIGNATURE=none
+  observed ''
   surface
   exit 0
 }
@@ -426,6 +533,7 @@ if [ "$READY_DECLARED" -eq 0 ]; then
   fi
   VERDICT=none
   SIGNATURE=none
+  observed ''
   surface
   exit 0
 fi
@@ -462,6 +570,7 @@ done
 if [ -z "$DISPATCHABLE" ]; then
   VERDICT=none
   SIGNATURE=none
+  observed ''
   surface
   exit 0
 fi
@@ -492,28 +601,53 @@ INTAKE=
 BRIEFED_N=0
 INTAKE_N=0
 COUNT=0
-SIG_BODY=
+# The briefed ids alone, in the sorted order DISPATCHABLE already carries, as
+# the durable record stores them. Kept separate from the display lists above,
+# which are bounded and decorated and must never be what a comparison reads.
+# The partial list a brief that cannot be read leaves behind is never reported
+# to `observed`, because the loop hands control to `undecidable` from inside
+# itself: that scan established nothing and so removes nothing.
+BRIEFED_IDS=
 for id in $DISPATCHABLE; do
   COUNT=$((COUNT + 1))
   state=$(brief_state "$id")
   [ "$state" != unreadable ] || undecidable brief-unreadable \
     "a brief exists but cannot be read: $DATA/$id/brief.md"
-  SIG_BODY="$SIG_BODY$id	$state
-"
   if [ "$state" = briefed ]; then
     BRIEFED_N=$((BRIEFED_N + 1))
+    BRIEFED_IDS="$BRIEFED_IDS $id"
     [ "$BRIEFED_N" -gt "$LIST_LIMIT" ] || BRIEFED="$BRIEFED, $id"
   else
     INTAKE_N=$((INTAKE_N + 1))
     [ "$INTAKE_N" -gt "$LIST_LIMIT" ] || INTAKE="$INTAKE, $id"
   fi
 done
+BRIEFED_IDS=${BRIEFED_IDS# }
+observed "$BRIEFED_IDS"
 BRIEFED=${BRIEFED#, }
 INTAKE=${INTAKE#, }
 [ -n "$BRIEFED" ] || BRIEFED=none
 [ -n "$INTAKE" ] || INTAKE=none
 [ "$BRIEFED_N" -le "$LIST_LIMIT" ] || BRIEFED="$BRIEFED (+$((BRIEFED_N - LIST_LIMIT)) more)"
 [ "$INTAKE_N" -le "$LIST_LIMIT" ] || INTAKE="$INTAKE (+$((INTAKE_N - LIST_LIMIT)) more)"
+
+# The gain, measured against the ids the last scan that could see them recorded.
+# Membership is tested on space-delimited whole words so no id can match another
+# as a prefix. The display list is bounded the same way every other list here is,
+# and what is cut is stated rather than silently dropped.
+GAINED_N=0
+GAINED=
+for id in $BRIEFED_IDS; do
+  case " $PREV_BRIEFED " in
+    *" $id "*) continue ;;
+  esac
+  BRIEFED_GAINED="$BRIEFED_GAINED $id"
+  GAINED_N=$((GAINED_N + 1))
+  [ "$GAINED_N" -gt "$LIST_LIMIT" ] || GAINED="$GAINED, $id"
+done
+BRIEFED_GAINED=${BRIEFED_GAINED# }
+GAINED=${GAINED#, }
+[ "$GAINED_N" -le "$LIST_LIMIT" ] || GAINED="$GAINED (+$((GAINED_N - LIST_LIMIT)) more)"
 
 # --- 6. the machine ---------------------------------------------------------
 
@@ -676,12 +810,20 @@ if [ "$FREE_KB" -lt "$THRESHOLD_KB" ]; then
   CAPACITY_BLOCKED=yes
   VERDICT=blocked
   SIGNATURE=$(printf 'blocked\n' | sig_hash)
+  # With no room nothing is dispatchable, so what this scan observed to be
+  # dispatchable and briefed is the empty set. That is both the honest answer
+  # and what re-arms the wake: whatever is briefed when room returns is a gain
+  # against nothing, and firstmate hears about it.
+  observed ''
+  BRIEFED_GAINED=
   PAYLOAD="dispatch blocked: $COUNT dispatchable but no room for another isolated copy; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor, and $RELEASE_MIB MiB is the release threshold; clone reserve $COPY_MIB MiB; live workers $LIVE_WORKERS"
 else
   CAPACITY_BLOCKED=no
   VERDICT=ready
-  SIGNATURE=$(printf 'ready\n%s' "$SIG_BODY" | sig_hash)
-  PAYLOAD="dispatch ready: $COUNT dispatchable ($BRIEFED_N briefed, $INTAKE_N need intake); briefed: $BRIEFED; needs intake: $INTAKE; live workers $LIVE_WORKERS; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor; clone reserve $COPY_MIB MiB; full list: tasks-axi ready --file $BACKLOG"
+  # Constant, like none. The ready path is decided by the gain above, not by a
+  # signature, and a second encoding of the same set would only drift from it.
+  SIGNATURE=ready
+  PAYLOAD="dispatch ready: $GAINED_N newly briefed and ready to dispatch: $GAINED; $COUNT dispatchable in all ($BRIEFED_N briefed, $INTAKE_N need intake); briefed: $BRIEFED; needs intake: $INTAKE; live workers $LIVE_WORKERS; disk free $FREE_MIB MiB against a $FLOOR_MIB MiB floor; clone reserve $COPY_MIB MiB; full list: tasks-axi ready --file $BACKLOG"
 fi
 surface
 exit 0

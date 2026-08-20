@@ -20,6 +20,20 @@ if [ -z "${FM_ROOT_OVERRIDE:-}" ]; then
   export FM_ROOT_OVERRIDE
 fi
 
+# Ambient FM_HOME (safety seam). Every script here resolves its home as FM_HOME,
+# then FM_ROOT_OVERRIDE, then the checkout - so an FM_HOME exported by the
+# surrounding firstmate session OUTRANKS the override above and every case-local
+# FM_ROOT_OVERRIDE below it, and each watcher these suites start would read the
+# OPERATOR's own data/ and state/. That is not hypothetical: the watcher's
+# slow-check sweep reads data/backlog.md on its first cycle, so a suite run from
+# inside a live session can surface a real fleet-level wake in a case that
+# asserts silence, and the failure then follows the operator's backlog rather
+# than the code under test. Removed rather than repointed, so the FM_ROOT_OVERRIDE
+# scoping these suites already rely on stays the one that decides; a per-call
+# FM_HOME= assignment still wins where a case sets its own. Installed by sourcing
+# this harness, so no suite can forget it.
+unset FM_HOME
+
 # Wedge-alarm notifier recorder (safety seam). The away-mode wedge alarm fires a
 # real OS-level desktop notification by default. Point its FM_WEDGE_ALARM_EXEC
 # seam at a recorder for every

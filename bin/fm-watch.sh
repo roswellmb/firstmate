@@ -57,10 +57,13 @@
 #                          inactive terminal outcome that still lacks its durable
 #                          upstream receipt
 #   check: dispatch        the fleet-level dispatch-readiness scan
-#                          (bin/fm-dispatch-poll.sh, which owns the verdicts and
-#                          the no-repeat rule) changed its verdict: work became
+#                          (bin/fm-dispatch-poll.sh, which owns the verdicts, the
+#                          definition of actionable and the no-repeat rule) found
+#                          something actionable: BRIEFED work newly became
 #                          dispatchable, the machine ran out of room for another
-#                          isolated copy, or the answer could not be established
+#                          isolated copy, or the answer could not be established.
+#                          A ready queue that is entirely unbriefed does not wake
+#                          on its own; session start still prints it in full
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
