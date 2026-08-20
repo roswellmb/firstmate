@@ -64,7 +64,7 @@ It rejects the *shape* of a leak, not its content, which is why it also flags sy
 A structural rule has gaps.
 These are the known ones, and the list is more useful than an implied guarantee:
 
-- **`git commit --no-verify` bypasses it completely.** Git offers no way for a hook to prevent this. Server-side or CI enforcement is the only answer, and the repository's CI check is what closes it for anything reaching the default branch.
+- **`git commit --no-verify` bypasses it completely.** Git offers no way for a hook to prevent this. Server-side or CI enforcement is the only answer, and the repository's CI check closes it by re-applying both rules to every non-merge commit in a pull request's range, so text introduced only by a merge commit's own conflict resolution is not scanned.
 - **An unquoted title is not detected.** The rule requires a quoted literal, because quoting is what turns prose into a reproduced value. A title written as bare prose passes.
 - **A title outside the anchor window passes.** If the document reference and the title are more than 64 characters apart, or the anchor word is not in the vocabulary, nothing fires.
 - **A title that does not look like a title passes.** An all-lowercase title, a one or two word title, a title under 12 characters, or one containing characters outside the whitelist, will not match.
@@ -148,7 +148,7 @@ bin/fm-redaction-guard.sh uninstall    # remove it again
 
 `install` refuses rather than overwriting a `commit-msg` hook it did not write.
 Local hooks are per clone, so each home installs it once.
-CI applies the same rules to every commit on a pull request, which is what stops a `--no-verify` commit from reaching the default branch.
+CI re-applies the same rules over a pull request's range, which is what stops a `--no-verify` commit from reaching the default branch.
 
 ## Maintaining this file
 

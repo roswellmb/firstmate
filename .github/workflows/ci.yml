@@ -25,8 +25,8 @@ jobs:
       - run: bin/fm-lint.sh
 
   # The only redaction enforcement `git commit --no-verify` cannot bypass. Local
-  # hooks are per clone; this applies the same rules to every commit that would
-  # land on the default branch. Owner: bin/fm-redaction-guard.sh.
+  # hooks are per clone; this applies the same rules to every non-merge commit
+  # that would land on the default branch. Owner: bin/fm-redaction-guard.sh.
   redaction:
     name: Redaction guard
     runs-on: ubuntu-latest
