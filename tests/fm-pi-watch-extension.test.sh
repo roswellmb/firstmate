@@ -1336,18 +1336,27 @@ const hooks = await mod.FmPrimaryWatchArm({
   worktree: process.env.WORKTREE,
 });
 const event = { event: { type: "session.idle", properties: { sessionID: "session-test" } } };
+const coordinator = globalThis.__firstmateOpenCodeWatchArm;
+// The event hook launches its attempt without handing back anything to await,
+// and concurrent attempts coalesce onto whichever launch is already in flight.
+// Join that launch through the coordinator instead of sleeping a fixed span:
+// the ownership check walks the process ancestry one spawned ps at a time, so
+// on a loaded machine it is still resolving when a sleep expires, and the next
+// event then inherits its already-decided read-only verdict and never arms.
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
 await hooks.event(event);
-await new Promise((resolve) => setTimeout(resolve, 120));
+const unowned = await coordinator.ensureArmed("session-test", client);
+if (unowned !== "read-only") {
+  console.error(`expected read-only without the session lock, got ${unowned}`);
+  process.exit(1);
+}
 if (existsSync(process.env.FM_ARM_LOG)) {
   console.error("watch arm ran without owning the session lock");
   process.exit(1);
 }
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 await hooks.event(event);
-for (let i = 0; i < 250 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
-  await new Promise((resolve) => setTimeout(resolve, 20));
-}
+await coordinator.ensureArmed("session-test", client);
 if (!existsSync(process.env.FM_ARM_LOG)) {
   console.error("watch arm did not run after the session lock matched");
   process.exit(1);
