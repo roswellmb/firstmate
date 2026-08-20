@@ -178,12 +178,20 @@ test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher() 
   done
   printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
 
-  # Removing the beacon and waiting for it to reappear proves a WHOLE new cycle
-  # ran under the held lock, without depending on one-second mtime granularity.
+  # The beacon is touched at the TOP of the loop body and the contended
+  # arm-check runs further down, so ONE reappearance only proves a cycle
+  # started - it would still appear with the watcher about to die on the very
+  # contention under test. Wait for a SECOND touch: that one belongs to the
+  # following cycle, so it can only happen once the intervening cycle ran all
+  # the way through its arm-check without exiting.
   rm -f "$state/.last-watcher-beat"
   wait_for_path "$state/.last-watcher-beat" 200 \
     || { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
          fail "the watcher stopped cycling while the wake-queue lock was held: $(cat "$out")"; }
+  rm -f "$state/.last-watcher-beat"
+  wait_for_path "$state/.last-watcher-beat" 300 \
+    || { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher did not survive a full cycle under the held wake-queue lock: $(cat "$out")"; }
   kill -0 "$pid" 2>/dev/null \
     || { kill -KILL "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
          fail "the watcher died on a contended wake-queue lock: $(cat "$out")"; }

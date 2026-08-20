@@ -758,26 +758,37 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    non-zero return as "did not get the lock" and must not proceed as if they
 #    had.
 fm_lock_acquire_wait() {  # <lockdir>
-  local lockdir=$1 budget deadline
+  local lockdir=$1 budget deadline= now
   budget=${FM_LOCK_WAIT_TIMEOUT:-300}
   # An unreadable override must not silently disable the ceiling that exists to
   # stop a permanent wait, so fall back to the default rather than to zero.
   case "$budget" in
     ''|*[!0-9]*|0) budget=300 ;;
   esac
-  # The budget is wall clock, not a tick count: each attempt forks cat/mkdir/ln
-  # and a live holder also walks the steal path, so counting 0.1s sleeps
-  # overshot the configured seconds by up to 2x. date(1) exposes whole seconds,
-  # so add one rounding second the way bin/fm-watch-arm.sh does for its confirm
-  # budget, keeping a one-second timeout from collapsing near a boundary.
-  deadline=$(( $(date +%s) + budget + 1 ))
   while ! fm_lock_try_acquire "$lockdir"; do
     if fm_lock_held_by_current_process "$lockdir"; then
       # stderr only - this process's stdout may be the wake protocol.
       printf 'fm-lock: already held by this process, proceeding without a fresh claim: %s\n' "$lockdir" >&2
       return 0
     fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    # Read the clock only once actually contended, and prefer bash 5's
+    # EPOCHSECONDS so even that costs no fork - lock acquisition is far hotter
+    # than fm_pid_identity, whose per-call uname this file already hoisted. An
+    # inherited non-numeric EPOCHSECONDS must not abort the arithmetic under
+    # set -u, so it falls back to date the same way an unset one does.
+    now=${EPOCHSECONDS:-}
+    case "$now" in
+      ''|*[!0-9]*) now=$(date +%s) ;;
+    esac
+    if [ -z "$deadline" ]; then
+      # The budget is wall clock, not a tick count: each attempt forks
+      # cat/mkdir/ln and a live holder also walks the steal path, so counting
+      # 0.1s sleeps overshot the configured seconds by up to 2x. Whole-second
+      # clocks round down, so add one second the way bin/fm-watch-arm.sh does
+      # for its confirm budget, keeping a one-second timeout from collapsing
+      # near a boundary.
+      deadline=$(( now + budget + 1 ))
+    elif [ "$now" -ge "$deadline" ]; then
       printf 'fm-lock: gave up after %ss waiting for %s (held by pid %s)\n' \
         "$budget" "$lockdir" "${FM_LOCK_HELD_PID:-unknown}" >&2
       return 1
