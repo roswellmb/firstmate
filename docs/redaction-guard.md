@@ -94,14 +94,15 @@ The scanner case is the one that matters most, because a scanner failure is the 
 
 ## Measured false-positive rate
 
-Measured against this repository's real content, not invented examples, on 2026-08-20 over this branch's history and working tree.
+Measured against this repository's real content, not invented examples, on 2026-08-20.
+Each row names the command whose output it counted, so the scope of the claim and the scope of the measurement are the same thing.
 
 | Corpus | Size | Refused by rule T | Refused by rule P |
 | --- | --- | --- | --- |
-| Every non-merge commit on every ref, diff and message together | 404 commits | 0 | 1 |
-| Every added content line across all of history | 210,628 lines | 0 | not applicable |
-| Every line of every tracked text file in the working tree | 168,491 lines in 392 files | 0 | not applicable |
-| Every commit message on every ref, merges included | 406 commits, 9,319 lines | 0 | not applicable |
+| `git rev-list --all --no-merges`, each commit's diff and message together | 405 commits | 0 | 1 |
+| Every added content line of those same commits | 211,059 lines | 0 | not applicable |
+| Every line of every tracked text file in the working tree, from `git ls-files` | 168,547 lines in 392 files | 0 | not applicable |
+| `git rev-list --all`, message only, merges included | 407 commits, 9,321 lines | 0 | not applicable |
 
 Rule T's false-positive rate on real repository content is **0**, across all four corpora.
 

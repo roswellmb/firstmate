@@ -283,7 +283,7 @@ check_private_paths() {
   # Reads a file rather than stdin, so a cannot-evaluate condition raised from
   # record_finding is raised in the main shell and not in a pipeline subshell.
   local list=$1 path root_name
-  while IFS= read -r path; do
+  while IFS= read -r -d '' path; do
     [ -n "$path" ] || continue
     root_name=${path%%/*}
     case " $PRIVATE_ROOTS " in
@@ -310,11 +310,31 @@ added_lines() {
   # own text starts with `++ ` or `-- ` arrives as `+++ ` or `--- ` and would
   # otherwise impersonate a file header and silence the rest of that file.
   LC_ALL=C awk '
+  # git quotes a header path that contains a quote, a backslash or a control
+  # character, whatever core.quotePath says. Only those two escapes are undone
+  # here; an escape standing for a control character is left as written so a
+  # path can never inject a tab or a newline into the record format below.
+  function unquote(s,   out, i, c, n) {
+    if (substr(s, 1, 1) != "\"" || substr(s, length(s), 1) != "\"") return s
+    s = substr(s, 2, length(s) - 2)
+    out = ""; i = 1; n = length(s)
+    while (i <= n) {
+      c = substr(s, i, 1)
+      if (c == "\\" && i < n) {
+        c = substr(s, i + 1, 1)
+        if (c == "\"" || c == "\\") { out = out c; i += 2; continue }
+        out = out "\\" c; i += 2; continue
+      }
+      out = out c; i++
+    }
+    return out
+  }
+
   /^diff --git / { in_hunk = 0; saw_old = 0; path = ""; next }
   !in_hunk && /^--- / { saw_old = 1; next }
   !in_hunk && saw_old && /^\+\+\+ / {
     saw_old = 0
-    p = substr($0, 5)
+    p = unquote(substr($0, 5))
     if (p == "/dev/null") { path = ""; next }
     sub(/^b\//, "", p)
     path = p
@@ -446,12 +466,12 @@ scan_into_findings() {
 mode_check_commit_msg() {
   local msg_file=$1
   [ -n "$msg_file" ] || die_cannot_evaluate "check-commit-msg needs a message-file path"
-  require_deps git awk sed cksum wc mktemp
+  require_deps git awk cksum wc mktemp tr cat rm mv
   set_repo_root
   [ -r "$msg_file" ] || die_cannot_evaluate "commit message file is not readable: $msg_file"
   new_findings_file
 
-  git -C "$REPO_ROOT" diff --cached --name-only --diff-filter=ACMR 2>/dev/null \
+  git -C "$REPO_ROOT" "${GIT_DIFF_CONFIG[@]}" diff --cached --name-only -z --diff-filter=ACMR 2>/dev/null \
     >"$FINDINGS_FILE.paths" \
     || die_cannot_evaluate "could not read the staged file list (git diff --cached failed)"
   check_private_paths "$FINDINGS_FILE.paths"
@@ -473,13 +493,13 @@ mode_check_commit_msg() {
 mode_check_rev() {
   local rev=$1 msg_file
   [ -n "$rev" ] || die_cannot_evaluate "check-rev needs a revision"
-  require_deps git awk sed cksum wc mktemp
+  require_deps git awk cksum wc mktemp tr cat rm mv
   set_repo_root
   git -C "$REPO_ROOT" rev-parse --verify --quiet "$rev^{commit}" >/dev/null \
     || die_cannot_evaluate "not a commit: $rev"
   new_findings_file
 
-  git -C "$REPO_ROOT" show --pretty=format: --name-only --diff-filter=ACMR "$rev" 2>/dev/null \
+  git -C "$REPO_ROOT" "${GIT_DIFF_CONFIG[@]}" show --pretty=format: --name-only -z --diff-filter=ACMR "$rev" 2>/dev/null \
     >"$FINDINGS_FILE.paths" \
     || die_cannot_evaluate "could not read the file list for $rev"
   check_private_paths "$FINDINGS_FILE.paths"
@@ -507,7 +527,7 @@ mode_check_range() {
   # so the range check is what actually stops a leak reaching the default branch.
   local range=$1 revs rev out rc worst=0 count
   [ -n "$range" ] || die_cannot_evaluate "check-range needs a revision range"
-  require_deps git awk sed cksum wc mktemp
+  require_deps git awk cksum wc mktemp tr cat rm mv
   set_repo_root
   revs="$(git -C "$REPO_ROOT" rev-list --no-merges "$range" 2>/dev/null)" \
     || die_cannot_evaluate "could not resolve the revision range: $range"
@@ -533,7 +553,7 @@ RANGE
 
 mode_check_text() {
   local label=$1
-  require_deps awk cksum wc mktemp
+  require_deps awk cksum wc mktemp tr cat rm mv
   new_findings_file
   label_lines "$label" '' "$FINDINGS_FILE.stdin"
   scan_into_findings "$FINDINGS_FILE.stdin"
@@ -550,7 +570,7 @@ EOF
 
 mode_install() {
   local hook
-  require_deps git
+  require_deps git grep mkdir chmod rm
   set_repo_root
   set_hooks_dir
   hook="$HOOKS_DIR/commit-msg"
@@ -566,7 +586,7 @@ mode_install() {
 
 mode_uninstall() {
   local hook
-  require_deps git
+  require_deps git grep mkdir chmod rm
   set_repo_root
   set_hooks_dir
   hook="$HOOKS_DIR/commit-msg"

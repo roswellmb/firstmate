@@ -134,6 +134,36 @@ test_forced_private_path_is_refused() {
   pass "a staged private path is refused on its own, without reading its content"
 }
 
+test_private_path_git_has_to_quote_is_refused() {
+  local repo rc out name
+  repo="$(new_repo private-path-quoted)"
+  # git quotes a path with a non-ASCII character in --name-only output unless it
+  # is told otherwise, and quotes one containing a double quote whatever it is
+  # told. A quoted name that rule P cannot parse is a private record walking
+  # straight past the guard. Both names below are synthesised for this test.
+  name="$(printf '%b' 'data/na\xc3\xafve-cafe-record.md')"
+  printf 'private record\n' >"$repo/$name"
+  git -C "$repo" add -f "$name"
+  rc="$(run_guard_status "$repo" 'chore: add notes')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "a force-added private path with a non-ASCII name must refuse (got exit $rc: $out)"
+  case "$out" in
+    *"$name"*) : ;;
+    *) fail "refusal must name the staged private path as git stores it (got: $out)" ;;
+  esac
+
+  repo="$(new_repo private-path-embedded-quote)"
+  name='data/quote"name.md'
+  printf 'private record\n' >"$repo/$name"
+  git -C "$repo" add -f "$name"
+  rc="$(run_guard_status "$repo" 'chore: add notes')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "a force-added private path containing a quote must refuse (got exit $rc: $out)"
+  pass "a private path that git has to quote is still refused on the path alone"
+}
+
 test_added_content_cannot_impersonate_a_diff_header() {
   local repo anchor title rc out
   repo="$(new_repo header-injection)"
@@ -579,6 +609,7 @@ test_document_context_title_is_refused
 test_id_reference_is_accepted
 test_commit_message_is_covered
 test_forced_private_path_is_refused
+test_private_path_git_has_to_quote_is_refused
 test_added_content_cannot_impersonate_a_diff_header
 test_diff_prefix_configuration_does_not_hide_a_leak
 test_a_long_line_is_still_scanned
