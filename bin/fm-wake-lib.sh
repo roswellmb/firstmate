@@ -501,14 +501,25 @@ _fm_recovery_marker_ack() {
   fm_lock_release "$lock"
 }
 
+# Distinguishes "a lock this needs is held by someone else" from "the marker
+# itself is unsafe to consume". The first is transient and retriable - the holder
+# is another process doing ordinary work, and the next attempt is likely to
+# succeed - so a caller on a repeating cadence should skip and come back. The
+# second means the durable recovery record could not be read or rewritten, which
+# never fixes itself by retrying and must stay loud. Collapsing both into 1 left
+# callers unable to tell a survivable wait from a genuine corruption.
+FM_RECOVERY_MARKER_CONTENDED=4
+
+# Returns 0 with FM_RECOVERY_MARKER_ACTION set, $FM_RECOVERY_MARKER_CONTENDED
+# when a required lock could not be acquired, or 1 when the marker is unsafe.
 _fm_recovery_marker_arm_check() {
   local marker=$1 lock line quarantine
   FM_RECOVERY_MARKER_ACTION='none'
   lock="${marker}.lock"
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return "$FM_RECOVERY_MARKER_CONTENDED"
   if ! fm_lock_acquire_wait "$lock"; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-    return 1
+    return "$FM_RECOVERY_MARKER_CONTENDED"
   fi
   if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
     if [ -s "$FM_WAKE_QUEUE" ]; then
@@ -747,27 +758,31 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    non-zero return as "did not get the lock" and must not proceed as if they
 #    had.
 fm_lock_acquire_wait() {  # <lockdir>
-  local lockdir=$1 waited=0 budget limit
+  local lockdir=$1 budget deadline
   budget=${FM_LOCK_WAIT_TIMEOUT:-300}
   # An unreadable override must not silently disable the ceiling that exists to
   # stop a permanent wait, so fall back to the default rather than to zero.
   case "$budget" in
     ''|*[!0-9]*|0) budget=300 ;;
   esac
-  limit=$(( budget * 10 ))
+  # The budget is wall clock, not a tick count: each attempt forks cat/mkdir/ln
+  # and a live holder also walks the steal path, so counting 0.1s sleeps
+  # overshot the configured seconds by up to 2x. date(1) exposes whole seconds,
+  # so add one rounding second the way bin/fm-watch-arm.sh does for its confirm
+  # budget, keeping a one-second timeout from collapsing near a boundary.
+  deadline=$(( $(date +%s) + budget + 1 ))
   while ! fm_lock_try_acquire "$lockdir"; do
     if fm_lock_held_by_current_process "$lockdir"; then
       # stderr only - this process's stdout may be the wake protocol.
       printf 'fm-lock: already held by this process, proceeding without a fresh claim: %s\n' "$lockdir" >&2
       return 0
     fi
-    if [ "$waited" -ge "$limit" ]; then
+    if [ "$(date +%s)" -ge "$deadline" ]; then
       printf 'fm-lock: gave up after %ss waiting for %s (held by pid %s)\n' \
         "$budget" "$lockdir" "${FM_LOCK_HELD_PID:-unknown}" >&2
       return 1
     fi
     sleep 0.1
-    waited=$((waited + 1))
   done
 }
 

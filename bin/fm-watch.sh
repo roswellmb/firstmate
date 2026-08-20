@@ -768,7 +768,12 @@ WATCHER_RECOVERY_PENDING=0
 if [ -n "${FM_LOCK_RECOVERED_PID:-}" ]; then
   WATCHER_RECOVERY_PENDING=1
 fi
-if ! fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER"; then
+armcheck_status=0
+fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER" || armcheck_status=$?
+if [ "$armcheck_status" -eq "$FM_RECOVERY_MARKER_CONTENDED" ]; then
+  echo "watcher: recovery state is locked by another process; not starting" >&2
+  exit 1
+elif [ "$armcheck_status" -ne 0 ]; then
   echo "watcher: recovery state could not be consumed safely; retaining stale lock evidence" >&2
   exit 1
 fi
@@ -800,7 +805,7 @@ watcher_cleanup() {
   # recorded holder, never another's, and only after the marker above is
   # published, so the outer lock still covers the marker write the way the
   # interrupted section intended.
-  if [ "$(cat "$FM_WAKE_QUEUE_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
+  if fm_lock_held_by_current_process "$FM_WAKE_QUEUE_LOCK"; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   fi
   return "$cleanup_status"
@@ -831,8 +836,16 @@ if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; the
 fi
 
 resurface_after_downtime() {
+  local status=0
   if [ "$WATCHER_RECOVERY_PENDING" -ne 1 ]; then
-    if ! fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER"; then
+    fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER" || status=$?
+    # A lock another process holds is transient, and this runs every poll, so
+    # skip the cycle and re-read the marker on the next one. An unsafe marker
+    # never resolves by retrying and still exits.
+    if [ "$status" -eq "$FM_RECOVERY_MARKER_CONTENDED" ]; then
+      return 0
+    fi
+    if [ "$status" -ne 0 ]; then
       echo "watcher: recovery state could not be consumed safely" >&2
       exit 1
     fi

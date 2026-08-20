@@ -64,6 +64,22 @@ SH
   chmod +x "$dir/fakebin/readlink"
 }
 
+install_marker_quarantine_fault() {  # <dir>
+  local dir=$1
+  REAL_MKTEMP=$(command -v mktemp)
+  export REAL_MKTEMP
+  cat > "$dir/fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    */.watcher-down.invalid.XXXXXX) exit 1 ;;
+  esac
+done
+exec "$REAL_MKTEMP" "$@"
+SH
+  chmod +x "$dir/fakebin/mktemp"
+}
+
 wait_for_path() {  # <path> <ticks>
   local path=$1 limit=$2 i=0
   while [ "$i" -lt "$limit" ]; do
@@ -125,6 +141,92 @@ test_watcher_signalled_inside_its_recovery_marker_lock_still_exits() {
     *) fail "cleanup did not publish downtime recovery state (got '$marker')" ;;
   esac
   pass "a watcher signalled inside its recovery-marker lock still exits and releases the singleton"
+}
+
+# A contended wake-queue lock is another process doing ordinary work, so the
+# read/reconcile path must skip the cycle and come back rather than killing the
+# watcher - which is the exact no-watcher/no-beacon symptom this branch repairs.
+# An unsafe marker is the opposite: it never resolves by retrying, so it must
+# still exit loudly. Both halves ride the same fm_recovery_marker_arm_check call
+# in the poll loop, so they are asserted together.
+test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher() {
+  local dir state out live pid i
+  dir=$(make_case watcher-armcheck-contended)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+
+  # The startup arm-check runs before the poll loop, so the lock is taken only
+  # once the watcher is provably cycling - otherwise this would test startup.
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_LOCK_WAIT_TIMEOUT=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_path "$state/.last-watcher-beat" 100 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+
+  sleep 300 &
+  live=$!
+  i=0
+  until mkdir "$state/.wake-queue.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || { kill -KILL "$pid" "$live" 2>/dev/null || true
+                          wait "$pid" 2>/dev/null || true
+                          fail "could not take the wake-queue lock away from the watcher"; }
+    sleep 0.05
+  done
+  printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
+
+  # Removing the beacon and waiting for it to reappear proves a WHOLE new cycle
+  # ran under the held lock, without depending on one-second mtime granularity.
+  rm -f "$state/.last-watcher-beat"
+  wait_for_path "$state/.last-watcher-beat" 200 \
+    || { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher stopped cycling while the wake-queue lock was held: $(cat "$out")"; }
+  kill -0 "$pid" 2>/dev/null \
+    || { kill -KILL "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher died on a contended wake-queue lock: $(cat "$out")"; }
+  grep -q "could not be consumed safely" "$out" \
+    && { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "contention was misreported as an unsafe recovery marker"; }
+
+  kill -KILL "$live" 2>/dev/null || true
+  rm -rf "$state/.wake-queue.lock"
+  kill -TERM "$pid" 2>/dev/null || true
+  wait_for_exit "$pid" 150
+  pass "a contended wake-queue lock skips the cycle and leaves the watcher alive"
+}
+
+test_unsafe_recovery_marker_still_exits_the_watcher() {
+  local dir state out pid status
+  dir=$(make_case watcher-armcheck-unsafe-marker)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+  install_marker_quarantine_fault "$dir"
+
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_path "$state/.last-watcher-beat" 100 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+
+  # Unreadable marker plus a quarantine that cannot be created: unsafe, and no
+  # amount of retrying makes it safe.
+  printf 'not-a-marker-token\n' > "$state/.watcher-down"
+  wait_for_exit "$pid" 150
+  status=$?
+  [ "$status" -ne 124 ] \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher kept running with a recovery marker it could not consume"; }
+  [ "$status" -ne 0 ] \
+    || fail "the watcher exited cleanly on an unsafe recovery marker: $(cat "$out")"
+  grep -q "recovery state could not be consumed safely" "$out" \
+    || fail "the watcher did not report the unsafe recovery marker: $(cat "$out")"
+  pass "an unsafe recovery marker still exits the watcher loudly"
 }
 
 test_lock_wait_returns_when_this_process_already_holds_it() {
@@ -1246,6 +1348,8 @@ test_singleton_start
 test_lock_wait_returns_when_this_process_already_holds_it
 test_lock_wait_gives_up_loudly_on_a_foreign_live_holder
 test_watcher_signalled_inside_its_recovery_marker_lock_still_exits
+test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher
+test_unsafe_recovery_marker_still_exits_the_watcher
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc
