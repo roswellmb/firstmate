@@ -482,12 +482,8 @@ if (stableRows.length !== 4) throw new Error(`single-flight recovery launched ${
 EOF
 )
   status=$?
-  # Report what the node block actually said BEFORE asserting its exit code.
-  # expect_code calls fail, which exits, so checking the code first threw away
-  # $out - and with it the only thing distinguishing this block's five separate
-  # throws. A CI failure here named none of them until this order was fixed.
+  [ "$status" -eq 0 ] || fail "Pi must deliver the actionable wake after bounded hung-successor recovery: $out"
   [ -z "$out" ] || fail "Pi hung-successor test printed output: $out"
-  expect_code 0 "$status" "Pi must deliver the actionable wake after bounded hung-successor recovery"
   pass "Pi hung successor falls back to one typed actionable wake"
 }
 
