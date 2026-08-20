@@ -21,6 +21,8 @@
 #      message crosses the stubbed ssh transport while the close is the same
 #      local ledger append; a failed transport closes nothing.
 #   7. Flag misuse (--key, empty message, explicit backend target) refuses.
+#   8. A delivered answer whose closing append fails routes the stuck operator to
+#      bin/fm-status-decision-close.sh, never to a fold-bypassing hand-append.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -395,6 +397,43 @@ test_flag_misuse_refuses() {
   pass "fm-send --resolve-key: --key, empty message, explicit targets, and malformed keys refuse loudly"
 }
 
+# The answer landed but the closing append could not. The operator is stuck at
+# exactly the moment they are most likely to follow whatever the tool says, so
+# the message must route them to the supported closer and must NOT teach the
+# hand-appended resolved line: that route skips the fold check
+# bin/fm-status-decision-close.sh performs, and a key it misfiles is one nothing
+# can later resolve.
+test_close_append_failure_routes_to_the_supported_closer() {
+  local dir fb log home err rc msg
+  dir="$TMP_ROOT/append-fails"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  home=$(setup_home append-fails)
+  fm_write_meta "$home/state/t8.meta" "window=sess:fm-t8" "kind=ship"
+  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$home/state/t8.status"
+  # Readable (so the pre-send fold still sees the key open) but not appendable.
+  chmod 0444 "$home/state/t8.status"
+
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" t8 --resolve-key api-shape "go with REST" >/dev/null 2>"$err"; rc=$?
+  chmod 0644 "$home/state/t8.status"
+  [ "$rc" -ne 0 ] || fail "a failed closing append should exit nonzero"
+  msg=$(cat "$err")
+  assert_contains "$msg" "was delivered" "the message should say the answer did land"
+  assert_contains "$msg" "do not resend the answer" "the message should still forbid resending"
+  assert_contains "$msg" \
+    "bin/fm-status-decision-close.sh t8 --key api-shape --answered-elsewhere" \
+    "the message should give the supported close for this exact task and key"
+  if printf '%s' "$msg" | grep -F ">> $home/state/t8.status" >/dev/null; then
+    fail "the message still teaches the hand-append that bypasses the fold check: $msg"
+  fi
+  if printf '%s' "$msg" | grep -Fq "Close it manually"; then
+    fail "the message still advises a manual close: $msg"
+  fi
+  pass "fm-send --resolve-key: a failed closing append routes to the deliberate closer, not a hand-append"
+}
+
 test_answer_send_closes_open_decision
 test_answer_starts_work_never_orphans
 test_routine_steer_never_closes
@@ -405,3 +444,4 @@ test_local_secondmate_answer_marked_and_closed
 test_remote_secondmate_answer_closes_locally
 test_remote_transport_failure_does_not_close
 test_flag_misuse_refuses
+test_close_append_failure_routes_to_the_supported_closer

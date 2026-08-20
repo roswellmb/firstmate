@@ -184,7 +184,11 @@ return_reconcile() {
     printf 'fm-afk-return: catch-up must finish before the captain request\n' >&2
     print_evidence "$GATE" >&2
     print_blockers "$GATE" >&2
-    printf 'fm-afk-return: handle each blocker now, or close it with resolved [key=...] and append a durable reclassification reason, then run bin/fm-afk-return.sh check\n' >&2
+    # Both closers are named because a blocker listed here may still have a live
+    # worker: answering one is better than declaring it moot. Never advise a
+    # hand-appended resolved line - it skips the fold check these perform, and a
+    # key it misfiles is one nothing can later resolve.
+    printf 'fm-afk-return: handle each blocker now, or close it through a supported closer carrying a durable reclassification reason - with a worker left to answer: bin/fm-send.sh <task> --resolve-key <key> <the answer>; with none: bin/fm-status-decision-close.sh <task> --key <key> --answered-elsewhere \x27<the answer given elsewhere>\x27 or --moot \x27<why>\x27 - then run bin/fm-afk-return.sh check\n' >&2
     rm -f "$evidence" "$blockers" "$drain_err"
     return 3
   fi
