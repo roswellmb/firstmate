@@ -1485,6 +1485,46 @@ EOF
   pass "session start: the tasks-axi compatibility verdict is computed once and reused"
 }
 
+# --- dispatch readiness inside the one startup digest -----------------------
+
+# Session start is the second arming point for the fleet-level dispatch-
+# readiness scan (bin/fm-dispatch-poll.sh); the watcher sweep is the first.
+# It runs on the locked path ahead of the wake drain precisely so a verdict
+# lands in THIS digest instead of arriving as a separate wake minutes later,
+# so the assertion is that the digest states the verdict AND the drain in the
+# same digest presents the durable record it queued. The briefed and
+# needs-intake split is asserted too: a wake that says which is far more
+# useful than one that does not.
+test_dispatch_readiness_lands_in_the_startup_digest() {
+  local rec root home fakebin out presented
+  rec=$(new_world dispatch-readiness)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tasks_axi_compact "$fakebin"
+  printf '# Backlog\n\n## In flight\n\n## Queued\n' > "$home/data/backlog.md"
+  mkdir -p "$home/data/ready-1"
+  printf '# Brief\n\nA real, task-specific brief for ready-1.\n' > "$home/data/ready-1/brief.md"
+
+  out=$(FM_DISPATCH_POOL_ROOT="$home" FM_DISPATCH_OS_RESERVE_MB=1 \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "dispatch readiness: actionable: dispatch ready: 2 dispatchable" \
+    "the startup digest did not state the dispatch-readiness verdict"
+  assert_contains "$out" "briefed: ready-1" \
+    "the startup digest did not name the ready-and-briefed task"
+  assert_contains "$out" "needs intake: ready-2" \
+    "the startup digest did not name the ready-but-needs-intake task"
+  assert_grep 'dispatch ready:' "$home/state/.wake-queue" \
+    "session start did not leave the durable dispatch wake record"
+  presented=$(printf '%s\n' "$out" | grep -c 'dispatch ready: 2 dispatchable' || true)
+  [ "$presented" -ge 2 ] \
+    || fail "the wake drain in the same digest did not present the verdict session start queued"
+  pass "session start: a dispatch-readiness verdict lands in the one startup digest"
+}
+
 # --- fleet-state digest: compact backlog rendering --------------------------
 
 # A backlog whose Done section, held row, blocked row, and plain queued rows can
@@ -2203,6 +2243,7 @@ test_unreachable_network_never_blocks_the_digest
 test_deferred_result_reaches_the_agent_when_the_digest_cannot_print_it
 test_read_only_session_declares_skipped_network_checks
 test_tasks_axi_compatibility_is_probed_once
+test_dispatch_readiness_lands_in_the_startup_digest
 test_session_start_preserves_ambiguous_pi_process
 test_session_start_preserves_transiently_unreadable_tmux
 test_session_start_preserves_proven_bare_shell_recovery
