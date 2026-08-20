@@ -330,6 +330,50 @@ test_a_ready_set_returning_after_going_empty_wakes_again() {
   pass "a ready set that empties and returns wakes again"
 }
 
+# The other direction of the same invariant: a scan may only ever REMOVE ids
+# from the gain baseline unless it is the scan that announced them. A briefed
+# task that arrives during a machine-measurement inability is never named by
+# that scan's payload, so absorbing it into the baseline would consume the gain
+# in silence and firstmate would never be told the work is dispatchable.
+test_a_gain_arriving_during_a_machine_inability_still_surfaces() {
+  have_tasks_axi || { skip_case gain-during-inability "tasks-axi not found"; return 0; }
+  make_home gainduringinability
+  local pool i
+  pool="$HOME_DIR/pool"
+  for i in 1 2 3 4 5 6; do
+    mkdir -p "$pool/repo-$i/1"
+  done
+  cat > "$FAKEBIN/du" <<SH
+#!/usr/bin/env bash
+[ ! -f "$HOME_DIR/slow-du" ] || sleep 1
+printf '1024\t%s\n' "\${!#}"
+SH
+  chmod +x "$FAKEBIN/du"
+
+  # Nothing briefed has ever been seen, and alpha arrives briefed on the very
+  # scan whose machine measurement runs out of time.
+  add_task alpha "first"
+  give_brief alpha
+  : > "$HOME_DIR/slow-du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
+    "the fixture did not produce the machine-measurement inability it needs"
+  assert_not_contains "$SCAN_OUT" "alpha" \
+    "the inability payload named the briefed work it never actually offered"
+  [ "$(wakes)" = 1 ] || fail "the reported inability did not queue its own wake"
+
+  # The disk recovers. alpha has been dispatchable and briefed the whole time
+  # and nobody has ever been told, so this scan owes firstmate the gain.
+  rm -f "$HOME_DIR/slow-du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: alpha" \
+    "a gain that arrived during a machine inability was absorbed by the scan that never announced it"
+  [ "$(wakes)" = 2 ] || fail "the absorbed gain did not queue its own wake once the machine could be read"
+  rm -f "$FAKEBIN/du"
+  pass "a gain arriving during a machine inability is never absorbed by the scan that stayed quiet about it"
+}
+
 # An inability that failed only on the MACHINE measurement DID observe the
 # briefed set, and must record what it saw. Carrying the previous set through
 # instead leaves the record naming ids that have since been dispatched, so their
@@ -363,7 +407,7 @@ printf '1024	%s
 ' "${!#}"
 SH
   chmod +x "$FAKEBIN/du"
-  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
     FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
   assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
     "the fixture did not produce the machine-measurement inability it needs"
@@ -659,7 +703,7 @@ SH
   [ "$(wakes)" = 1 ] || fail "the briefed pair did not queue a wake"
 
   : > "$HOME_DIR/slow-du"
-  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
     FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
   assert_contains "$SCAN_OUT" "copy-reserve-timed-out" "the first inability was not reported"
   [ "$(wakes)" = 2 ] || fail "the first inability did not queue its own wake"
@@ -674,19 +718,72 @@ SH
   [ "$(wakes)" = 2 ] || fail "a silent ready scan queued a wake"
 
   : > "$HOME_DIR/slow-du"
-  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
     FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
   [ -z "$SCAN_OUT" ] || fail "the identical inability surfaced again inside its bound: $SCAN_OUT"
   [ "$(wakes)" = 2 ] || fail "the identical inability queued a second wake inside its bound"
 
   # Still bounded, not silenced: once the cadence elapses it speaks again.
-  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
     FM_DISPATCH_COPY_MEASURE_SECS=0 RESURFACE_SECS=0 scan >/dev/null
   unset RESURFACE_SECS
   rm -f "$HOME_DIR/slow-du" "$FAKEBIN/du"
   assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
     "the persisting inability never re-surfaced once its bound elapsed"
   pass "a silent ready scan leaves the blocked-or-unknown re-surface cadence intact"
+}
+
+# The same invariant, on the other silent path. A none verdict prints nothing
+# and queues nothing, so it has announced nothing, so it may not move the
+# baseline the bounded cadence is measured against.
+test_a_silent_none_scan_keeps_the_fault_cadence() {
+  have_tasks_axi || { skip_case silent-none-keeps-cadence "tasks-axi not found"; return 0; }
+  make_home silentnonecadence
+  local pool i
+  pool="$HOME_DIR/pool"
+  for i in 1 2 3 4 5 6; do
+    mkdir -p "$pool/repo-$i/1"
+  done
+  cat > "$FAKEBIN/du" <<SH
+#!/usr/bin/env bash
+[ ! -f "$HOME_DIR/slow-du" ] || sleep 1
+printf '1024\t%s\n' "\${!#}"
+SH
+  chmod +x "$FAKEBIN/du"
+
+  add_task alpha "first"
+  give_brief alpha
+  : > "$HOME_DIR/slow-du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" "the first inability was not reported"
+  [ "$(wakes)" = 1 ] || fail "the first inability did not queue its own wake"
+
+  # Every queued item is dispatched, so the verdict is none: it surfaces nothing
+  # and therefore has nothing to say about when the fault last spoke.
+  rm -f "$HOME_DIR/slow-du"
+  tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not start alpha"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "an emptied ready set printed a line: $SCAN_OUT"
+  [ "$(wakes)" = 1 ] || fail "an emptied ready set queued a wake"
+
+  tasks-axi reopen alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not reopen alpha"
+  : > "$HOME_DIR/slow-du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "the identical inability surfaced again inside its bound: $SCAN_OUT"
+  [ "$(wakes)" = 1 ] || fail "the identical inability queued a second wake inside its bound"
+
+  # Still bounded, not silenced: once the cadence elapses it speaks again.
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=5 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 RESURFACE_SECS=0 scan >/dev/null
+  unset RESURFACE_SECS
+  rm -f "$HOME_DIR/slow-du" "$FAKEBIN/du"
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
+    "the persisting inability never re-surfaced once its bound elapsed"
+  pass "a silent none scan leaves the blocked-or-unknown re-surface cadence intact"
 }
 
 # --- the copy measurement reads copies, not pools ---------------------------
@@ -843,7 +940,7 @@ intervene_with_none() {
   tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
     || fail "fixture: could not start alpha"
   FM_DISPATCH_POOL_ROOT_OVERRIDE="$HOME_DIR/pool" scan >/dev/null
-  assert_grep 'verdict=none' "$STATE/.dispatch-poll" "the intervening verdict was not none"
+  [ -z "$SCAN_OUT" ] || fail "the intervening scan was not a silent none verdict: $SCAN_OUT"
   tasks-axi reopen alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
     || fail "fixture: could not reopen alpha"
 }
@@ -858,7 +955,7 @@ intervene_with_unknown() {
   chmod 000 "$DATA/backlog.md"
   RESURFACE_SECS=0 FM_DISPATCH_POOL_ROOT_OVERRIDE="$HOME_DIR/pool" scan >/dev/null
   chmod 644 "$DATA/backlog.md"
-  assert_grep 'verdict=unknown' "$STATE/.dispatch-poll" "the intervening verdict was not unknown"
+  assert_contains "$SCAN_OUT" "dispatch unknown" "the intervening verdict was not unknown"
 }
 
 # --- the watcher actually runs it -------------------------------------------
@@ -1037,7 +1134,7 @@ test_blocked_verdict_holds_until_a_whole_clone_of_room_returns() {
   FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" OS_RESERVE_MB="$reserve_mb" scan >/dev/null
   [ -z "$SCAN_OUT" ] || fail "a verdict inside the deadband woke firstmate again: $SCAN_OUT"
   [ "$(wakes)" = 1 ] || fail "a verdict inside the deadband queued a second wake"
-  assert_grep 'verdict=blocked' "$STATE/.dispatch-poll" \
+  assert_grep 'announced_verdict=blocked' "$STATE/.dispatch-poll" \
     "free space barely above the floor released the blocked verdict"
 
   # 3. Free space above the floor by a whole copy: released, and worth a wake.
@@ -1126,6 +1223,7 @@ test_a_re_queued_task_can_be_a_gain_again
 test_a_ready_set_returning_after_going_empty_wakes_again
 test_an_inability_never_manufactures_a_gain
 test_an_inability_after_the_briefed_set_records_what_it_saw
+test_a_gain_arriving_during_a_machine_inability_still_surfaces
 test_room_returning_re_offers_the_briefed_work
 test_never_ranks_and_never_spawns
 test_long_ready_set_is_bounded_and_the_cut_is_disclosed
@@ -1141,6 +1239,7 @@ test_invalid_capacity_configuration_reports_rather_than_passes
 test_persisting_fault_resurfaces_on_a_bounded_cadence
 test_ready_verdict_never_resurfaces_on_cadence
 test_a_silent_ready_scan_keeps_the_fault_cadence
+test_a_silent_none_scan_keeps_the_fault_cadence
 test_superseded_verdicts_collapse_to_the_latest
 test_a_hung_backlog_tool_is_reported_not_silently_killed
 test_an_unusable_budget_reports_rather_than_defaulting
