@@ -9,6 +9,12 @@ STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
+# Ceiling for fm_lock_acquire_wait. Every legitimate hold in this repo is a few
+# file operations long, and the slowest (a remote push under a home lock) is
+# still far below this, so reaching it means the holder is never going to
+# release. Generous by design: it exists to convert a permanent wedge into one
+# diagnostic line, not to arbitrate ordinary contention.
+FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-300}"
 # Resolved once at source time: fm_pid_identity and fm_path_mtime run inside 0.2s
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
@@ -697,10 +703,69 @@ fm_lock_try_acquire() {
   return "$rc"
 }
 
-fm_lock_acquire_wait() {
-  local lockdir=$1
+# fm_lock_held_by_current_process: does THIS process already own <lockdir>?
+#
+# Deliberately compares the stored holder against ${BASHPID:-$$} rather than $$,
+# matching what fm_lock_claim writes and what fm_lock_release checks, so a
+# subshell is correctly judged NOT to be the holder its parent is.
+fm_lock_held_by_current_process() {  # <lockdir>
+  local lockdir=$1 pid
+  # cat follows the owner symlink, the same read fm_lock_try_acquire performs.
+  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  [ -n "$pid" ] || return 1
+  [ "$pid" = "${BASHPID:-$$}" ]
+}
+
+# fm_lock_acquire_wait: block until this process may proceed under <lockdir>.
+#
+# Two ways of never proceeding are handled explicitly, because the plain
+# retry-forever loop this replaced could do neither and wedged the watcher.
+#
+# 1. The caller already holds this lock. fm_lock_try_acquire only reports
+#    whether the lock is free, and a lock held by a live pid is never free -
+#    including when that live pid is the caller. Retrying then waits for a
+#    release only the waiter itself could perform, so it can never succeed.
+#    bin/fm-watch.sh reached exactly this state: a SIGTERM landing inside
+#    _fm_recovery_marker_arm_check's critical section ran `trap 'exit 1'`, whose
+#    EXIT trap re-entered the same marker lock through
+#    _fm_recovery_marker_publish and spun on it forever, leaving .watch.lock
+#    unreleased, the liveness beacon frozen, and anything wait(1)ing on the
+#    watcher blocked until a second signal arrived. The invariant a caller wants
+#    from this function - this process has exclusive access - already holds in
+#    that case, so report success instead of deadlocking. This is an escape for
+#    abandonment paths (signal handlers and EXIT traps unwinding out of a
+#    critical section), NOT a recursive mutex: the matching release really does
+#    drop the lock, which is what an abandoning path needs and why no caller may
+#    nest this lock on an ordinary path.
+#
+# 2. Someone else holds it and never lets go - a wedged peer, or a recorded pid
+#    that has been recycled by an unrelated live process, which the stale-steal
+#    path in fm_lock_try_acquire deliberately refuses to evict. Waiting past the
+#    ceiling turns another process's fault into this one's silent stall, so give
+#    up and say which lock and which holder, the same bounded-then-give-up shape
+#    the cycle-log and delivery-log waiters already use. Callers must treat a
+#    non-zero return as "did not get the lock" and must not proceed as if they
+#    had.
+fm_lock_acquire_wait() {  # <lockdir>
+  local lockdir=$1 waited=0 budget limit
+  budget=${FM_LOCK_WAIT_TIMEOUT:-300}
+  # An unreadable override must not silently disable the ceiling that exists to
+  # stop a permanent wait, so fall back to the default rather than to zero.
+  case "$budget" in
+    ''|*[!0-9]*|0) budget=300 ;;
+  esac
+  limit=$(( budget * 10 ))
   while ! fm_lock_try_acquire "$lockdir"; do
+    if fm_lock_held_by_current_process "$lockdir"; then
+      return 0
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      printf 'fm-lock: gave up after %ss waiting for %s (held by pid %s)\n' \
+        "$budget" "$lockdir" "${FM_LOCK_HELD_PID:-unknown}" >&2
+      return 1
+    fi
     sleep 0.1
+    waited=$((waited + 1))
   done
 }
 
@@ -815,7 +880,7 @@ fm_wake_append() {
   recovery_marker="$STATE/.watcher-down"
   status=0
 
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
   _fm_recovery_marker_publish "$recovery_marker" downtime || status=$?
   if [ "$status" -eq 0 ]; then
     seq=$(cat "$seq_file" 2>/dev/null || echo 0)
@@ -844,7 +909,7 @@ fm_wake_queued_keys() {
     signal|stale|check|heartbeat) ;;
     *) printf 'fm_wake_queued_keys: invalid wake kind: %s\n' "$kind" >&2; return 2 ;;
   esac
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
   fm_wake_queued_keys_locked "$kind"
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
 }

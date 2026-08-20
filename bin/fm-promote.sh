@@ -103,7 +103,8 @@ CONTROL_LOCK_HELD=1
 META="$STATE/$ID.meta"
 [ -d "$STATE" ] || { echo "error: state dir not found: $STATE" >&2; exit 1; }
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
-fm_lock_acquire_wait "$META_LOCK"
+fm_lock_acquire_wait "$META_LOCK" \
+  || { echo "error: could not acquire the task metadata lock" >&2; exit 1; }
 META_LOCK_HELD=1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }

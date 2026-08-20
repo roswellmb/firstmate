@@ -34,6 +34,145 @@ drain_and_ack() {  # <state>
     --recovery-generation "$generation"
 }
 
+# A watcher that is signalled while it holds its own recovery-marker lock used to
+# re-enter that lock from its EXIT trap and wait on itself forever, so it never
+# released .watch.lock, stopped beating, and left arm/daemon/test teardown - all
+# of which send ONE signal and then wait(1) - blocked until a second signal
+# arrived. Pausing inside the critical section makes that a rendezvous instead of
+# a race: readlink is the first external command bin/fm-wake-lib.sh runs against
+# an already-claimed lock, so holding it there parks the watcher exactly where
+# the incident landed. Armed by the test only once the watcher is in its main
+# loop, so the pause lands after the EXIT trap is installed rather than during
+# startup, where a signal would terminate by default and prove nothing.
+install_recovery_marker_lock_fault() {  # <dir>
+  local dir=$1
+  REAL_READLINK=$(command -v readlink)
+  export REAL_READLINK
+  cat > "$dir/fakebin/readlink" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */.watcher-down.lock)
+    if [ -n "${FM_MARKER_LOCK_ARM:-}" ] && [ -e "$FM_MARKER_LOCK_ARM" ] \
+      && [ ! -e "$FM_MARKER_LOCK_READY" ] && [ -s "$1/pid" ]; then
+      printf '1\n' > "$FM_MARKER_LOCK_READY"
+      while [ ! -e "$FM_MARKER_LOCK_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$REAL_READLINK" "$@"
+SH
+  chmod +x "$dir/fakebin/readlink"
+}
+
+wait_for_path() {  # <path> <ticks>
+  local path=$1 limit=$2 i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ -e "$path" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+test_watcher_signalled_inside_its_recovery_marker_lock_still_exits() {
+  local dir state fakebin out arm ready release pid status marker
+  dir=$(make_case watcher-signal-in-marker-lock)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  arm="$dir/marker-lock-arm"
+  ready="$dir/marker-lock-ready"
+  release="$dir/marker-lock-release"
+  mark_pr_check_migration_complete "$state"
+  install_recovery_marker_lock_fault "$dir"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_MARKER_LOCK_ARM="$arm" FM_MARKER_LOCK_READY="$ready" FM_MARKER_LOCK_RELEASE="$release" \
+    "$WATCH" > "$out" &
+  pid=$!
+  # The beacon is only touched inside the poll loop, so its arrival proves the
+  # EXIT trap is installed and the pause below lands in a signalled-during-cleanup
+  # window rather than during startup.
+  wait_for_path "$state/.last-watcher-beat" 100 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+  touch "$arm"
+  wait_for_path "$ready" 200 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never reached its recovery-marker critical section: $(cat "$out")"; }
+  [ "$(cat "$state/.watcher-down.lock/pid" 2>/dev/null || true)" = "$pid" ] \
+    || fail "the paused watcher does not hold its own recovery-marker lock"
+
+  # Exactly one signal, the way bin/fm-watch-arm.sh and bin/fm-supervise-daemon.sh
+  # stop a watcher before waiting on it.
+  kill -TERM "$pid" 2>/dev/null || fail "could not signal the paused watcher"
+  touch "$release"
+  wait_for_exit "$pid" 150
+  status=$?
+  [ "$status" -ne 124 ] \
+    || fail "the watcher did not exit after one signal delivered inside its recovery-marker lock"
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "the exiting watcher left its singleton lock behind"
+  marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
+  case "$marker" in
+    pending:downtime:*) ;;
+    *) fail "cleanup did not publish downtime recovery state (got '$marker')" ;;
+  esac
+  pass "a watcher signalled inside its recovery-marker lock still exits and releases the singleton"
+}
+
+test_lock_wait_returns_when_this_process_already_holds_it() {
+  local dir state out pid status
+  dir=$(make_case lock-wait-reentrant)
+  state="$dir/state"
+  out="$dir/reentrant.out"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_acquire_wait "$2" || { echo "first acquire failed"; exit 3; }
+    fm_lock_acquire_wait "$2" || { echo "second acquire failed"; exit 4; }
+    fm_lock_release "$2"
+    echo held-then-released
+  ' _ "$LIB" "$state/.reentrant.lock" > "$out" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 100
+  status=$?
+  [ "$status" -ne 124 ] \
+    || fail "fm_lock_acquire_wait waited on a lock this same process already holds"
+  [ "$status" -eq 0 ] || fail "re-entrant fm_lock_acquire_wait failed ($status): $(cat "$out")"
+  grep -qx held-then-released "$out" || fail "re-entrant acquire did not complete: $(cat "$out")"
+  [ ! -e "$state/.reentrant.lock" ] && [ ! -L "$state/.reentrant.lock" ] \
+    || fail "the re-entrant holder could not release its own lock"
+  pass "fm_lock_acquire_wait does not wait on a lock the calling process already holds"
+}
+
+test_lock_wait_gives_up_loudly_on_a_foreign_live_holder() {
+  local dir state live out pid status
+  dir=$(make_case lock-wait-foreign-holder)
+  state="$dir/state"
+  out="$dir/giveup.out"
+  sleep 300 &
+  live=$!
+  mkdir "$state/.foreign.lock"
+  printf '%s\n' "$live" > "$state/.foreign.lock/pid"
+  FM_STATE_OVERRIDE="$state" FM_LOCK_WAIT_TIMEOUT=1 bash -c '
+    . "$1"
+    fm_lock_acquire_wait "$2"
+  ' _ "$LIB" "$state/.foreign.lock" > "$out" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 150
+  status=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$status" -ne 124 ] || fail "fm_lock_acquire_wait waited past its ceiling on a live foreign holder"
+  [ "$status" -ne 0 ] || fail "fm_lock_acquire_wait reported success without the lock"
+  grep -qF "gave up after 1s waiting for $state/.foreign.lock" "$out" \
+    || fail "giving up on a live foreign holder was silent: $(cat "$out")"
+  [ "$(cat "$state/.foreign.lock/pid" 2>/dev/null || true)" = "$live" ] \
+    || fail "a live foreign holder's lock was stolen instead of waited on"
+  pass "fm_lock_acquire_wait gives up loudly rather than waiting forever on a live foreign holder"
+}
+
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
   dir=$(make_case singleton)
@@ -1099,6 +1238,9 @@ test_msys_pid_identity_uses_proc() {
 }
 
 test_singleton_start
+test_lock_wait_returns_when_this_process_already_holds_it
+test_lock_wait_gives_up_loudly_on_a_foreign_live_holder
+test_watcher_signalled_inside_its_recovery_marker_lock_still_exits
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc
