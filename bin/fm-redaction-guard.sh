@@ -40,6 +40,9 @@
 #   1  evaluated, refused (violations printed)
 #   2  could NOT evaluate (missing dependency, unreadable input, unknown mode).
 #      This also stops the commit. The guard never exits 0 on an error path.
+#      Every cannot-evaluate condition is raised from the main shell, never
+#      from a subshell or the right-hand side of a pipeline, so its exit 2 is
+#      always the exit status of the process.
 #
 # Usage:
 #   fm-redaction-guard.sh install [--repo <dir>]
@@ -60,6 +63,7 @@
 #         print the built-in anchor vocabulary
 #   fm-redaction-guard.sh --help
 set -u
+set -o pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SELF_DIR/fm-redaction-guard.sh"
@@ -76,6 +80,13 @@ PRIVATE_FILES='.env'
 # English words that mark "an archived document is being referred to here".
 # Matched as whole lowercase words inside a bounded window before a literal.
 ANCHORS='document documents doc docs scan scans scanned rescan rescanned ocr correspondence invoice invoices receipt receipts statement statements attachment attachments paperless titled entitled'
+
+# Diff options pinned on every git invocation that this script parses. The
+# parser below strips a known `b/` prefix, so the prefixes must not be left to
+# diff.noprefix, diff.srcPrefix, diff.dstPrefix or diff.mnemonicPrefix, and a
+# non-ASCII path must not arrive octal-escaped.
+GIT_DIFF_CONFIG=(-c core.quotePath=false -c diff.noprefix=false -c diff.mnemonicPrefix=false)
+GIT_DIFF_OPTS=(--unified=0 --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ --diff-filter=ACMR)
 
 die_cannot_evaluate() {
   printf '%s: cannot evaluate: %s\n' "$HOOK_MARKER" "$1" >&2
@@ -95,13 +106,28 @@ require_deps() {
   done
 }
 
-repo_root() {
-  local root
-  root="$(git rev-parse --show-toplevel 2>/dev/null)" \
+# Set rather than print: a cannot-evaluate condition raised inside a command
+# substitution would only kill that subshell, and the process would carry on.
+REPO_ROOT=
+set_repo_root() {
+  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die_cannot_evaluate "not inside a git repository (git rev-parse --show-toplevel failed)"
-  [ -n "$root" ] \
+  [ -n "$REPO_ROOT" ] \
     || die_cannot_evaluate "git reported an empty repository root"
-  printf '%s\n' "$root"
+}
+
+# The hooks directory git will actually run, which is neither $root/.git/hooks
+# in a linked worktree (where .git is a file) nor when core.hooksPath is set.
+HOOKS_DIR=
+set_hooks_dir() {
+  HOOKS_DIR="$(git -C "$REPO_ROOT" rev-parse --git-path hooks 2>/dev/null)" \
+    || die_cannot_evaluate "could not resolve the hooks directory (git rev-parse --git-path hooks failed)"
+  [ -n "$HOOKS_DIR" ] \
+    || die_cannot_evaluate "git reported an empty hooks directory"
+  case "$HOOKS_DIR" in
+    /*) : ;;
+    *) HOOKS_DIR="$REPO_ROOT/$HOOKS_DIR" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -111,20 +137,32 @@ repo_root() {
 #   <label> <lineno> <literal>
 # ---------------------------------------------------------------------------
 # Input on stdin is TAB-separated: <label> <lineno> <line>
+# Every awk that touches repository content runs in the C locale. Rule T is an
+# ASCII rule, and committed content is arbitrary bytes: in a UTF-8 locale a
+# single invalid byte sequence makes awk fail, which is now correctly a
+# cannot-evaluate condition and would stop every commit touching such a file.
 scan_lines() {
-  awk -v anchors="$ANCHORS" -F '\t' '
+  LC_ALL=C awk -v anchors="$ANCHORS" -F '\t' '
   BEGIN {
     n = split(anchors, a, " ")
     for (i = 1; i <= n; i++) if (a[i] != "") ANCHOR[a[i]] = 1
     WINDOW = 64
-    MAXLINE = 2000
+    MAXTITLE = 120
+    # Scanning a line costs quadratic time, because awks substr is linear in
+    # the length of the string it is given. Measured on this machine (awk
+    # version 20200816) over a minified one-line JSON document and over a
+    # quote-dense line of the same length: 0.00s at 10,000 characters, 0.04s at
+    # 32,000, 0.40s at 100,000, 3.1s at 300,000, and 34s at 1,000,000. The cap
+    # is set at the last length whose worst case stays under half a second, and
+    # is 833 times the longest literal that can be title-shaped at all.
+    MAXLINE = 100000
   }
 
   # A literal is title-shaped when every one of these holds. This is the whole
   # of the guards expected value: no archive is consulted to decide it.
   function title_shaped(s,   len, cnt, i, w, arr, cap, caplong) {
     len = length(s)
-    if (len < 12 || len > 120) return 0
+    if (len < 12 || len > MAXTITLE) return 0
     # Character whitelist. Anything outside it reads as code, a path, a URL, a
     # glob, a command or an expression rather than as a document title.
     if (s !~ /^[A-Za-z0-9 .,&:#'"'"'-]+$/) return 0
@@ -174,10 +212,16 @@ scan_lines() {
     sub(/^[^\t]*\t[^\t]*\t/, "", line)
     L = length(line)
     if (L > MAXLINE) next
+    # Whether a closing quote exists at all depends only on the rest of the
+    # line, never on where the search started, so one failed search settles
+    # that quote character for the whole line. Without this memo a line full of
+    # unmatched quotes rescans to the end once per quote.
+    split("", NOCLOSE)
     i = 1
     while (i <= L) {
       c = substr(line, i, 1)
       if (c == "\"" || c == "`" || c == "'"'"'") {
+        if (c in NOCLOSE) { i++; continue }
         before = (i > 1) ? substr(line, i - 1, 1) : ""
         if (!edge(before)) { i++; continue }
         j = i + 1
@@ -189,10 +233,15 @@ scan_lines() {
           }
           j++
         }
-        if (!found) { i++; continue }
-        lit = substr(line, i + 1, j - i - 1)
-        if (title_shaped(lit) && anchored(substr(line, 1, i - 1)))
-          printf "%s\t%s\t%s\n", label, lineno, lit
+        if (!found) { NOCLOSE[c] = 1; i++; continue }
+        # Skip a literal that cannot be title-shaped before copying it out: on
+        # a long line the copy alone would cost more than the whole scan.
+        if (j - i - 1 >= 12 && j - i - 1 <= MAXTITLE) {
+          lit = substr(line, i + 1, j - i - 1)
+          start = (i - 1 > WINDOW) ? i - WINDOW : 1
+          if (title_shaped(lit) && anchored(substr(line, start, i - start)))
+            printf "%s\t%s\t%s\n", label, lineno, lit
+        }
         i = j + 1
       } else i++
     }
@@ -204,29 +253,36 @@ scan_lines() {
 # Findings
 # ---------------------------------------------------------------------------
 FINDINGS_FILE=
+FINDING_TOKEN=
 
-finding_token() {
+set_finding_token() {
   # Bound to the exact rule, location and literal. A different literal, or the
   # same literal in a different file, is a different finding with a different
   # token, so an exception can never be reused for a second leak.
   local sum
   sum="$(printf '%s\037%s\037%s' "$1" "$2" "$3" | cksum | awk '{print $1}')" \
     || die_cannot_evaluate "could not compute a finding token (cksum failed)"
-  printf '%08x\n' "$sum"
+  [ -n "$sum" ] \
+    || die_cannot_evaluate "could not compute a finding token (empty checksum)"
+  FINDING_TOKEN="$(printf '%08x' "$sum")" \
+    || die_cannot_evaluate "could not format a finding token"
 }
 
 record_finding() {
   # rule, location, literal, human message
-  local rule=$1 loc=$2 lit=$3 msg=$4 token
-  token="$(finding_token "$rule" "$loc" "$lit")"
-  printf '%s\t%s\t%s\n' "$token" "$rule" "$msg" >>"$FINDINGS_FILE"
+  local rule=$1 loc=$2 lit=$3 msg=$4
+  set_finding_token "$rule" "$loc" "$lit"
+  printf '%s\t%s\t%s\n' "$FINDING_TOKEN" "$rule" "$msg" >>"$FINDINGS_FILE" \
+    || die_cannot_evaluate "could not record a finding"
 }
 
 # ---------------------------------------------------------------------------
 # Rule P
 # ---------------------------------------------------------------------------
 check_private_paths() {
-  local path root_name
+  # Reads a file rather than stdin, so a cannot-evaluate condition raised from
+  # record_finding is raised in the main shell and not in a pipeline subshell.
+  local list=$1 path root_name
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     root_name=${path%%/*}
@@ -243,17 +299,25 @@ check_private_paths() {
         record_finding P "$path" "$path" "staged path is a private file: $path"
         ;;
     esac
-  done
+  done <"$list"
 }
 
 # ---------------------------------------------------------------------------
 # Added lines of a diff, as <label> <lineno> <line>
 # ---------------------------------------------------------------------------
 added_lines() {
-  awk -F '\t' '
-  /^\+\+\+ / {
-    path = substr($0, 7)
-    if (path == "/dev/null") path = ""
+  # Hunk state, not line shape, decides what is a header. An added line whose
+  # own text starts with `++ ` or `-- ` arrives as `+++ ` or `--- ` and would
+  # otherwise impersonate a file header and silence the rest of that file.
+  LC_ALL=C awk '
+  /^diff --git / { in_hunk = 0; saw_old = 0; path = ""; next }
+  !in_hunk && /^--- / { saw_old = 1; next }
+  !in_hunk && saw_old && /^\+\+\+ / {
+    saw_old = 0
+    p = substr($0, 5)
+    if (p == "/dev/null") { path = ""; next }
+    sub(/^b\//, "", p)
+    path = p
     next
   }
   /^@@ / {
@@ -261,14 +325,27 @@ added_lines() {
     sub(/^@@ [^+]*\+/, "", m)
     sub(/[ ,].*$/, "", m)
     lineno = m + 0
+    in_hunk = 1
     next
   }
-  /^\+/ {
+  in_hunk && /^\+/ {
     if (path == "") next
     printf "%s\t%d\t%s\n", path, lineno, substr($0, 2)
     lineno++
   }
   '
+}
+
+label_lines() {
+  # An empty source means standard input.
+  local label=$1 src=$2 dest=$3
+  if [ -n "$src" ]; then
+    LC_ALL=C awk -v label="$label" '{ printf "%s\t%d\t%s\n", label, NR, $0 }' "$src" >"$dest" \
+      || die_cannot_evaluate "could not read the lines of $src"
+  else
+    LC_ALL=C awk -v label="$label" '{ printf "%s\t%d\t%s\n", label, NR, $0 }' >"$dest" \
+      || die_cannot_evaluate "could not read the text on standard input"
+  fi
 }
 
 report_and_exit() {
@@ -303,8 +380,8 @@ EOF
 # ---------------------------------------------------------------------------
 apply_exceptions() {
   local msg_file=$1 kept token rule msg line ex_token ex_reason released
-  kept="$(mktemp "${TMPDIR:-/tmp}/fm-redaction-kept.XXXXXX")" \
-    || die_cannot_evaluate "could not create a temporary file"
+  kept="$FINDINGS_FILE.kept"
+  : >"$kept" || die_cannot_evaluate "could not create a temporary file"
   while IFS=$'\t' read -r token rule msg; do
     released=0
     while IFS= read -r line; do
@@ -339,24 +416,24 @@ apply_exceptions() {
 new_findings_file() {
   FINDINGS_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-redaction-findings.XXXXXX")" \
     || die_cannot_evaluate "could not create a temporary file"
-  trap 'rm -f "$FINDINGS_FILE"' EXIT
+  # Every working file this run creates is a sibling of the findings file, so
+  # one trap removes all of them. They hold copies of exactly the content this
+  # guard exists to contain, including on the exit-2 paths.
+  trap 'rm -f "$FINDINGS_FILE" "$FINDINGS_FILE".*' EXIT
 }
 
 scan_into_findings() {
-  # stdin: <label> <lineno> <line>
-  # The scanner's own failure is a cannot-evaluate condition, not a clean pass.
-  local label lineno lit out err
-  out="$(mktemp "${TMPDIR:-/tmp}/fm-redaction-scan.XXXXXX")" \
-    || die_cannot_evaluate "could not create a temporary file"
-  err="$out.err"
-  if ! scan_lines >"$out" 2>"$err"; then
-    printf '%s\n' "$(cat "$err" 2>/dev/null)" >&2
-    rm -f "$out" "$err"
+  # <label> <lineno> <line> records in a file, not on a pipe: the scanner's own
+  # failure is a cannot-evaluate condition, and exit 2 has to reach the process.
+  local input=$1 label lineno lit out err
+  out="$FINDINGS_FILE.scan"
+  err="$FINDINGS_FILE.scanerr"
+  if ! scan_lines <"$input" >"$out" 2>"$err"; then
+    cat "$err" >&2 2>/dev/null
     die_cannot_evaluate "the line scanner failed"
   fi
   if [ -s "$err" ]; then
-    printf '%s\n' "$(cat "$err")" >&2
-    rm -f "$out" "$err"
+    cat "$err" >&2
     die_cannot_evaluate "the line scanner reported errors"
   fi
   while IFS=$'\t' read -r label lineno lit; do
@@ -367,56 +444,60 @@ scan_into_findings() {
 }
 
 mode_check_commit_msg() {
-  local msg_file=$1 root staged
+  local msg_file=$1
   [ -n "$msg_file" ] || die_cannot_evaluate "check-commit-msg needs a message-file path"
   require_deps git awk sed cksum wc mktemp
-  root="$(repo_root)"
+  set_repo_root
   [ -r "$msg_file" ] || die_cannot_evaluate "commit message file is not readable: $msg_file"
   new_findings_file
 
-  staged="$(git -C "$root" diff --cached --name-only --diff-filter=ACMR 2>/dev/null)" \
+  git -C "$REPO_ROOT" diff --cached --name-only --diff-filter=ACMR 2>/dev/null \
+    >"$FINDINGS_FILE.paths" \
     || die_cannot_evaluate "could not read the staged file list (git diff --cached failed)"
-  printf '%s\n' "$staged" | check_private_paths
+  check_private_paths "$FINDINGS_FILE.paths"
 
-  git -C "$root" diff --cached --unified=0 --no-color --no-ext-diff --diff-filter=ACMR 2>/dev/null \
+  git -C "$REPO_ROOT" "${GIT_DIFF_CONFIG[@]}" diff --cached "${GIT_DIFF_OPTS[@]}" 2>/dev/null \
     >"$FINDINGS_FILE.diff" \
     || die_cannot_evaluate "could not read the staged diff (git diff --cached failed)"
-  added_lines <"$FINDINGS_FILE.diff" | scan_into_findings
-  rm -f "$FINDINGS_FILE.diff"
+  added_lines <"$FINDINGS_FILE.diff" >"$FINDINGS_FILE.added" \
+    || die_cannot_evaluate "could not parse the staged diff (the diff reader failed)"
+  scan_into_findings "$FINDINGS_FILE.added"
 
-  awk -v label=COMMIT_MSG '{ printf "%s\t%d\t%s\n", label, NR, $0 }' "$msg_file" \
-    | scan_into_findings
+  label_lines COMMIT_MSG "$msg_file" "$FINDINGS_FILE.msglines"
+  scan_into_findings "$FINDINGS_FILE.msglines"
 
   apply_exceptions "$msg_file"
   report_and_exit
 }
 
 mode_check_rev() {
-  local rev=$1 root msg_file
+  local rev=$1 msg_file
   [ -n "$rev" ] || die_cannot_evaluate "check-rev needs a revision"
   require_deps git awk sed cksum wc mktemp
-  root="$(repo_root)"
-  git -C "$root" rev-parse --verify --quiet "$rev^{commit}" >/dev/null \
+  set_repo_root
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "$rev^{commit}" >/dev/null \
     || die_cannot_evaluate "not a commit: $rev"
   new_findings_file
 
-  git -C "$root" show --pretty=format: --name-only --diff-filter=ACMR "$rev" 2>/dev/null \
-    | check_private_paths \
+  git -C "$REPO_ROOT" show --pretty=format: --name-only --diff-filter=ACMR "$rev" 2>/dev/null \
+    >"$FINDINGS_FILE.paths" \
     || die_cannot_evaluate "could not read the file list for $rev"
+  check_private_paths "$FINDINGS_FILE.paths"
 
-  git -C "$root" show --pretty=format: --unified=0 --no-color --no-ext-diff \
-    --diff-filter=ACMR "$rev" 2>/dev/null >"$FINDINGS_FILE.diff" \
+  git -C "$REPO_ROOT" "${GIT_DIFF_CONFIG[@]}" show --pretty=format: "${GIT_DIFF_OPTS[@]}" "$rev" 2>/dev/null \
+    >"$FINDINGS_FILE.diff" \
     || die_cannot_evaluate "could not read the diff for $rev"
-  added_lines <"$FINDINGS_FILE.diff" | scan_into_findings
-  rm -f "$FINDINGS_FILE.diff"
+  added_lines <"$FINDINGS_FILE.diff" >"$FINDINGS_FILE.added" \
+    || die_cannot_evaluate "could not parse the diff for $rev (the diff reader failed)"
+  scan_into_findings "$FINDINGS_FILE.added"
 
   msg_file="$FINDINGS_FILE.msg"
-  git -C "$root" log -1 --format=%B "$rev" >"$msg_file" 2>/dev/null \
+  git -C "$REPO_ROOT" log -1 --format=%B "$rev" >"$msg_file" 2>/dev/null \
     || die_cannot_evaluate "could not read the commit message for $rev"
-  awk -v label=COMMIT_MSG '{ printf "%s\t%d\t%s\n", label, NR, $0 }' "$msg_file" \
-    | scan_into_findings
+  label_lines COMMIT_MSG "$msg_file" "$FINDINGS_FILE.msglines"
+  scan_into_findings "$FINDINGS_FILE.msglines"
+
   apply_exceptions "$msg_file"
-  rm -f "$msg_file"
   report_and_exit
 }
 
@@ -424,11 +505,11 @@ mode_check_range() {
   # Apply check-rev to every non-merge commit in a range. This is the CI entry
   # point: local hooks are per clone and `git commit --no-verify` bypasses them,
   # so the range check is what actually stops a leak reaching the default branch.
-  local range=$1 root revs rev out rc worst=0 count
+  local range=$1 revs rev out rc worst=0 count
   [ -n "$range" ] || die_cannot_evaluate "check-range needs a revision range"
   require_deps git awk sed cksum wc mktemp
-  root="$(repo_root)"
-  revs="$(git -C "$root" rev-list --no-merges "$range" 2>/dev/null)" \
+  set_repo_root
+  revs="$(git -C "$REPO_ROOT" rev-list --no-merges "$range" 2>/dev/null)" \
     || die_cannot_evaluate "could not resolve the revision range: $range"
   if [ -z "$revs" ]; then
     printf '%s: no commits to check in %s\n' "$HOOK_MARKER" "$range"
@@ -440,7 +521,7 @@ mode_check_range() {
     out="$( ( mode_check_rev "$rev" ) 2>&1 )" && continue
     rc=$?
     printf '%s: %s\n' "$HOOK_MARKER" \
-      "$(git -C "$root" log -1 --format='%h %s' "$rev" 2>/dev/null)" >&2
+      "$(git -C "$REPO_ROOT" log -1 --format='%h %s' "$rev" 2>/dev/null)" >&2
     printf '%s\n' "$out" >&2
     [ "$rc" -gt "$worst" ] && worst=$rc
   done <<RANGE
@@ -454,7 +535,8 @@ mode_check_text() {
   local label=$1
   require_deps awk cksum wc mktemp
   new_findings_file
-  awk -v label="$label" '{ printf "%s\t%d\t%s\n", label, NR, $0 }' | scan_into_findings
+  label_lines "$label" '' "$FINDINGS_FILE.stdin"
+  scan_into_findings "$FINDINGS_FILE.stdin"
   report_and_exit
 }
 
@@ -467,12 +549,13 @@ EOF
 }
 
 mode_install() {
-  local root hook
+  local hook
   require_deps git
-  root="$(repo_root)"
-  hook="$root/.git/hooks/commit-msg"
-  [ -d "$root/.git/hooks" ] || mkdir -p "$root/.git/hooks" \
-    || die_cannot_evaluate "could not create $root/.git/hooks"
+  set_repo_root
+  set_hooks_dir
+  hook="$HOOKS_DIR/commit-msg"
+  [ -d "$HOOKS_DIR" ] || mkdir -p "$HOOKS_DIR" \
+    || die_cannot_evaluate "could not create $HOOKS_DIR"
   if [ -e "$hook" ] && ! grep -q "$HOOK_MARKER" "$hook" 2>/dev/null; then
     die_cannot_evaluate "$hook already exists and was not installed by $HOOK_MARKER; merge it by hand"
   fi
@@ -482,10 +565,11 @@ mode_install() {
 }
 
 mode_uninstall() {
-  local root hook
+  local hook
   require_deps git
-  root="$(repo_root)"
-  hook="$root/.git/hooks/commit-msg"
+  set_repo_root
+  set_hooks_dir
+  hook="$HOOKS_DIR/commit-msg"
   if [ ! -e "$hook" ]; then
     printf '%s: no commit-msg hook to remove\n' "$HOOK_MARKER"
     return 0
@@ -494,6 +578,31 @@ mode_uninstall() {
     || die_cannot_evaluate "$hook was not installed by $HOOK_MARKER; leaving it alone"
   rm -f "$hook" || die_cannot_evaluate "could not remove $hook"
   printf '%s: removed commit-msg hook at %s\n' "$HOOK_MARKER" "$hook"
+}
+
+# A malformed invocation is a could-not-evaluate condition like any other, so it
+# exits 2 with a named reason rather than 1, which means "refused with findings".
+need_value() {
+  # flag, count of remaining arguments, value
+  [ "$2" -ge 2 ] || die_cannot_evaluate "$1 needs a value"
+  [ -n "$3" ] || die_cannot_evaluate "$1 needs a value"
+}
+
+no_extra_args() {
+  [ "$#" -eq 0 ] || die_cannot_evaluate "unrecognised argument '$1' (see --help)"
+}
+
+enter_repo_flag() {
+  case "${1:-}" in
+    '') return 0 ;;
+    --repo)
+      need_value --repo "$#" "${2:-}"
+      cd "$2" || die_cannot_evaluate "cannot enter $2"
+      shift 2
+      no_extra_args "$@"
+      ;;
+    *) die_cannot_evaluate "unrecognised argument '$1' (see --help)" ;;
+  esac
 }
 
 main() {
@@ -505,19 +614,37 @@ main() {
     -h|--help|help) usage; exit 0 ;;
     --list-anchors) printf '%s' "$ANCHORS" | tr ' ' '\n'; exit 0 ;;
     install)
-      case "${1:-}" in --repo) cd "${2:?--repo needs a directory}" || die_cannot_evaluate "cannot enter ${2}" ;; esac
+      enter_repo_flag "$@"
       mode_install
       ;;
     uninstall)
-      case "${1:-}" in --repo) cd "${2:?--repo needs a directory}" || die_cannot_evaluate "cannot enter ${2}" ;; esac
+      enter_repo_flag "$@"
       mode_uninstall
       ;;
-    check-commit-msg) mode_check_commit_msg "${1:-}" ;;
-    check-rev) mode_check_rev "${1:-}" ;;
-    check-range) mode_check_range "${1:-}" ;;
+    check-commit-msg)
+      [ "$#" -le 1 ] || die_cannot_evaluate "unrecognised argument '$2' (see --help)"
+      mode_check_commit_msg "${1:-}"
+      ;;
+    check-rev)
+      [ "$#" -le 1 ] || die_cannot_evaluate "unrecognised argument '$2' (see --help)"
+      mode_check_rev "${1:-}"
+      ;;
+    check-range)
+      [ "$#" -le 1 ] || die_cannot_evaluate "unrecognised argument '$2' (see --help)"
+      mode_check_range "${1:-}"
+      ;;
     check-text)
       label=STDIN
-      case "${1:-}" in --label) label=${2:?--label needs a name} ;; esac
+      case "${1:-}" in
+        '') : ;;
+        --label)
+          need_value --label "$#" "${2:-}"
+          label=$2
+          shift 2
+          no_extra_args "$@"
+          ;;
+        *) die_cannot_evaluate "unrecognised argument '$1' for check-text (see --help)" ;;
+      esac
       mode_check_text "$label"
       ;;
     *) die_cannot_evaluate "unrecognised mode '$mode' (see --help)" ;;

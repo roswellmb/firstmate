@@ -134,6 +134,90 @@ test_forced_private_path_is_refused() {
   pass "a staged private path is refused on its own, without reading its content"
 }
 
+test_added_content_cannot_impersonate_a_diff_header() {
+  local repo anchor title rc out
+  repo="$(new_repo header-injection)"
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  # An added line whose own text starts with `++ ` reaches the diff as `+++ `.
+  # If that is read as a file header, every later added line in the file is
+  # dropped and the leak below sails through.
+  {
+    printf -- '++ ok\n'
+    printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title"
+  } >"$repo/docs/notes.md"
+  git -C "$repo" add docs/notes.md
+  rc="$(run_guard_status "$repo" 'docs: record reprocessing')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "a leak after a line starting with '++ ' must still refuse (got exit $rc: $out)"
+  case "$out" in
+    *docs/notes.md*) : ;;
+    *) fail "refusal must still name the offending file (got: $out)" ;;
+  esac
+  pass "added content that looks like a diff header does not silence the rest of the file"
+}
+
+test_diff_prefix_configuration_does_not_hide_a_leak() {
+  local repo anchor title rc out
+  repo="$(new_repo noprefix)"
+  git -C "$repo" config diff.noprefix true
+  git -C "$repo" config diff.mnemonicPrefix true
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  # A two-character path is the case that used to vanish entirely, because the
+  # parser stripped a fixed six characters from the header line.
+  printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title" >"$repo/ab"
+  git -C "$repo" add ab
+  rc="$(run_guard_status "$repo" 'chore: add ab')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "diff.noprefix must not hide a leak (got exit $rc: $out)"
+  case "$out" in
+    *ab:1*) : ;;
+    *) fail "the finding must name the real path, not a truncated one (got: $out)" ;;
+  esac
+  pass "the guard pins its own diff prefixes, so diff config cannot hide or mislabel a leak"
+}
+
+test_a_long_line_is_still_scanned() {
+  local anchor title pad rc out
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  # A pasted chunk of document content is exactly what produces a long line, so
+  # the length at which the scanner gives up has to be far past anything real.
+  pad="$(awk 'BEGIN { s = ""; while (length(s) < 20000) s = s "padding text "; print s }')"
+  out="$(printf -- '%s reprocessed the %s "%s"\n' "$pad" "$anchor" "$title" \
+    | bash "$GUARD" check-text --label LONG 2>&1)" && rc=0 || rc=$?
+  [ "${rc:-0}" = "1" ] \
+    || fail "a leak carried on a 20,000 character line must still refuse (got exit ${rc:-0}: $out)"
+  pass "a leak on a line far longer than any real source line is still caught"
+}
+
+test_invalid_utf8_content_is_still_evaluated() {
+  local repo anchor title rc out
+  repo="$(new_repo invalid-utf8)"
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  # Committed content is arbitrary bytes. A byte sequence that is not valid
+  # UTF-8 must not make the scanner fail, because failing is now correctly a
+  # refusal and would stop every commit that touches such a file.
+  {
+    printf 'a stray byte: \345 and more text\n'
+    printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title"
+  } >"$repo/docs/notes.md"
+  git -C "$repo" add docs/notes.md
+  rc="$(run_guard_status "$repo" 'docs: record reprocessing')"
+  out="$(cat "$repo/.out")"
+  [ "$rc" = "1" ] \
+    || fail "an invalid byte sequence must not stop the scan (got exit $rc: $out)"
+  case "$out" in
+    *conversion*|*multibyte*) fail "the scanner must not report an encoding error (got: $out)" ;;
+    *) : ;;
+  esac
+  pass "content that is not valid UTF-8 is scanned as bytes rather than refused as unevaluable"
+}
+
 # --- ordinary work must not trip the guard ----------------------------------
 
 test_ordinary_repo_prose_passes() {
@@ -254,6 +338,80 @@ test_outside_repository_refuses() {
   pass "running outside a git repository refuses with exit 2"
 }
 
+# A deliberately failing awk earlier on PATH, so the scanner itself breaks. This
+# is not the missing-dependency case: awk is present and found, it just fails.
+# The exit 2 has to reach the process even though the scanner used to be the
+# right-hand side of a pipeline, where its exit only killed a subshell.
+broken_awk_dir() {
+  local dir="$TMPROOT/broken-awk"
+  mkdir -p "$dir"
+  printf '#!/bin/sh\nprintf "awk: deliberately broken for the test\\n" >&2\nexit 3\n' >"$dir/awk"
+  chmod +x "$dir/awk"
+  printf '%s\n' "$dir"
+}
+
+test_scanner_failure_refuses() {
+  local repo out rc dir anchor title msg
+  repo="$(new_repo scanner-fail)"
+  dir="$(broken_awk_dir)"
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  printf 'unrelated tracked edit\n' >"$repo/docs/notes.md"
+  git -C "$repo" add docs/notes.md
+  msg="$(printf 'fix: reprocess the %s "%s"' "$anchor" "$title")"
+  printf '%s\n' "$msg" >"$repo/.msg"
+  out="$( cd "$repo" && PATH="$dir:$PATH" bash "$GUARD" check-commit-msg .msg 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" = "2" ] \
+    || fail "a failing scanner must refuse with exit 2, not pass (got exit ${rc:-0}: $out)"
+  case "$out" in
+    *cannot\ evaluate*) : ;;
+    *) fail "a failing scanner must say it cannot evaluate (got: $out)" ;;
+  esac
+
+  out="$( printf 'anything\n' | PATH="$dir:$PATH" bash "$GUARD" check-text 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" = "2" ] \
+    || fail "check-text must refuse with exit 2 when the scanner fails (got exit ${rc:-0}: $out)"
+  pass "a scanner that fails refuses with exit 2 instead of passing silently"
+}
+
+test_malformed_invocation_refuses() {
+  local out rc
+  out="$(bash "$GUARD" check-text --label 2>&1)" && rc=0 || rc=$?
+  [ "${rc:-0}" = "2" ] \
+    || fail "--label with no value must refuse with exit 2 (got exit ${rc:-0}: $out)"
+  out="$(bash "$GUARD" install --repo 2>&1)" && rc=0 || rc=$?
+  [ "${rc:-0}" = "2" ] \
+    || fail "--repo with no value must refuse with exit 2 (got exit ${rc:-0}: $out)"
+  out="$(printf 'anything\n' | bash "$GUARD" check-text --lable CONTROL 2>&1)" && rc=0 || rc=$?
+  [ "${rc:-0}" = "2" ] \
+    || fail "an unrecognised check-text argument must refuse with exit 2 (got exit ${rc:-0}: $out)"
+  case "$out" in
+    *cannot\ evaluate*) : ;;
+    *) fail "a malformed invocation must say it cannot evaluate (got: $out)" ;;
+  esac
+  pass "a malformed invocation refuses with exit 2, not the exit 1 that means findings"
+}
+
+test_no_temporary_files_are_left_behind() {
+  local repo dir before after rc
+  repo="$(new_repo temp-files)"
+  dir="$TMPROOT/tmpdir"
+  mkdir -p "$dir"
+  printf 'unrelated tracked edit\n' >"$repo/docs/notes.md"
+  git -C "$repo" add docs/notes.md
+  printf 'docs: an ordinary edit\n' >"$repo/.msg"
+  before="$(find "$dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+  ( cd "$repo" && TMPDIR="$dir" bash "$GUARD" check-commit-msg .msg ) >/dev/null 2>&1
+  # And on a could-not-evaluate path taken after the diff copy exists.
+  ( cd "$repo" && TMPDIR="$dir" PATH="$(broken_awk_dir):$PATH" bash "$GUARD" check-commit-msg .msg ) >/dev/null 2>&1 \
+    && rc=0 || rc=$?
+  [ "${rc:-0}" = "2" ] || fail "expected the broken-scanner run to refuse with exit 2 (got ${rc:-0})"
+  after="$(find "$dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+  [ "$before" = "$after" ] \
+    || fail "the guard must not leave copies of the diff or message behind (was $before, now $after: $(find "$dir" -mindepth 1 -maxdepth 1))"
+  pass "no copy of the diff or the message survives, on the clean or the refused path"
+}
+
 # --- the escape hatch -------------------------------------------------------
 
 test_exception_token_releases_only_its_own_finding() {
@@ -370,10 +528,61 @@ test_install_is_idempotent_and_hooks_run() {
   pass "install wires the hook so a real git commit is stopped"
 }
 
+test_install_works_in_a_linked_worktree() {
+  local repo wt rc out anchor title
+  repo="$(new_repo worktree)"
+  wt="$TMPROOT/worktree-linked"
+  git -C "$repo" worktree add -q "$wt" -b guard-worktree \
+    || fail "could not create a linked worktree for the test"
+  # In a linked worktree .git is a file, so $root/.git/hooks is not a directory.
+  out="$( cd "$wt" && bash "$GUARD" install 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" = "0" ] \
+    || fail "install must succeed in a linked worktree (got exit ${rc:-0}: $out)"
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  mkdir -p "$wt/docs"
+  printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title" >"$wt/docs/notes.md"
+  git -C "$wt" add docs/notes.md
+  out="$( cd "$wt" && git commit -m 'docs: record reprocessing' 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" != "0" ] \
+    || fail "the hook installed from a linked worktree must stop a commit there (got: $out)"
+  pass "install works from a linked worktree, where .git is a file"
+}
+
+test_install_honours_core_hookspath() {
+  local repo rc out anchor title
+  repo="$(new_repo hookspath)"
+  mkdir -p "$repo/myhooks"
+  git -C "$repo" config core.hooksPath myhooks
+  out="$( cd "$repo" && bash "$GUARD" install 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" = "0" ] \
+    || fail "install must succeed with core.hooksPath set (got exit ${rc:-0}: $out)"
+  [ -x "$repo/myhooks/commit-msg" ] \
+    || fail "install must write into the hooks directory git actually runs (got: $out)"
+  # Reporting success while writing where git never looks is a silent claim of
+  # protection, so prove the installed hook really runs.
+  anchor='document'
+  title='Northwind Municipal Waterworks - Annual Meter Reading 2019'
+  printf -- '- reprocessed the %s "%s"\n' "$anchor" "$title" >"$repo/docs/notes.md"
+  git -C "$repo" add docs/notes.md
+  out="$( cd "$repo" && git commit -m 'docs: record reprocessing' 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" != "0" ] \
+    || fail "the hook installed under core.hooksPath must stop a commit (got: $out)"
+  out="$( cd "$repo" && bash "$GUARD" uninstall 2>&1 )" && rc=0 || rc=$?
+  [ "${rc:-0}" = "0" ] || fail "uninstall must succeed with core.hooksPath set (got: $out)"
+  [ ! -e "$repo/myhooks/commit-msg" ] \
+    || fail "uninstall must remove the hook it installed under core.hooksPath"
+  pass "install and uninstall follow core.hooksPath instead of guessing .git/hooks"
+}
+
 test_document_context_title_is_refused
 test_id_reference_is_accepted
 test_commit_message_is_covered
 test_forced_private_path_is_refused
+test_added_content_cannot_impersonate_a_diff_header
+test_diff_prefix_configuration_does_not_hide_a_leak
+test_a_long_line_is_still_scanned
+test_invalid_utf8_content_is_still_evaluated
 test_ordinary_repo_prose_passes
 test_title_outside_document_context_passes
 test_doc_cross_reference_passes
@@ -382,8 +591,13 @@ test_unknown_mode_refuses
 test_missing_message_file_refuses
 test_missing_dependency_refuses
 test_outside_repository_refuses
+test_scanner_failure_refuses
+test_malformed_invocation_refuses
+test_no_temporary_files_are_left_behind
 test_exception_token_releases_only_its_own_finding
 test_exception_token_is_bound_to_the_literal
 test_check_range_covers_every_commit_in_the_range
 test_check_range_refuses_an_unresolvable_range
 test_install_is_idempotent_and_hooks_run
+test_install_works_in_a_linked_worktree
+test_install_honours_core_hookspath

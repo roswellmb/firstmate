@@ -70,6 +70,7 @@ These are the known ones, and the list is more useful than an implied guarantee:
 - **A title that does not look like a title passes.** An all-lowercase title, a one or two word title, a title under 12 characters, or one containing characters outside the whitelist, will not match.
 - **Document *content*, as opposed to a document *title*, is only covered incidentally.** A quoted sentence from inside a document is refused only if it happens to be title-shaped, which most prose is not.
 - **A title split across lines is not detected.** The scanner works one line at a time.
+- **A line longer than 100,000 characters is not scanned.** Scanning costs quadratic time in the length of a line, so this cap is measured rather than guessed: the worst case is 0.4 seconds at 100,000 characters, 3 seconds at 300,000, and 34 seconds at 1,000,000, with the figures recorded in `scan_lines`. The cap is 833 times the longest literal that can be title-shaped at all, so a pasted chunk of document content is scanned and a whole minified bundle on one line is not.
 - **Only the added lines of the staged diff are read.** Content already in a file is not rescanned, so the five accepted files under `data/` and anything else already present are untouched by design.
 - **It knows nothing about other repositories.** The private roots are firstmate's own layout.
 
@@ -87,18 +88,20 @@ A missing dependency, an unreadable commit-message file, a `git` invocation that
 There is no path on which the guard exits `0` because something went wrong.
 A check that quietly steps aside is worse than no check, because it is believed.
 
-`tests/fm-redaction-guard.test.sh` proves this: it puts the guard in four separate unevaluable states and asserts it refuses each one.
+`tests/fm-redaction-guard.test.sh` proves this: it puts the guard in seven separate unevaluable states and asserts it refuses each one.
+Those states are an unrecognised mode, an unreadable message file, a missing dependency, a directory that is not a repository, a scanner that fails, a malformed invocation, and an unresolvable range.
+The scanner case is the one that matters most, because a scanner failure is the only unevaluable state the guard reaches after it has already started reading content.
 
 ## Measured false-positive rate
 
-Measured against this repository's real content, not invented examples, on 2026-08-20 at commit `bb15d15`.
+Measured against this repository's real content, not invented examples, on 2026-08-20 over this branch's history and working tree.
 
 | Corpus | Size | Refused by rule T | Refused by rule P |
 | --- | --- | --- | --- |
-| Every non-merge commit in history, diff and message together | 402 commits | 0 | 1 |
-| Every added content line across all of history | 208,506 lines | 0 | not applicable |
-| Every line of every tracked text file at `HEAD` | 165,877 lines in 380 files | 0 | not applicable |
-| Every commit message on every ref, merges included | 445 commits, 9,493 lines | 0 | not applicable |
+| Every non-merge commit on every ref, diff and message together | 404 commits | 0 | 1 |
+| Every added content line across all of history | 210,628 lines | 0 | not applicable |
+| Every line of every tracked text file in the working tree | 168,491 lines in 392 files | 0 | not applicable |
+| Every commit message on every ref, merges included | 406 commits, 9,319 lines | 0 | not applicable |
 
 Rule T's false-positive rate on real repository content is **0**, across all four corpora.
 
@@ -109,7 +112,8 @@ No commit since has tripped either rule.
 One genuine false-positive class was found during measurement and fixed: an ordinary cross-reference of the form `docs/<file>.md "Some Section"` read as a document context, because the anchor matched the `docs` path component.
 Anchors no longer match inside a path or a filename, and `tests/fm-redaction-guard.test.sh` pins that case.
 
-A zero measured on real content is only meaningful if the scanner can fire at all, so the same test suite runs a positive control: the identical scanner, over the same real corpus with one synthesised leak line appended, refuses.
+A zero measured on real content is only meaningful if the scanner can fire at all, so the same test suite runs a permanent positive control: the identical scanner, given one synthesised leak line, refuses it.
+The measurement above was re-run after the diff parser was corrected, so the counts describe what the guard reads today rather than what an earlier parser happened to reach.
 
 ## The escape hatch
 
