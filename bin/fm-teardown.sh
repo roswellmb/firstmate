@@ -37,9 +37,15 @@
 # refusal names bin/fm-status-decision-close.sh, the supported way to close such
 # a decision when no live worker is left to deliver an answer to. --force still
 # completes, and records what it discarded in data/<task-id>/discarded-decisions.md.
-# That record is written at the very end of each destroying path's refusals and
+# So does an UNFORCED teardown that reaches the removal with a decision open: the
+# early gate cannot see one the crew appends while teardown is still doing its git
+# and PR work, and the crew stays alive until the worktree is returned. That block
+# claims no authority nobody gave - it says only that the decisions were open when
+# the log was removed and that the gate had already passed - but the property is
+# absolute, so silence is not an option on either path.
+# The record is written at the very end of each destroying path's refusals and
 # immediately before the status log is removed - record, verify, destroy, with
-# nothing between them - so it can only ever describe a discard that is actually
+# nothing between them - so it can only ever describe a removal that is actually
 # happening, and a record that cannot be written refuses with the log still in
 # place rather than losing the question.
 # The gate covers THIS home's ledger for THIS task. A forced secondmate
@@ -492,16 +498,21 @@ EOF
   return 0
 }
 
-# Write what --force is about to discard, next to this task's brief and report
-# where it outlives the state dir. Called at the END of a destroying path's
+# Write what this teardown is about to remove, next to this task's brief and
+# report where it outlives the state dir. Called at the END of a destroying path's
 # refusals and immediately before that path removes state/<id>.status, so the
-# discard it describes is certain by the time it is written, and a write that
+# removal it describes is certain by the time it is written, and a write that
 # cannot be completed refuses with the log still in place. The open set is folded
 # through bin/fm-classify-lib.sh here rather than carried down from the gate, so
 # the record always names what is open at the moment of destruction.
+#
+# Two blocks, because the two cases are not the same thing and a later reader has
+# to be able to tell them apart. --force is a discard somebody authorized. An
+# unforced teardown reaching here means the gate passed with nothing open and the
+# decision was appended afterwards, during the window where the crew is still
+# alive; nobody authorized anything, and the block says only that.
 teardown_record_discarded_decisions() {
   local status="$STATE/$ID.status" open record stamp block key verb note written
-  [ "$FORCE" = "--force" ] || return 0
   open=$(status_open_decisions "$status")
   [ -n "$open" ] || return 0
 
@@ -521,10 +532,18 @@ teardown_record_discarded_decisions() {
   # present before the caller is allowed to delete the log it describes.
   block=
   [ -s "$record" ] || block="# Discarded decisions - $ID"$'\n'
-  block="$block"$'\n'"## $stamp - forced teardown"$'\n'$'\n'
-  block="${block}These decisions were open in task $ID's status log when a --force teardown"$'\n'
-  block="${block}removed it. --force carried explicit discard authority, so the log and every"$'\n'
-  block="${block}decision listed below went with it; nothing answered them."$'\n'$'\n'
+  if [ "$FORCE" = "--force" ]; then
+    block="$block"$'\n'"## $stamp - forced teardown"$'\n'$'\n'
+    block="${block}These decisions were open in task $ID's status log when a --force teardown"$'\n'
+    block="${block}removed it. --force carried explicit discard authority, so the log and every"$'\n'
+    block="${block}decision listed below went with it; nothing answered them."$'\n'$'\n'
+  else
+    block="$block"$'\n'"## $stamp - teardown without --force"$'\n'$'\n'
+    block="${block}These decisions were open in task $ID's status log at the moment teardown"$'\n'
+    block="${block}removed it. Nobody authorized ending them: this teardown was not forced."$'\n'
+    block="${block}Teardown's decision gate found nothing open when it ran, so these were"$'\n'
+    block="${block}appended after the last point at which teardown could still have refused."$'\n'$'\n'
+  fi
   while IFS=$'\t' read -r key verb note; do
     [ -n "$key" ] || continue
     block="$block- [key=$key] $verb: $note"$'\n'
@@ -543,7 +562,11 @@ EOF
       return 1
       ;;
   esac
-  echo "teardown $ID: the open decisions --force discarded were recorded in $record" >&2
+  if [ "$FORCE" = "--force" ]; then
+    echo "teardown $ID: the open decisions --force discarded were recorded in $record" >&2
+  else
+    echo "teardown $ID: a decision was open when its status log was removed; it was recorded in $record" >&2
+  fi
   return 0
 }
 teardown_open_decisions_gate || exit 1

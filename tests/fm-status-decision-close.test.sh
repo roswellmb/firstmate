@@ -36,6 +36,9 @@
 #   (k) the record is written only on the path that actually destroys: a --force
 #       teardown that refuses for any other reason leaves NO record behind, and a
 #       later successful --force run records every open decision exactly once.
+#   (m) a decision the crew appends AFTER the early gate has passed - the crew is
+#       alive until the worktree is returned - is still recorded when the log is
+#       removed, under wording that claims no authority nobody gave.
 #   (l) the substance of a deliberate close is stored whole - the durable log is
 #       the only copy - while still being exactly one line.
 set -u
@@ -624,6 +627,55 @@ $stored"
   pass "a deliberate close stores its whole substance on exactly one line"
 }
 
+# --- (m) a decision that arrives after the gate has already passed ----------
+
+test_unforced_teardown_records_a_decision_opened_after_the_gate() {
+  local case_dir rc out record
+  case_dir=$(make_teardown_case race-after-gate)
+  # Nothing open when the early gate runs, so this teardown is allowed to start.
+  write_status "$case_dir/home" task-x1 'working: finishing up'
+
+  # The crew is still alive until the worktree is returned, so it can still append
+  # to the log while teardown is doing its later work. Drive that for real: the
+  # worktree return - the step that ends the crew - appends the decision, once,
+  # which lands it strictly after the gate and strictly before the removal.
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+if [ ! -e "$case_dir/raced" ]; then
+  : > "$case_dir/raced"
+  printf '%s\n' 'needs-decision [key=late-shape]: pick REST or gRPC before the migration' \
+    >> "$case_dir/home/state/task-x1.status"
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  record="$case_dir/home/data/task-x1/discarded-decisions.md"
+  out=$(run_teardown "$case_dir" 2>&1) && rc=0 || rc=$?
+  [ -e "$case_dir/raced" ] \
+    || fail "the fixture never reached the point that appends the late decision; the race was not driven: $out"
+  [ "$rc" -eq 0 ] || fail "an unforced teardown did not complete: $out"
+  [ -f "$case_dir/home/state/task-x1.status" ] \
+    && fail "the completed teardown left the status log behind"
+
+  [ -f "$record" ] \
+    || fail "a decision open when the log was removed left no record at all: $out"
+  grep -Fq '[key=late-shape]' "$record" \
+    || fail "the record does not name the decision that was open: $(cat "$record")"
+  grep -Fq 'pick REST or gRPC before the migration' "$record" \
+    || fail "the record does not carry the decision's substance: $(cat "$record")"
+  # Nobody authorized this one. The forced path's phrasing must not appear.
+  if grep -Fq 'forced teardown' "$record"; then
+    fail "an unforced teardown's record claims a forced discard: $(cat "$record")"
+  fi
+  if grep -Fq 'discard authority' "$record"; then
+    fail "an unforced teardown's record claims discard authority: $(cat "$record")"
+  fi
+  grep -Fq 'teardown without --force' "$record" \
+    || fail "the record does not say which kind of teardown removed the log: $(cat "$record")"
+  pass "a decision opened after the gate is recorded when the log is removed, claiming no authority"
+}
+
 # --- (a, concluded) the checkout is untouched -------------------------------
 
 test_checkout_is_unchanged_after_the_suite() {
@@ -648,4 +700,5 @@ test_force_completes_and_records_the_discarded_decision
 test_force_refuses_when_the_record_cannot_be_written
 test_force_records_only_on_the_path_that_destroys
 test_close_substance_is_stored_whole
+test_unforced_teardown_records_a_decision_opened_after_the_gate
 test_checkout_is_unchanged_after_the_suite
