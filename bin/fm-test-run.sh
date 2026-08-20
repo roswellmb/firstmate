@@ -1564,7 +1564,18 @@ run_one_serial() {
   set +e
   # Stream live output while retaining a copy for gate-skip detection.
   # PIPESTATUS[0] is the test script; tee's exit is ignored for aggregate.
-  bash "$script" 2>&1 | tee "$out"
+  #
+  # The ambient firstmate environment is removed here, exactly as the parallel
+  # worker below removes it, because every firstmate script resolves FM_HOME
+  # BEFORE FM_ROOT_OVERRIDE: a value exported by the surrounding session would
+  # outrank both the hermetic root a harness installs and any case-local
+  # override under it, and the suite would silently read the operator's real
+  # home. This is the default path - --jobs is 1 unless asked otherwise - so the
+  # isolation has to hold for every suite here, not only for the ones that
+  # source a harness that scrubs it.
+  ( unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
+      FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND 2>/dev/null || true
+    bash "$script" 2>&1 ) | tee "$out"
   rc=${PIPESTATUS[0]}
   set -e
   : "${rc:=1}"

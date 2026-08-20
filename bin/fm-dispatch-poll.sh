@@ -87,9 +87,15 @@
 # loud - otherwise a task that is dispatched and later re-queued could never be
 # a gain again. A blocked verdict records the EMPTY set, because with no room
 # nothing is dispatchable; that is also what re-arms the wake for the moment room
-# returns. An unknown verdict carries the previous set through untouched, exactly
-# as it carries the capacity boundary: an inability observed nothing, and must
-# not manufacture a gain when it clears.
+# returns. An unknown verdict turns on whether the scan got far enough to
+# ESTABLISH the set before it failed. One that failed earlier - reading the
+# backlog, the task tool, a brief - observed nothing, so it carries the previous
+# set through untouched exactly as it carries the capacity boundary, and cannot
+# manufacture a gain when it clears. One that failed only on the MACHINE
+# measurement did establish the set, and it records what it saw: the briefed set
+# is a fact about the queue, not about the disk, and discarding an observation
+# the scan actually made would leave the record claiming ids that have since been
+# dispatched, so their re-arrival could never count as a gain again.
 #
 # The durable wake record is keyed by the CONSTANT string "dispatch", not by the
 # verdict, so the drain's kind+key collapse keeps only the newest: a superseded
@@ -222,8 +228,9 @@ case "$COPY_MEASURE_SECS" in
 esac
 # One wake payload is one line, and a home can hold dozens of dispatchable
 # items, so the identifier lists are bounded. What is cut is always stated -
-# never silently dropped - and the change signature covers the WHOLE set, so an
-# item beyond the display limit still wakes when it appears.
+# never silently dropped - and the gain is computed over the WHOLE briefed set
+# rather than over these lists, so an item beyond the display limit still wakes
+# when it appears.
 LIST_LIMIT=${FM_DISPATCH_LIST_LIMIT:-12}
 case "$LIST_LIMIT" in
   ''|*[!0-9]*|0) LIST_LIMIT=12 ;;
@@ -309,14 +316,21 @@ BRIEFED_RECORD=$PREV_BRIEFED
 VERDICT=
 SIGNATURE=
 PAYLOAD=
-# The briefed ids this scan found that the last scan did not. Set only by the
-# ready path; empty everywhere else, because no other verdict establishes a set.
+# The briefed ids this scan found that the last scan did not. Computed in
+# section 5 as soon as the briefed set is established, so it is populated before
+# any verdict is known; only the ready path acts on it, and the blocked path
+# clears it because with no room nothing gained anything.
 BRIEFED_GAINED=
 
 undecidable() { # <class> <reason>
   VERDICT=unknown
   SIGNATURE=$(printf 'unknown\t%s\n' "$1" | sig_hash)
   PAYLOAD="dispatch unknown ($1): $2"
+  # Whether an inability observed the briefed set is not a property of its
+  # class, it is whether section 5 finished before the failure - so this asks
+  # BRIEFED_IDS itself rather than naming classes, and a class added later on
+  # either side of that point cannot pick the wrong answer by omission.
+  [ -z "${BRIEFED_IDS+set}" ] || BRIEFED_RECORD=$BRIEFED_IDS
   surface
   exit 0
 }
@@ -344,10 +358,13 @@ surface() {
       # Silent, but not forgetful. The baseline has to follow what is actually
       # there, or a task that is dispatched now and re-queued later would be
       # measured against a set it is still a member of and never count as a
-      # gain again. The surfaced_epoch is carried through unchanged, because
-      # nothing was surfaced.
+      # gain again. Only dispatchable_briefed moves: the verdict, signature and
+      # surfaced_epoch are carried through unchanged, because nothing was
+      # surfaced and stamping this scan over them would reset the no-repeat
+      # baseline of a blocked or unknown verdict and let the same fault wake
+      # twice inside the bounded cadence. The ready path never reads them.
       if [ "$BRIEFED_RECORD" != "$PREV_BRIEFED" ]; then
-        record_write ready "$SIGNATURE" "$PREV_EPOCH" || exit 1
+        record_write "$PREV_VERDICT" "$PREV_SIG" "$PREV_EPOCH" || exit 1
       fi
       return 0
     fi
@@ -362,7 +379,8 @@ surface() {
   # The key is constant on purpose. fm_wake_print_deduped collapses queued
   # records on kind+key and keeps the newest per key, which is exactly right
   # here: only the latest verdict is true. The signature stays in the record
-  # above, where it belongs, as the change detector.
+  # above, where it belongs, as the change detector for blocked and unknown; the
+  # ready path is decided by the gain in the briefed set instead.
   fm_wake_append check dispatch "$PAYLOAD" || exit 1
   record_write "$VERDICT" "$SIGNATURE" "$epoch" || exit 1
   printf 'actionable: %s\n' "$PAYLOAD"
@@ -550,7 +568,13 @@ COUNT=0
 # The briefed ids alone, in the sorted order DISPATCHABLE already carries, as
 # the durable record stores them. Kept separate from the display lists above,
 # which are bounded and decorated and must never be what a comparison reads.
-BRIEFED_IDS=
+#
+# BRIEFED_IDS comes into EXISTENCE only where this loop finishes, and never
+# before, because whether it exists is what `undecidable` reads to decide if
+# this scan observed the briefed set. The partial answer a brief that cannot be
+# read leaves behind is not an observation of the set, so the accumulator it was
+# building is deliberately a different name.
+BRIEFED_SCAN=
 for id in $DISPATCHABLE; do
   COUNT=$((COUNT + 1))
   state=$(brief_state "$id")
@@ -558,14 +582,14 @@ for id in $DISPATCHABLE; do
     "a brief exists but cannot be read: $DATA/$id/brief.md"
   if [ "$state" = briefed ]; then
     BRIEFED_N=$((BRIEFED_N + 1))
-    BRIEFED_IDS="$BRIEFED_IDS $id"
+    BRIEFED_SCAN="$BRIEFED_SCAN $id"
     [ "$BRIEFED_N" -gt "$LIST_LIMIT" ] || BRIEFED="$BRIEFED, $id"
   else
     INTAKE_N=$((INTAKE_N + 1))
     [ "$INTAKE_N" -gt "$LIST_LIMIT" ] || INTAKE="$INTAKE, $id"
   fi
 done
-BRIEFED_IDS=${BRIEFED_IDS# }
+BRIEFED_IDS=${BRIEFED_SCAN# }
 BRIEFED=${BRIEFED#, }
 INTAKE=${INTAKE#, }
 [ -n "$BRIEFED" ] || BRIEFED=none

@@ -330,6 +330,57 @@ test_a_ready_set_returning_after_going_empty_wakes_again() {
   pass "a ready set that empties and returns wakes again"
 }
 
+# An inability that failed only on the MACHINE measurement DID observe the
+# briefed set, and must record what it saw. Carrying the previous set through
+# instead leaves the record naming ids that have since been dispatched, so their
+# re-arrival is measured against a set they never left and can never be a gain
+# again - a real wake swallowed permanently by one transient timeout.
+test_an_inability_after_the_briefed_set_records_what_it_saw() {
+  have_tasks_axi || { skip_case inability-records-observed "tasks-axi not found"; return 0; }
+  make_home inabilityobserved
+  local pool i
+  add_task alpha "first"
+  add_task beta "second"
+  give_brief alpha
+  scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: alpha" \
+    "the first scan did not record alpha as the briefed set"
+  [ "$(wakes)" = 1 ] || fail "the first scan did not queue a wake"
+
+  # alpha is dispatched, so the briefed set this scan sees is empty. beta keeps
+  # the ready set non-empty, so the scan runs on to the machine measurement -
+  # and that is where it fails, well after the briefed set was established.
+  tasks-axi start alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not start alpha"
+  pool="$HOME_DIR/pool"
+  for i in 1 2 3 4 5 6; do
+    mkdir -p "$pool/repo-$i/1"
+  done
+  cat > "$FAKEBIN/du" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+printf '1024	%s
+' "${!#}"
+SH
+  chmod +x "$FAKEBIN/du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
+    "the fixture did not produce the machine-measurement inability it needs"
+  rm -f "$FAKEBIN/du"
+  [ "$(wakes)" = 2 ] || fail "the reported inability did not queue its own wake"
+
+  # alpha comes back, brief intact. It is immediately dispatchable again, so it
+  # is news however the scan before it happened to fail.
+  tasks-axi reopen alpha --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not reopen alpha"
+  scan >/dev/null
+  assert_contains "$SCAN_OUT" "1 newly briefed and ready to dispatch: alpha" \
+    "a timeout after the briefed set was established discarded it, so re-queued briefed work never woke firstmate"
+  [ "$(wakes)" = 3 ] || fail "the re-queued briefed task did not queue its own wake"
+  pass "an inability raised after the briefed set was established records what it saw"
+}
+
 # An inability observed nothing. It must not erase what was known, and it must
 # not manufacture a gain out of the same briefed set when it clears.
 test_an_inability_never_manufactures_a_gain() {
@@ -576,6 +627,66 @@ test_ready_verdict_never_resurfaces_on_cadence() {
   unset RESURFACE_SECS
   [ -z "$SCAN_OUT" ] || fail "an unchanged ready set re-surfaced on the fault cadence: $SCAN_OUT"
   pass "the bounded re-surface cadence never applies to an unchanged ready set"
+}
+
+# A ready scan that says nothing must not reset the no-repeat baseline of the
+# verdict that DID speak. Only the briefed set moves on a silent write; stamping
+# the ready verdict over a fault's signature would make the very next occurrence
+# of that same fault look new and wake firstmate for it twice inside the bound.
+test_a_silent_ready_scan_keeps_the_fault_cadence() {
+  have_tasks_axi || { skip_case silent-ready-keeps-cadence "tasks-axi not found"; return 0; }
+  make_home silentcadence
+  local pool i
+  pool="$HOME_DIR/pool"
+  for i in 1 2 3 4 5 6; do
+    mkdir -p "$pool/repo-$i/1"
+  done
+  # Slow only while the marker is there, so the same fixture produces the
+  # identical inability twice with a healthy scan in between.
+  cat > "$FAKEBIN/du" <<SH
+#!/usr/bin/env bash
+[ ! -f "$HOME_DIR/slow-du" ] || sleep 1
+printf '1024\t%s\n' "\${!#}"
+SH
+  chmod +x "$FAKEBIN/du"
+
+  add_task alpha "first"
+  add_task beta "second"
+  give_brief alpha
+  give_brief beta
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "dispatch ready:" "the briefed pair did not establish a baseline"
+  [ "$(wakes)" = 1 ] || fail "the briefed pair did not queue a wake"
+
+  : > "$HOME_DIR/slow-du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" "the first inability was not reported"
+  [ "$(wakes)" = 2 ] || fail "the first inability did not queue its own wake"
+
+  # A healthy ready scan whose briefed set only SHRINKS: no gain, so it stays
+  # silent - and a silent scan has said nothing the cadence should count.
+  rm -f "$HOME_DIR/slow-du"
+  tasks-axi start beta --file "$DATA/backlog.md" >/dev/null 2>&1 \
+    || fail "fixture: could not start beta"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "a shrinking briefed set woke firstmate: $SCAN_OUT"
+  [ "$(wakes)" = 2 ] || fail "a silent ready scan queued a wake"
+
+  : > "$HOME_DIR/slow-du"
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 scan >/dev/null
+  [ -z "$SCAN_OUT" ] || fail "the identical inability surfaced again inside its bound: $SCAN_OUT"
+  [ "$(wakes)" = 2 ] || fail "the identical inability queued a second wake inside its bound"
+
+  # Still bounded, not silenced: once the cadence elapses it speaks again.
+  FM_DISPATCH_POOL_ROOT_OVERRIDE="$pool" FM_DISPATCH_BUDGET_SECS=2 \
+    FM_DISPATCH_COPY_MEASURE_SECS=0 RESURFACE_SECS=0 scan >/dev/null
+  unset RESURFACE_SECS
+  rm -f "$HOME_DIR/slow-du" "$FAKEBIN/du"
+  assert_contains "$SCAN_OUT" "copy-reserve-timed-out" \
+    "the persisting inability never re-surfaced once its bound elapsed"
+  pass "a silent ready scan leaves the blocked-or-unknown re-surface cadence intact"
 }
 
 # --- the copy measurement reads copies, not pools ---------------------------
@@ -1014,6 +1125,7 @@ test_a_second_brief_wakes_for_itself_alone
 test_a_re_queued_task_can_be_a_gain_again
 test_a_ready_set_returning_after_going_empty_wakes_again
 test_an_inability_never_manufactures_a_gain
+test_an_inability_after_the_briefed_set_records_what_it_saw
 test_room_returning_re_offers_the_briefed_work
 test_never_ranks_and_never_spawns
 test_long_ready_set_is_bounded_and_the_cut_is_disclosed
@@ -1028,6 +1140,7 @@ test_unreadable_task_record_reports_rather_than_passes
 test_invalid_capacity_configuration_reports_rather_than_passes
 test_persisting_fault_resurfaces_on_a_bounded_cadence
 test_ready_verdict_never_resurfaces_on_cadence
+test_a_silent_ready_scan_keeps_the_fault_cadence
 test_superseded_verdicts_collapse_to_the_latest
 test_a_hung_backlog_tool_is_reported_not_silently_killed
 test_an_unusable_budget_reports_rather_than_defaulting
