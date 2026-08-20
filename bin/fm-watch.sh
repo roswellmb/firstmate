@@ -56,6 +56,11 @@
 #   check: inactive-outcome bounded poll-loop reconciliation found a suspicious
 #                          inactive terminal outcome that still lacks its durable
 #                          upstream receipt
+#   check: dispatch        the fleet-level dispatch-readiness scan
+#                          (bin/fm-dispatch-poll.sh, which owns the verdicts and
+#                          the no-repeat rule) changed its verdict: work became
+#                          dispatchable, the machine ran out of room for another
+#                          isolated copy, or the answer could not be established
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -880,6 +885,26 @@ while :; do
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
+    # Fleet-level dispatch readiness, evaluated FIRST inside the sweep. It is a
+    # tracked repository script rather than a state/*.check.sh, because the
+    # per-task loop below is keyed by task id and this concern has no task id;
+    # bin/fm-dispatch-poll.sh's header owns that reasoning and the reason no
+    # bin/fm-check-register.sh binding applies. First is safe here precisely
+    # because it cannot repeat: it prints only when its verdict CHANGES, so it
+    # can never starve the per-task checks - whereas a per-task check that keeps
+    # printing on every sweep (an unauthenticated state check sitting in the
+    # directory, say) would starve it indefinitely from second place.
+    dispatch_out=
+    if dispatch_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-dispatch-poll.sh" scan 2>/dev/null); then
+      if [ -n "$dispatch_out" ]; then
+        touch "$STATE/.last-check"
+        wake "check: dispatch"
+      fi
+    else
+      triage_log "dispatch readiness scan unavailable"
+    fi
+
     rejected_checks=
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue

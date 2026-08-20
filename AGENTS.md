@@ -114,6 +114,7 @@ state/               runtime records and signals; gitignored
   x-poll.error x-poll.claim-error  generated Relay and offer-claim diagnostic dedupe markers
   .browser-refusal/<id>/  generated owner-only per-task dir holding one freshly minted per-launch dir, itself prepended to that one agent's PATH, whose refusing chrome-devtools-axi shim stands in when the installed tool cannot give the task its own browser session; absent until a spawn needs it, removed by that task's teardown or by the spawn's own abort path when no task record was published (docs/configuration.md "Agent browser isolation")
   .startup-network.*  status, report, per-step elapsed timings, inline-print claim, and lock for the deferred network stage session start runs off its blocking path; bin/fm-startup-network.sh
+  .dispatch-poll .dispatch-copy-reserve  last surfaced dispatch-readiness verdict and the cached clone measurement behind its capacity floor; written only by bin/fm-dispatch-poll.sh, safe to delete (forces one re-surface and one remeasure)
   .wake-queue        durable queued wakes retained until post-handling acknowledgement: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .watcher-down      private generation-bound recovery state coupling watcher downtime, durable wake presentation, and post-handling acknowledgement; never touch
   .<id>.open-decisions-cursor  per-task byte cursor and folded open-decision set bounding the OPEN DECISIONS scan's cost to new status-log appends; written only by fm-classify-lib.sh's status_open_decisions_incremental, removed by teardown, safe to delete (forces one full re-fold)
@@ -392,7 +393,8 @@ Handle actionable wakes as follows:
 
 1. For `signal:`, read the listed event lines first, then reconcile current state only where action depends on it.
 2. For `stale:`, inspect the recorded endpoint and load `stuck-crewmate-recovery` for a stopped, looping, confused, or unresponsive worker; a deep-inspection reason also requires current-state and validation-log inspection.
-3. For `check:`, act on the named poll result, including merges, Relay events, and process-to-event source results.
+3. For `check:`, act on the named poll result, including merges, Relay events, process-to-event source results, and `check: dispatch` dispatch-readiness verdicts.
+   A dispatch-readiness verdict reports only that a dispatch has become possible, become impossible for want of machine room, or stopped being establishable; the intake, delivery-mode, autonomy, and brief judgement in sections 7 and 11 remains entirely yours.
 4. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
