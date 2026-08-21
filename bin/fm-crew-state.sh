@@ -28,6 +28,19 @@
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
 #      the same line of history). Local work that advanced past the run head, or
 #      diverged from it, invalidates attribution.
+#      Only the branch's CURRENT run is ever a candidate - the one `axi status`
+#      answers with, else the newest row for the branch in the runs list. When
+#      that run does not bind, this script reports `unknown` and stops; it never
+#      reaches past it to an older run that happens to match, and never lets a
+#      failed bind fall through to another source. The two consequential words
+#      here are `failed` and `cancelled` (`cancelled` says branch ownership has
+#      returned to the crew, which authorises a hand-push around what may be a
+#      live pipeline), so ambiguity resolves to non-terminal by construction, at
+#      one choke point, for every way the bind can fail. Until 2026-08-21 the
+#      paragraph above described an invariant the code did not hold: the coarse
+#      fallback skipped an unmatched newest row and bound an older, genuinely
+#      cancelled run pinned to the pre-rebase head, reporting a mid-flight run
+#      as `failed - run cancelled`.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -45,7 +58,8 @@
 #      `resolved` never become current state or detail.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
-#      than trusting a stale status log.
+#      than trusting a stale status log. A run that exists but does not bind (2)
+#      also reports unknown · none, before any of the fallbacks in (4) run.
 #
 # Read-only and side-effect free. Always exits 0 on a successful read regardless
 # of state; exit 2 only on a usage error (no id).
@@ -331,10 +345,21 @@ nm_ci_checks_state() {
 # "<status> <branch> <short-sha> <date> [<pr-url>]" separated by runs of
 # spaces (verified: no quoting, so splitting on the first two whitespace runs
 # is exact) - but branch + coarse status is exactly what this predicate needs:
-# is a run for THIS branch active right now. Echoes the first (most recent)
-# matching row's status word (running/completed/cancelled/failed), or empty
-# when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
-nm_runs_status_for_branch() {  # <branch>
+# is a run for THIS branch active right now.
+#
+# Echoes the FIRST (most recent) row for this branch as "<status> <short-sha>",
+# or empty when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
+# It deliberately does NOT itself judge code identity, and deliberately does NOT
+# keep scanning past that first row. The list is newest-first, so only the first
+# row can describe the branch right now; every row below it is a superseded run.
+# Reaching past an unmatched newest row to an older one that happens to match is
+# exactly the 2026-08-21 misattribution this contract now forbids: the branch's
+# live run had been rebased away from the worktree head, the older row was a
+# genuinely cancelled run pinned to that stale head, and the scan bound it and
+# reported a mid-flight pipeline as `failed - run cancelled`. Binding is the
+# caller's single choke point (see ATTRIBUTION below), so "no bind" cannot be
+# turned back into a search for some other run that does bind.
+nm_runs_row_for_branch() {  # <branch>
   local branch=$1 out row st rest br sha
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 0
@@ -349,12 +374,7 @@ nm_runs_status_for_branch() {  # <branch>
     rest=$(trim "$rest")
     sha=${rest%% *}
     if [ "$br" = "$branch" ]; then
-      # Same code-identity rule as axi status: skip a same-branch row whose
-      # short-sha does not match this worktree (rewritten or advanced tip).
-      if ! nm_coarse_head_matches_worktree "$sha"; then
-        continue
-      fi
-      printf '%s' "$st"
+      printf '%s %s' "$st" "$sha"
       return 0
     fi
   done <<< "$out"
@@ -381,37 +401,98 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"
 }
 
-HAVE_RUN=0
-# RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
-# $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
-# a bare status word came back from the runs-list fallback above, so the
-# run-step block below skips the TOON field parsing entirely for this crew.
-RUN_SOURCE=full
+# Why a run could not be bound, for the one line this script emits. Names both
+# heads so the reader can see the divergence without a second command.
+unbound_detail() {  # <run-head-or-empty>
+  local local_head
+  local_head=$(git -C "$WT" rev-parse --short=8 HEAD 2>/dev/null)
+  if [ -n "$1" ]; then
+    printf 'run head %s vs local %s; rewritten or diverged' "$1" "$local_head"
+  else
+    printf 'run reports no head; nothing to bind to local %s' "$local_head"
+  fi
+}
+
+# ATTRIBUTION is the single outcome of the whole run-lookup below, and the one
+# place a run is ever bound to this crew. It takes exactly one of four values:
+#
+#   none       this branch has no run at all (pre-validation, scout, secondmate,
+#              no CLI, or the CLI did not answer) -> pane/log fallback, as before.
+#   full       the branch's current run is bound and $RUN_OUT carries its `axi
+#              status` TOON, so step/gate detail is available.
+#   coarse     the branch's current run is bound from the plain runs list, so
+#              only a bare status word is available.
+#   ambiguous  a run for this branch EXISTS but does not bind to the code
+#              identity in front of us.
+#
+# `ambiguous` is a verdict, not a retry condition. This is the invariant the
+# 2026-08-21 misattribution broke: when this script cannot match a run to the
+# code identity in front of it, it must report that it cannot determine the
+# state, and must never resolve that ambiguity toward a terminal verdict.
+# `failed` and `cancelled` are the two most consequential words emitted here -
+# `cancelled` specifically means branch ownership has returned to the crew, and
+# a supervisor acting on it hand-pushes around what may be a live pipeline. So
+# a failed bind terminates the lookup with `unknown` rather than widening the
+# search until some run answers. There are exactly two ways the bind can fail
+# and both land here by construction, with no divergence shape special-cased:
+# `axi status` answered for this branch and its head did not bind, or the runs
+# list's newest row for this branch did not bind.
+ATTRIBUTION=none
 COARSE_STATUS=""
+UNBOUND_DETAIL=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
-      HAVE_RUN=1
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+      # This IS the branch's active-or-most-recent run, so no other run can be
+      # more current: bind it or decline. Never fall through to the runs list
+      # here - that list can only offer an OLDER, superseded run for the branch.
+      if nm_run_head_matches_worktree; then
+        ATTRIBUTION=full
+      else
+        ATTRIBUTION=ambiguous
+        UNBOUND_DETAIL=$(unbound_detail "$(strip_quotes "$(nm_field head)")")
+      fi
     else
-      # The active-or-most-recent run is for another branch, or same branch with
-      # a rewritten/diverged head (the CLI is alive and answered; only the
-      # attribution missed) - try the coarse fallback.
+      # The answer belongs to another branch, so this crew's own run (if any) was
+      # not reported: consult the runs list for the branch's own newest row.
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
-      COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
-      if [ -n "$COARSE_STATUS" ]; then
-        HAVE_RUN=1
-        RUN_SOURCE=coarse
+      coarse_row=$(nm_runs_row_for_branch "$CREW_BRANCH")
+      if [ -n "$coarse_row" ]; then
+        COARSE_STATUS=${coarse_row%% *}
+        coarse_sha=${coarse_row#* }
+        if nm_coarse_head_matches_worktree "$coarse_sha"; then
+          ATTRIBUTION=coarse
+        else
+          ATTRIBUTION=ambiguous
+          COARSE_STATUS=""
+          UNBOUND_DETAIL=$(unbound_detail "$coarse_sha")
+        fi
       fi
     fi
   fi
 fi
+
+# The choke point. Every path that failed to bind exits here, non-terminal, with
+# the one extra command a supervisor needs to resolve it by hand.
+if [ "$ATTRIBUTION" = ambiguous ]; then
+  emit unknown none \
+    "run on $CREW_BRANCH unbound to local code ($UNBOUND_DETAIL)${SEP}read \`no-mistakes axi status\` in the worktree"
+fi
+
+HAVE_RUN=0
+[ "$ATTRIBUTION" = none ] || HAVE_RUN=1
+# RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
+# $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
+# a bare status word came back from the runs-list fallback above, so the
+# run-step block below skips the TOON field parsing entirely for this crew.
+RUN_SOURCE=$ATTRIBUTION
 
 # --- run-step authoritative path -------------------------------------------
 

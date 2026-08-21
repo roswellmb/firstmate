@@ -49,6 +49,41 @@ make_repo_on_branch() {  # <dir> <branch>
   export FM_FAKE_RUN_HEAD
 }
 
+# A real repo on <branch> whose tip is the PRE-rewrite commit, plus a genuinely
+# diverged rewritten commit that is NOT on the worktree tip's line of history -
+# the shape a no-mistakes rebase leaves behind while its run is in flight.
+# Echoes "<branch-tip> <rewritten-head>".
+make_repo_with_rewritten_head() {  # <dir> <branch>
+  local dir=$1 branch=$2 base tip rewritten
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" commit -q --allow-empty -m init
+  base=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q -b "$branch"
+  git -C "$dir" commit -q --allow-empty -m 'crew commit'
+  tip=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q -b rewritten-line "$base"
+  git -C "$dir" commit -q --allow-empty -m 'crew commit, rebased by the pipeline'
+  rewritten=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q "$branch"
+  printf '%s %s' "$tip" "$rewritten"
+}
+
+# Anti-vacuity guard for every rewritten-head case below: prove the fixture IS
+# the incident shape before asserting anything about the verdict. A case that
+# passed because the two heads happened to be related, or because the worktree
+# was not where the test thinks, would have tested nothing.
+assert_diverged_from_worktree() {  # <worktree> <tip> <rewritten>
+  local wt=$1 tip=$2 rewritten=$3
+  [ "$(git -C "$wt" rev-parse HEAD)" = "$tip" ] \
+    || fail "worktree is not at the pre-rewrite tip"
+  [ "$tip" != "$rewritten" ] || fail "rewrite did not produce a different commit"
+  ! git -C "$wt" merge-base --is-ancestor "$tip" "$rewritten" 2>/dev/null \
+    || fail "not diverged: the worktree tip is an ancestor of the rewritten head"
+  ! git -C "$wt" merge-base --is-ancestor "$rewritten" "$tip" 2>/dev/null \
+    || fail "not diverged: the rewritten head is an ancestor of the worktree tip"
+}
+
 # A fakebin with a fake `no-mistakes` (serves the env-driven run output) and a
 # fake `tmux` (serves a busy or idle pane). The fake no-mistakes mirrors the real
 # command surface the helper uses: `axi status`, `axi status --run <id>` (the
@@ -288,6 +323,19 @@ run:
   pr: ""
   findings: none
 outcome: failed
+EOF
+}
+
+run_cancelled() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: cancelled
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+outcome: cancelled
 EOF
 }
 
@@ -1241,9 +1289,154 @@ test_historical_same_branch_rewritten_head_not_current() {
   out=$(run_crew_state "$d" wishlist)
   assert_not_contains "$out" "source: run-step" "historical rewritten head must not use run-step"
   assert_not_contains "$out" "parked at" "historical parked run must not mask current state"
-  assert_contains "$out" "source: status-log" "falls back to status-log after head mismatch"
-  assert_contains "$out" "state: working" "status-log working: remains current"
+  # A run for this branch EXISTS but does not bind to the code in front of us,
+  # so the lookup stops there and says so. It no longer widens the search to the
+  # status log: that log is an append-only event history, and after a head
+  # rewrite nothing corroborates that its last verb is still current.
+  assert_contains "$out" "state: unknown" "an unbindable run reports undetermined state"
+  assert_contains "$out" "unbound to local code" "the verdict names why it could not bind"
   pass "historical same-branch rewritten head is not attributed as current"
+}
+
+# --- 2026-08-21: an unbindable run must never resolve toward a terminal word --
+#
+# Incident: `fm-crew-state.sh` reported `failed - run cancelled` for a crew whose
+# no-mistakes run was mid-flight at the ci step, checks about to come back green.
+# The pipeline had rebased the branch, so the worktree head no longer bound to
+# the live run's head; attribution then reached PAST that unmatched run to an
+# older, genuinely cancelled run pinned to the stale head, and bound that one.
+# `cancelled` is the word that says branch ownership has returned to the crew, so
+# a supervisor acting on it hand-pushes around a live pipeline - the exact action
+# that destroyed a branch earlier in this body of work.
+#
+# Each pair below drives the two inputs APART deliberately: the same stale
+# terminal run, the same worktree, differing only in whether a newer run for the
+# branch supersedes it. The control half proves the stale run really is
+# attributable on its own, so the regression half cannot pass vacuously.
+
+# Full path: `axi status` answers for THIS branch at the rebased head.
+test_unbindable_live_run_control_stale_run_alone_is_attributable() {
+  reset_fakes
+  local d heads tip out
+  d=$(new_case unbindable-control-full)
+  heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-rebased)
+  tip=${heads%% *}
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased.meta" "window=fm:fm-rebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  # Control: the cancelled run is the branch's CURRENT run and it binds exactly.
+  FM_FAKE_RUN_HEAD="$tip"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-rebased)"
+  out=$(run_crew_state "$d" rebased)
+  assert_contains "$out" "state: failed" "a bound cancelled run still reports failed"
+  assert_contains "$out" "run cancelled" "a bound cancelled run still says cancelled"
+  assert_contains "$out" "source: run-step" "a bound cancelled run is still run-step sourced"
+  pass "control: a genuinely cancelled run that binds still reports failed"
+}
+
+test_unbindable_live_run_does_not_bind_a_superseded_terminal_run() {
+  reset_fakes
+  local d heads tip rewritten short_tip short_rewritten out
+  d=$(new_case unbindable-live-run)
+  heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-rebased)
+  tip=${heads%% *}
+  rewritten=${heads##* }
+  assert_diverged_from_worktree "$d/wt" "$tip" "$rewritten"
+  short_tip=$(git -C "$d/wt" rev-parse --short=8 "$tip")
+  short_rewritten=$(git -C "$d/wt" rev-parse --short=8 "$rewritten")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased.meta" "window=fm:fm-rebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  # The branch's live run sits on the rebased head, mid-flight at ci.
+  FM_FAKE_RUN_HEAD="$rewritten"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-rebased)"
+  FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
+  # ...while the SAME stale cancelled run the control half just proved
+  # attributable is still sitting in the list, pinned to the worktree head.
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-rebased ${short_rewritten}  2026-08-21 04:41
+  cancelled  fm/feat-rebased ${short_tip}  2026-08-20 23:51
+EOF
+)"
+  out=$(run_crew_state "$d" rebased)
+  assert_not_contains "$out" "state: failed" "a live rebased run must never read as failed"
+  assert_not_contains "$out" "cancelled" "a live rebased run must never read as cancelled"
+  assert_not_contains "$out" "state: done" "an unbindable run must not resolve to done either"
+  assert_contains "$out" "state: unknown" "an unbindable live run reports undetermined state"
+  pass "a rebased live run does not bind the superseded cancelled run below it"
+}
+
+# Coarse path: `axi status` answers for ANOTHER branch, so the runs list is what
+# attribution reads. Same defect, different place the bind can fail.
+test_coarse_control_stale_row_alone_is_attributable() {
+  reset_fakes
+  local d heads tip short_tip out
+  d=$(new_case unbindable-control-coarse)
+  heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-coarse-rebased)
+  tip=${heads%% *}
+  short_tip=$(git -C "$d/wt" rev-parse --short=8 "$tip")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/coarserebased.meta" "window=fm:fm-coarserebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaaa  2026-08-21 04:45
+  cancelled  fm/feat-coarse-rebased ${short_tip}  2026-08-20 23:51
+EOF
+)"
+  out=$(run_crew_state "$d" coarserebased)
+  assert_contains "$out" "state: failed" "a bound cancelled runs-list row still reports failed"
+  assert_contains "$out" "run cancelled" "a bound cancelled runs-list row still says cancelled"
+  assert_contains "$out" "source: run-step" "a bound runs-list row is still run-step sourced"
+  pass "control: a genuinely cancelled runs-list row that binds still reports failed"
+}
+
+test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row() {
+  reset_fakes
+  local d heads tip rewritten short_tip short_rewritten out
+  d=$(new_case unbindable-coarse-reach-past)
+  heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-coarse-rebased)
+  tip=${heads%% *}
+  rewritten=${heads##* }
+  assert_diverged_from_worktree "$d/wt" "$tip" "$rewritten"
+  short_tip=$(git -C "$d/wt" rev-parse --short=8 "$tip")
+  short_rewritten=$(git -C "$d/wt" rev-parse --short=8 "$rewritten")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/coarserebased.meta" "window=fm:fm-coarserebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  # Identical to the control list, plus ONE newer row for this branch that does
+  # not bind. That single row is the whole difference between the two cases.
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaaa  2026-08-21 04:45
+  running    fm/feat-coarse-rebased ${short_rewritten}  2026-08-21 04:41
+  cancelled  fm/feat-coarse-rebased ${short_tip}  2026-08-20 23:51
+EOF
+)"
+  out=$(run_crew_state "$d" coarserebased)
+  assert_not_contains "$out" "state: failed" "an unbound newest row must not fall through to a stale terminal row"
+  assert_not_contains "$out" "cancelled" "an unbound newest row must never read as cancelled"
+  assert_contains "$out" "state: unknown" "an unbound newest runs-list row reports undetermined state"
+  pass "the runs-list scan never reaches past an unbound newest row"
+}
+
+# Counter-direction for the runs-list path: a genuinely failed run whose row DOES
+# bind must still report failed, so the fix cannot have widened `unknown` until
+# nothing is ever terminal.
+test_coarse_bound_failed_row_still_reports_failed() {
+  reset_fakes
+  local d short out
+  d=$(new_case coarse-bound-failed)
+  make_repo_on_branch "$d/wt" fm/feat-genuinely-failed
+  short=$(git -C "$d/wt" rev-parse --short=8 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/genfailed.meta" "window=fm:fm-genfailed" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaaa  2026-08-21 04:45
+  failed     fm/feat-genuinely-failed ${short}  2026-08-21 04:41
+EOF
+)"
+  out=$(run_crew_state "$d" genfailed)
+  assert_contains "$out" "state: failed" "a bound failed runs-list row still reports failed"
+  assert_contains "$out" "run failed" "a bound failed runs-list row still says failed"
+  pass "a genuinely failed run that binds still reports failed"
 }
 
 # Head-binding: an active pipeline whose run head is a descendant of the local
@@ -1285,8 +1478,10 @@ test_local_advanced_past_run_head_invalidates() {
   arm_idle_record "$d/state" adv
   out=$(run_crew_state "$d" adv)
   assert_not_contains "$out" "source: run-step" "local-advanced tip must not use historical run"
-  assert_contains "$out" "source: status-log" "falls back after local advanced past run"
-  assert_contains "$out" "state: working" "status-log working: is current"
+  # Same rule as the rewritten-head case: a run exists for this branch and does
+  # not bind, so the answer is "undetermined", not the status log's last verb.
+  assert_contains "$out" "state: unknown" "local-advanced tip reports undetermined state"
+  assert_contains "$out" "unbound to local code" "the verdict names why it could not bind"
   pass "local work advanced past run head invalidates attribution"
 }
 
@@ -1304,9 +1499,12 @@ test_missing_run_head_falls_back_to_current_state() {
   arm_idle_record "$d/state" no-head
   out=$(run_crew_state "$d" no-head)
   assert_not_contains "$out" "source: run-step" "missing run head must not permit branch-only attribution"
-  assert_contains "$out" "source: status-log" "missing run head falls back to current state sources"
-  assert_contains "$out" "state: working" "status-log remains current after missing run head"
-  pass "missing run head falls back instead of matching by branch"
+  # The strongest form of an unbindable run: a run exists for this branch and
+  # reports no code identity at all, so nothing can bind it and nothing else
+  # gets to answer in its place.
+  assert_contains "$out" "state: unknown" "missing run head reports undetermined state"
+  assert_contains "$out" "run reports no head" "the verdict names the missing code identity"
+  pass "missing run head reports undetermined instead of matching by branch"
 }
 
 test_active_run_is_authoritative
@@ -1355,6 +1553,11 @@ test_provably_working_via_runs_list_fallback
 test_not_provably_working_when_stopped
 test_usage_error
 test_historical_same_branch_rewritten_head_not_current
+test_unbindable_live_run_control_stale_run_alone_is_attributable
+test_unbindable_live_run_does_not_bind_a_superseded_terminal_run
+test_coarse_control_stale_row_alone_is_attributable
+test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row
+test_coarse_bound_failed_row_still_reports_failed
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
