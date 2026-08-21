@@ -337,6 +337,10 @@ An absent or incompatible `lavish-axi` reports `MISSING: lavish-axi (install: np
 An absent or too-old `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; firstmate cannot resolve a profile array without a compatible binary.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
+The session-start deferred network stage also reports a `HOME_CURRENCY:` line for any firstmate home that is not exactly at its origin default-branch commit - behind, ahead, diverged, or a distance it cannot measure without fetching - and a separate `cannot verify` line when the comparison could not be made at all, which is never treated as a pass.
+A home at that commit stays silent.
+It covers the code root this instance loads from plus every local secondmate home this home owns; a remote-routed secondmate is reported by the same check in its own session start on its own host, so silence here says nothing about one.
+The check is read-only: it never fetches, fast-forwards, or writes anything, so it changes no home it names, and updating one stays `/updatefirstmate`'s job.
 The locked session-start deferred network stage runs bootstrap's best-effort project clone refresh through `fm-fleet-sync.sh`.
 It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
 Normal completed runs keep local-only and no-origin skips silent.
@@ -571,6 +575,7 @@ FM_SESSION_START_QUEUED_LIMIT=20   # plain queued backlog rows in the session-st
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_BOOTSTRAP_NETWORK=all   # internal session-start phase split: all, skip (local steps only), or only (network steps only); see bin/fm-bootstrap.sh
 FM_STARTUP_NETWORK_TIMEOUT=120   # seconds bounding the whole deferred network stage; hitting it prints an actionable NETWORK_CHECKS line. This is the LOWER bound on FM_LOCK_WAIT_TIMEOUT, because the stage holds the fleet lock for its whole duration; raising it alone inverts that relationship and makes a session on the start path give up on the fleet lock and fall back to read-only
+FM_HOME_CURRENCY_TIMEOUT=15   # seconds bounding ONE read-only origin probe in bootstrap's home-currency check; empty, zero, or non-numeric uses 15. Origin's advertised tip is cached per origin URL for the run, so homes sharing an origin cost one probe between them, and hitting the bound reports "cannot verify" rather than passing
 FM_TASKS_AXI_COMPATIBLE=   # internal one-hop handoff of an already-computed tasks-axi compatibility verdict (0 or 1); consumed when bin/fm-tasks-axi-lib.sh is sourced
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically

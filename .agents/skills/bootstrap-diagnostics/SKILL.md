@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap or network-checks section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, STARTUP_MEMORY_BUDGET, CREW_DISPATCH invalid, FLEET_SYNC, NETWORK_CHECKS, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, SECONDMATE_HANDOFF, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh or bin/fm-startup-network.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap or network-checks section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, HOME_CURRENCY, TANGLE, STARTUP_MEMORY_BUDGET, CREW_DISPATCH invalid, FLEET_SYNC, NETWORK_CHECKS, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, SECONDMATE_HANDOFF, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh or bin/fm-startup-network.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -30,6 +30,17 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Rerun the printed command; it is idempotent and re-derives every finding.
   A `hit the ...s bound` line means one of those checks is slow or unreachable - most often a remote secondmate host - and the stage stopped rather than letting it wedge; a `lock was no longer held` line means the session that asked for the sweeps no longer owns them, so leave them to the session that does.
   A `could not take the fleet lock acquisition lease` line is the opposite case and takes the opposite remedy: the fleet lock may still belong to the session that asked, and only the short-lived lease that stops it moving mid-sweep could not be taken within the wait budget, so rerun the printed command once the lease holder has finished instead of handing the sweeps to another session.
+- `HOME_CURRENCY: <home> is [at least] <n> commits behind|ahead of|diverged from|not at origin/<branch> ...` - that firstmate home is not at its origin default-branch commit, so the instructions, agent-loaded skills, and scripts it is running are not the fleet's.
+  Nothing was updated: this check only reports, and updating a home is `/updatefirstmate`'s job (`AGENTS.md` section 12).
+  An `at least <n>` distance is a truthful lower bound taken from the home's last-fetched remote-tracking ref, because the exact number would need a fetch this check deliberately does not perform; the real gap is that number or larger.
+  Treat everything that home's own copy asserts as suspect for as long as it is behind, including its tool version floors, its detection logic, and any tool it reports as absent - the floor it checked against is the floor its stale copy carries, so a silent tools section proves nothing.
+  Before telling the captain that a stale home has adopted anything, confirm the thing exists in that home rather than upstream.
+  Report the consequence and offer `/updatefirstmate`; never fast-forward a home by hand around that path, and never while a validation run is live in it.
+  When a `TANGLE:` line prints alongside an ahead-of or diverged-from line for the same home, they are one condition: the stray feature branch is what the home is running, so restoring the checkout per the `TANGLE:` remediation resolves both.
+- `HOME_CURRENCY: cannot verify <home> against origin - <reason> ...` - the comparison could not be made at all, so that home's currency is unknown, NOT confirmed current.
+  Read the printed reason: an unreachable or bounded-out origin means try again when the network is back, no origin remote or a non-git home means the home itself is mis-provisioned and needs `secondmate-provisioning` or captain attention.
+  Until it resolves, do not rely on that home's instructions or scripts matching the fleet, and say so plainly rather than reporting a clean start.
+  A home checked from another home is reported once per home; a remote-routed secondmate is reported by its own session start on its own host, so a silent section here says nothing about one.
 - `TANGLE: <remediation>` - the primary checkout is stranded on a feature branch instead of its default branch; `AGENTS.md` section 8 explains why this guard exists and what it protects.
   The work is safe on that branch ref; restore the primary to its default branch with the printed `git -C <root> checkout <default>`, then re-validate that branch in a proper worktree.
   This is the only sanctioned firstmate-initiated git write to the primary, and it is a non-destructive branch switch that strands nothing.

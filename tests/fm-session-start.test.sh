@@ -1390,7 +1390,7 @@ EOF
   assert_contains "$out" "SESSION START" "the digest did not complete"
   assert_contains "$out" "IN PROGRESS - the deferred network checks have not finished yet." \
     "the digest did not disclose that its network checks were still running"
-  assert_contains "$out" "NOT yet confirmed: GitHub authentication, dead-secondmate relaunch" \
+  assert_contains "$out" "NOT yet confirmed: GitHub authentication, home-currency reporting against origin, dead-secondmate relaunch" \
     "the digest did not name the checks it has not confirmed"
   assert_not_contains "$out" "NEEDS_GH_AUTH" \
     "the digest reported a GitHub-auth verdict it could not yet have"
@@ -1454,6 +1454,10 @@ SH
   assert_contains "$out" "READ-ONLY SESSION" "the read-only fixture did not actually refuse the lock"
   assert_contains "$out" "skipped (read-only session) - GitHub authentication" \
     "a read-only session did not declare its skipped network checks"
+  assert_contains "$out" "home-currency reporting" \
+    "a read-only session did not name the home-currency check among what it skipped"
+  assert_contains "$out" "treat this home as NOT" \
+    "a read-only session presented an unrun currency check as a confirmed-current home"
   assert_absent "$home/state/.startup-network.status" \
     "a read-only session started the deferred stage it has no authority for"
   pass "session start: a read-only session declares its skipped network checks rather than dropping them"
