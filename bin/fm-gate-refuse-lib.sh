@@ -55,7 +55,8 @@
 #
 # Sourced by bin/fm-spawn.sh, bin/fm-send.sh, bin/fm-control.sh,
 # bin/fm-teardown.sh, bin/fm-status-decision-close.sh,
-# bin/fm-sessionstart-nudge.sh, bin/fm-sessionstart-run.sh, and the tests.
+# bin/fm-decision-raise.sh, bin/fm-sessionstart-nudge.sh,
+# bin/fm-sessionstart-run.sh, and the tests.
 # No side effects on source. set -u / set -e safe. The refusal is a hard exit,
 # not a return, because there is no safe way to continue a fleet mutation from a
 # gate context.

@@ -238,6 +238,10 @@ Report only true captain-relevant outcomes or a declared external wait by append
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
+When a \`needs-decision\` you are escalating IS a choice between options, raise it with its fields separate so the question, the options and the recommendation reach the captain intact instead of as one blob - this hop is where a decision raised by one of your own crewmates would otherwise be flattened back into prose:
+   \`$FM_ROOT/bin/fm-decision-raise.sh raise --status $STATUS_FILE --key {slug} --question "{one sentence}" --option "{label}" --option "{label}" --recommend {id} --because "{why}"\`
+It appends the status line for you, and refuses rather than recording fields padded to pass; on a refusal the plain \`needs-decision:\` line above is the right answer, not longer fields.
+When the escalation answers a marked from-firstmate request, add \`--note "corr={id} {one short line}"\` so the status line it appends still carries the correlation token the main firstmate needs; the structure never replaces that contract.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
 This is also how you return the answer to a marked from-firstmate request above.
 A marked request requires one correlated answer after the work; it does not require a separate receipt or start acknowledgement.
@@ -333,6 +337,9 @@ The report is the only thing that survives, so anything worth keeping must be in
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+   When it IS a choice between options, raise it with its fields separate so the question, the options and the recommendation reach the captain intact instead of as one blob:
+   \`$FM_ROOT/bin/fm-decision-raise.sh raise --status $STATUS_FILE --key {slug} --question "{one sentence}" --option "{label}" --option "{label}" --recommend {id} --because "{why}"\`
+   It appends the status line for you, and refuses rather than recording fields padded to pass; on a refusal the plain \`needs-decision:\` line above is the right answer, not longer fields.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (carrying the same key if you opened it with one) as you resume.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
@@ -452,6 +459,9 @@ $RULE1
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
+   When it IS a choice between options, raise it with its fields separate so the question, the options and the recommendation reach the captain intact instead of as one blob:
+   \`$FM_ROOT/bin/fm-decision-raise.sh raise --status $STATUS_FILE --key {slug} --question "{one sentence}" --option "{label}" --option "{label}" --recommend {id} --because "{why}"\`
+   It appends the status line for you, and refuses rather than recording fields padded to pass; on a refusal the plain \`needs-decision:\` line above is the right answer, not longer fields.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (carrying the same key if you opened it with one) as you resume.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
