@@ -905,7 +905,7 @@ bound_case() {  # <label> <expect> <pattern> <command...>
 }
 
 test_every_entrance_is_bounded_against_a_hostile_value() {
-  local state blob covered sub
+  local state blob covered sub dense
   state=$(make_state bounded_entrances)
   blob=$(hostile_value)
 
@@ -926,6 +926,14 @@ test_every_entrance_is_bounded_against_a_hostile_value() {
     --question "Which encoder should the importer use?" \
     --option-id vend "$blob" --option-id new "The new encoder" \
     --recommend new --because "It is already on the path."
+
+  bound_case "raise --consequence" refuse 'consequence-too-long' \
+    "$RAISE" raise --status "$state/c.status" --key c \
+    --question "Which encoder should the importer use?" \
+    --option "A one" --option "B two" \
+    --consequence 1 "$blob" --consequence 2 "It needs a vendor bump." \
+    --recommend 1 --because "It is already on the path."
+  assert_absent "$state/c.status" "a refused raise must not append a status line"
 
   bound_case "raise --because" refuse 'rationale-too-long' \
     "$RAISE" raise --status "$state/b.status" --key b \
@@ -965,6 +973,23 @@ test_every_entrance_is_bounded_against_a_hostile_value() {
   bound_case "option --id" refuse 'malformed' \
     "$RAISE" option --status "$state/r.status" --key read-key --id 1
 
+  # The same read path for the consequence accumulator, which a record can fill
+  # just as hostilely as the question: it must be WITHHELD rather than decoded,
+  # and the record must say so rather than paying for it.
+  dense=$(awk 'BEGIN { for (i = 0; i < 40000; i++) printf "\\t" }')
+  printf 'needs-decision [key=dense]: a short note\n' > "$state/dc.status"
+  {
+    printf 'decision\t1\tdense\t1787000000\n'
+    printf 'question\tWhich encoder should the importer use?\n'
+    printf 'option\t1\tThe vendored encoder\n'
+    printf 'option\t2\tThe new encoder\n'
+    printf 'consequence\t1\t%s\n' "$dense"
+    printf 'recommend\t1\tIt is already on the path.\n'
+    printf 'end\tdense\n'
+  } > "$state/dc.decisions"
+  bound_case "show --json (dense consequence)" malformed '"code":"consequence-too-long"' \
+    "$RAISE" show --status "$state/dc.status" --key dense --json
+
   # --- the relay: the drain that runs at the top of every wake turn --------
   bound_case "wake drain" accept 'MALFORMED DECISION RECORD' \
     env FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=99999 "$DRAIN"
@@ -981,6 +1006,377 @@ test_every_entrance_is_bounded_against_a_hostile_value() {
     esac
   done
   pass "every worker-controlled entrance stays bounded against a hostile value"
+}
+
+# --- per-option consequences ------------------------------------------------
+#
+# The property this half of the contract exists for: a recommendation is only
+# honest when the reader could have DISAGREED with it. Three labels that cannot
+# be weighed against each other are not a choice - the marked one gets taken
+# because it is the only argued one - so each option may carry its own
+# consequence, and these tests assert that it survives to the relay attached to
+# the right option, that declining it changes nothing, and that a consequence
+# which was padded rather than written is named and refused.
+#
+# Every assertion here is POSITIVE - the exact record accepted, the exact codes
+# emitted - because a test that only checks "nothing was rejected" passes on
+# empty output.
+
+# Raise the same choice as raise_sound, with a consequence on each option.
+raise_with_consequences() {  # <status-file> <key>
+  "$RAISE" raise --status "$1" --key "$2" \
+    --question "Should the importer retry per request or per session?" \
+    --option-id per-request "Retry per request" \
+    --option-id per-session "Retry per session" \
+    --consequence per-request "Ships today; every call site grows a header." \
+    --consequence per-session "Needs a store we do not run yet, so it lands after the freeze." \
+    --recommend per-request \
+    --because "The gateway already carries a per-request token; a store is new infrastructure."
+}
+
+# The whole point of the field, asserted as the exact record that lands and the
+# exact lines the relay prints: the consequence is attached to ITS option, on
+# both sides of the wire, and the reader can weigh the two against each other.
+test_a_consequence_reaches_the_relay_attached_to_its_option() {
+  local state status out json section record expected
+  state=$(make_state consequences)
+  status="$state/importer.status"
+  out=$(raise_with_consequences "$status" retry-budget) \
+    || fail "raising a decision with consequences failed"
+  assert_contains "$out" '2 of them carrying a consequence' \
+    "the raise must report how many options it argued"
+
+  # The exact bytes of the accepted record, so the wire format is pinned rather
+  # than merely exercised: `consequence` rows carry the OPTION ID they belong
+  # to, which is what makes the attachment survive a dropped or reordered row.
+  record="${status%.status}.decisions"
+  expected="question	Should the importer retry per request or per session?
+option	per-request	Retry per request
+option	per-session	Retry per session
+consequence	per-request	Ships today; every call site grows a header.
+consequence	per-session	Needs a store we do not run yet, so it lands after the freeze.
+recommend	per-request	The gateway already carries a per-request token; a store is new infrastructure.
+end	retry-budget"
+  out=$(sed -n '2,$p' "$record")
+  [ "$out" = "$expected" ] \
+    || fail "the accepted record is not the record this contract writes"$'\n'"--- got ---"$'\n'"$out"$'\n'"--- want ---"$'\n'"$expected"
+
+  json=$("$RAISE" show --status "$status" --key retry-budget --json) \
+    || fail "show --json failed for a sound decision carrying consequences"
+  assert_contains "$json" '"degenerate":[]' \
+    "a decision whose options are argued must carry no defects"
+  assert_contains "$json" '"id":"per-request","label":"Retry per request","consequence":"Ships today; every call site grows a header."' \
+    "each option must carry its own consequence in the payload a surface reads"
+  assert_contains "$json" '"id":"per-session","label":"Retry per session","consequence":"Needs a store we do not run yet, so it lands after the freeze."' \
+    "each option must carry its own consequence in the payload a surface reads"
+  assert_contains "$json" '"consequences":{"covered":2,"of":2,"partial":false,"note":null}' \
+    "full coverage must be reported as the count it is"
+
+  section=$(drain_section "$state")
+  assert_contains "$section" '    (per-request) Retry per request
+        => Ships today; every call site grows a header.' \
+    "the relay must print each consequence under the option it belongs to"
+  assert_contains "$section" '    (per-session) Retry per session
+        => Needs a store we do not run yet, so it lands after the freeze.' \
+    "the relay must print each consequence under the option it belongs to"
+  assert_not_contains "$section" 'consequences: ' \
+    "a fully argued decision has already said so option by option"
+  pass "a consequence reaches the relay attached to the option it belongs to"
+}
+
+# ALONGSIDE MEANS ALONGSIDE. Most decisions will not carry the field for a long
+# time, and a decision without it is not a defective decision. Asserted as an
+# identity rather than as an absence: the record a raise writes without
+# consequences is EXACTLY the record it writes with them, minus those rows.
+test_declining_consequences_changes_nothing() {
+  local state with without out json section
+  state=$(make_state declined)
+  raise_with_consequences "$state/with.status" k >/dev/null || fail "raising with consequences failed"
+
+  out=$("$RAISE" raise --status "$state/without.status" --key k \
+    --question "Should the importer retry per request or per session?" \
+    --option-id per-request "Retry per request" \
+    --option-id per-session "Retry per session" \
+    --recommend per-request \
+    --because "The gateway already carries a per-request token; a store is new infrastructure.") \
+    || fail "raising without consequences failed"
+  [ "$out" = "raised needs-decision [key=k] with 2 options; recommendation: per-request" ] \
+    || fail "declining the field must report exactly what it always did, got: $out"
+
+  with=$(grep -v '^consequence	' "$state/with.decisions" | sed -n '2,$p')
+  without=$(sed -n '2,$p' "$state/without.decisions")
+  [ "$with" = "$without" ] \
+    || fail "a record without consequences must be the same record minus those rows"$'\n'"--- with ---"$'\n'"$with"$'\n'"--- without ---"$'\n'"$without"
+
+  json=$("$RAISE" show --status "$state/without.status" --key k --json) \
+    || fail "show --json must succeed for a decision that declined consequences"
+  assert_contains "$json" '"degenerate":[]' \
+    "declining the field is not a defect and must never be flagged as one"
+  assert_contains "$json" '"consequences":{"covered":0,"of":2,"partial":false,"note":null}' \
+    "no coverage is reported as zero, not as a defect"
+  assert_contains "$json" '"consequence":null' \
+    "an option carrying no consequence must be null, never an empty string"
+
+  # The relay renders it exactly as it did before the field existed.
+  section=$(FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=99999 "$DRAIN" 2>/dev/null \
+    | sed -n '/^without \[key=k\]/,/^OPEN DECISIONS:/p')
+  assert_contains "$section" '(per-request) Retry per request' "the options must still render"
+  assert_not_contains "$section" '=>' "no consequence line may appear for a decision that has none"
+  assert_not_contains "$section" 'consequences:' "no coverage line may appear for a decision that has none"
+  assert_not_contains "$section" 'MALFORMED' "declining the field must never make a record malformed"
+  pass "a decision raised without consequences is unchanged, byte for byte, and is not a defect"
+}
+
+# The honest common case while the field spreads, and the one the surface must
+# not hide: some options argued, others not. It is RECORDED and RENDERED - a
+# refusal here would force a worker holding one real consequence to invent two,
+# which is the padded field this contract exists to keep out - and it SAYS how
+# many, so an unargued option is visible as unargued.
+test_partial_coverage_is_recorded_rendered_and_counted() {
+  local state status out json section
+  state=$(make_state partial)
+  status="$state/ship.status"
+  out=$("$RAISE" raise --status "$status" --key ship \
+    --question "Ship the importer now, after the freeze, or behind a flag?" \
+    --option "Ship now" --option "Ship after the freeze" --option "Ship behind a flag" \
+    --consequence 1 "Two weeks of the old path stays live and we carry both." \
+    --recommend 1 --because "The freeze is three weeks out and the old path is the one leaking.") \
+    || fail "a partially argued decision must be recorded, not refused"
+  assert_contains "$out" '3 options, 1 of them carrying a consequence' \
+    "the raise must report the coverage it recorded"
+  assert_contains "$out" '1 of 3 options carry a consequence - the rest are unargued' \
+    "the raise must say in words what the count means, while the worker can still act on it"
+  assert_grep 'needs-decision [key=ship]:' "$status" \
+    "a partially argued decision must still append its ordinary status line"
+
+  json=$("$RAISE" show --status "$status" --key ship --json) \
+    || fail "show --json must succeed for a partially argued decision"
+  assert_contains "$json" '"degenerate":[]' \
+    "partial coverage is a count, not a defect: the fields stay trustworthy"
+  assert_contains "$json" '"covered":1,"of":3,"partial":true' \
+    "the payload must carry the coverage as numbers a surface can render"
+  assert_contains "$json" '"note":"1 of 3 options carry a consequence - the rest are unargued, so they cannot be weighed against the ones that are"' \
+    "the payload must carry the operator-facing sentence too"
+
+  section=$(drain_section "$state")
+  assert_not_contains "$section" 'MALFORMED' \
+    "partial coverage must never withhold a sound decision's fields"
+  assert_contains "$section" '    (1) Ship now
+        => Two weeks of the old path stays live and we carry both.' \
+    "the argued option must render with its consequence"
+  assert_contains "$section" '    (2) Ship after the freeze
+    (3) Ship behind a flag' \
+    "the unargued options must still render, with no consequence line invented for them"
+  assert_contains "$section" 'consequences: 1 of 3 options - the rest are unargued' \
+    "the relay must state the coverage, or it asserts more structure than it has"
+  pass "partial coverage is recorded, rendered in full, and reported as 1 of 3"
+}
+
+# The trap this field invites: a required-looking field filled by pasting
+# something into it. Each case below is a way a consequence can be produced
+# without being written, each is mechanically decidable, and each must be named
+# by its own code and refused without writing anything.
+#
+# NOTE WHAT IS NOT HERE. Nothing checks whether a consequence is TRUE, is the
+# RIGHT one, or is informative rather than merely distinct. Those are a reader's
+# questions, and a check that appeared to answer them would be worse than none:
+# a bar a worker must clear is a bar a worker writes to, and three distinct
+# useless sentences that cleared it would now look verified.
+test_every_faked_consequence_is_refused_by_name() {
+  local state case_name expect rest err rc
+  state=$(make_state faked)
+  # <name>|<expected code>|<consequence for option 1>|<consequence for option 2>
+  while IFS='|' read -r case_name expect rest; do
+    [ -n "$case_name" ] || continue
+    err="$state/$case_name.err"
+    rc=0
+    # shellcheck disable=SC2086 # the two consequences are deliberately split on the delimiter.
+    "$RAISE" raise --status "$state/$case_name.status" --key "$case_name" \
+      --question "One endpoint or two?" \
+      --option "One endpoint" --option "Two endpoints" \
+      --consequence 1 "${rest%%|*}" --consequence 2 "${rest##*|}" \
+      --recommend 1 --because "Fewer moving parts than a second service." \
+      >/dev/null 2>"$err" || rc=$?
+    [ "$rc" -ne 0 ] || fail "$case_name: a consequence that was pasted rather than written must be refused"
+    assert_grep "$expect" "$err" "$case_name: the refusal must name '$expect'"
+    assert_grep 'raise it as free text' "$err" \
+      "$case_name: a refusal must point at the free-text line, never at padding the field"
+    assert_absent "$state/$case_name.status" "$case_name: a refused raise must not append a status line"
+    assert_absent "$state/$case_name.decisions" "$case_name: a refused raise must not write a record"
+  done <<'EOF'
+empty|empty-consequence|   |Two services to run instead of one.
+same-as-each-other|duplicate-consequences|It is a tradeoff.|It is a tradeoff.
+same-as-its-label|consequence-duplicates-option|One endpoint|Two services to run instead of one.
+same-as-the-rationale|consequence-duplicates-rationale|Fewer moving parts than a second service.|Two services to run instead of one.
+same-as-the-question|consequence-duplicates-question|One endpoint or two?|Two services to run instead of one.
+EOF
+
+  # One field holding the whole argument while the other got a token. Both are
+  # inside the length cap, so this is the disproportion and nothing else.
+  err="$state/blob.err"
+  rc=0
+  "$RAISE" raise --status "$state/blob.status" --key blob \
+    --question "One endpoint or two?" \
+    --option "One endpoint" --option "Two endpoints" \
+    --consequence 1 "The read path stays on one service, so the cache stays warm, nothing new gets deployed, and the on-call rotation does not grow a second page target this quarter." \
+    --consequence 2 "Two." \
+    --recommend 1 --because "Fewer moving parts than a second service." \
+    >/dev/null 2>"$err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "one consequence carrying the whole argument must be refused"
+  assert_grep 'consequence-carries-everything' "$err" \
+    "the field holding the whole blob must be named as that, not as a length problem"
+  assert_no_grep 'consequence-too-long' "$err" \
+    "the disproportion case must be the disproportion, not a cap it also happened to break"
+  pass "every way a consequence can be pasted rather than written is refused by name"
+}
+
+# A consequence attaches BY ID, which is the half of the contract an answering
+# surface has to agree with. Attached to nothing, or to an option twice, and the
+# attachment this field rests on is broken.
+test_a_consequence_must_belong_to_exactly_one_real_option() {
+  local state err rc
+  state=$(make_state attach)
+  err="$state/err.txt"
+
+  rc=0
+  "$RAISE" raise --status "$state/unknown.status" --key unknown \
+    --question "One endpoint or two?" \
+    --option "One endpoint" --option "Two endpoints" \
+    --consequence 9 "Two services to run instead of one." \
+    --recommend 1 --because "Fewer moving parts than a second service." \
+    >/dev/null 2>"$err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "a consequence naming no option must be refused, never re-pointed"
+  assert_grep 'consequence-unknown-option' "$err" "an unattached consequence must be named"
+  assert_absent "$state/unknown.status" "a refused raise must not append a status line"
+
+  rc=0
+  "$RAISE" raise --status "$state/twice.status" --key twice \
+    --question "One endpoint or two?" \
+    --option "One endpoint" --option "Two endpoints" \
+    --consequence 1 "It ships today." \
+    --consequence 1 "Two services to run instead of one." \
+    --recommend 1 --because "Fewer moving parts than a second service." \
+    >/dev/null 2>"$err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "two consequences under one option id must be refused, never merged"
+  assert_grep 'duplicate-consequence-id' "$err" "the ambiguous attachment must be named"
+  pass "a consequence belongs to exactly one real option, or the decision is not recorded"
+}
+
+# The backstop, matching the one the other fields have: the writer refuses, but
+# a record can still reach the file hand-written or from a future writer. A
+# faked consequence must look wrong AT THE RELAY, to firstmate, rather than
+# reach the captain as two options that look separately argued.
+test_a_faked_consequence_on_disk_is_visible_at_the_relay() {
+  local state section json rc
+  state=$(make_state ondisk_consequence)
+  printf 'needs-decision [key=blob]: one endpoint or two?\n' >> "$state/faked.status"
+  {
+    printf 'decision\t1\tblob\t1787000000\n'
+    printf 'question\tOne endpoint or two?\n'
+    printf 'option\t1\tOne endpoint\n'
+    printf 'option\t2\tTwo endpoints\n'
+    printf 'consequence\t1\tIt is a tradeoff either way.\n'
+    printf 'consequence\t2\tIt is a tradeoff either way.\n'
+    printf 'recommend\t1\tFewer moving parts.\n'
+    printf 'end\tblob\n'
+  } >> "$state/faked.decisions"
+
+  section=$(drain_section "$state")
+  assert_contains "$section" 'MALFORMED DECISION RECORD (duplicate-consequences)' \
+    "two options given the same consequence must be marked malformed at the relay"
+  assert_contains "$section" 'relay the note above, not these as options' \
+    "the relay must say not to present the fields as options"
+  assert_not_contains "$section" 'It is a tradeoff either way.' \
+    "a malformed record's consequences must never be rendered as if they argued anything"
+
+  rc=0
+  json=$("$RAISE" show --status "$state/faked.status" --key blob --json) || rc=$?
+  [ "$rc" -ne 0 ] || fail "reading a record with faked consequences must report failure to its caller"
+  assert_contains "$json" '"code":"duplicate-consequences"' \
+    "the machine payload must carry the defect, not just the human view"
+  pass "a faked consequence on disk is malformed at the relay, not relayed as an argued option"
+}
+
+# Consequence text is untrusted prose, exactly as a label is. It must not be
+# able to mint a row, forge a field, or render a line at the relay that reads
+# like a real one - and it must come back out exactly as it went in.
+test_consequence_text_cannot_forge_a_row_or_a_line() {
+  local state status json section ids
+  state=$(make_state inject_consequence)
+  status="$state/t.status"
+  "$RAISE" raise --status "$status" --key inject \
+    --question "Which encoder should the importer use?" \
+    --option "The vendored encoder" --option "The new encoder" \
+    --consequence 1 "$(printf 'ships today\noption\t3\tA MINTED OPTION')" \
+    --consequence 2 "$(printf 'needs a\tvendor bump')" \
+    --recommend 1 --because "It is already on the path." >/dev/null \
+    || fail "raising with awkward consequence text failed"
+
+  json=$("$RAISE" show --status "$status" --key inject --json) \
+    || fail "show --json failed after awkward consequence text"
+  assert_contains "$json" '"degenerate":[]' \
+    "awkward text is not a defect: it is text, and it must survive as text"
+  assert_contains "$json" '"consequence":"ships today\noption\t3\tA MINTED OPTION"' \
+    "a consequence must come back out exactly as it went in"
+  assert_contains "$json" '"consequence":"needs a\tvendor bump"' \
+    "a consequence must come back out exactly as it went in"
+
+  # The option SET is the identity contract: exactly the two ids raised, and
+  # not the one the consequence text tried to mint.
+  ids=$(option_ids "$status" inject)
+  [ "$ids" = "1 2 " ] \
+    || fail "consequence text minted an option: expected ids '1 2 ', got '$ids'"
+
+  section=$(drain_section "$state")
+  assert_not_contains "$section" '(3) A MINTED OPTION' \
+    "consequence prose must never render a line that reads like a real option"
+  assert_contains "$section" '        => ships today option 3 A MINTED OPTION
+    (2) The new encoder' \
+    "the text must render flattened onto its own single line, with the next option after it"
+  pass "consequence text can neither mint an option nor forge a line at the relay"
+}
+
+# The relay's per-decision field budget, asserted as the all-or-nothing thing it
+# is. The drain stops BUILDING a block once it is past the allowance, because
+# the option count is a crewmate's number and the loop would otherwise run once
+# per row of a record nothing bounds - on the path that runs at the top of every
+# wake-handling turn. Stopping early must change the cost and nothing else, so
+# this pins the output either side of that line: the decision's own line is
+# still printed, not one field line leaks, and the cut is counted and named.
+test_an_over_budget_field_block_is_dropped_whole_and_counted() {
+  local state status i section
+  state=$(make_state overbudget)
+  status="$state/wide.status"
+  printf 'needs-decision [key=wide]: which encoder should the importer use?\n' >> "$status"
+  {
+    printf 'decision\t1\twide\t1787000000\n'
+    printf 'question\tWhich encoder should the importer use?\n'
+    i=1
+    while [ "$i" -le 60 ]; do
+      printf 'option\t%s\tEncoder number %s, one of a great many candidates on the list\n' "$i" "$i"
+      i=$((i + 1))
+    done
+    i=1
+    while [ "$i" -le 60 ]; do
+      printf 'consequence\t%s\tPicking encoder %s means carrying its vendor bump for the rest of the year\n' "$i" "$i"
+      i=$((i + 1))
+    done
+    printf 'recommend\t1\tIt is already on the path.\n'
+    printf 'end\twide\n'
+  } >> "$state/wide.decisions"
+
+  section=$(drain_section "$state")
+  assert_contains "$section" 'wide [key=wide] needs-decision: which encoder should the importer use?' \
+    "a decision whose fields do not fit must still be listed"
+  assert_not_contains "$section" 'Encoder number' \
+    "an over-budget block must be dropped whole, never printed in part"
+  assert_not_contains "$section" '=>' \
+    "an over-budget block must take its consequences with it"
+  assert_not_contains "$section" 'recommends' \
+    "an over-budget block must take its recommendation with it"
+  assert_contains "$section" 'OPEN DECISIONS: fields omitted for 1 (byte cap) - read them with bin/fm-decision-raise.sh show <task> --key <key>' \
+    "a bounded view must say what it cut and where to read it"
+  pass "a field block over the relay's budget is dropped whole, counted, and never printed in part"
 }
 
 # A durable log line is never shortened behind the worker's back. An over-long

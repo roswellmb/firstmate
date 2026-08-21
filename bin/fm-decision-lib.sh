@@ -26,6 +26,7 @@
 #   decision<TAB><format-version><TAB><key><TAB><epoch>
 #   question<TAB><encoded>
 #   option<TAB><option-id><TAB><encoded label>      (repeated)
+#   consequence<TAB><option-id><TAB><encoded text>  (repeated, OPTIONAL)
 #   recommend<TAB><option-id><TAB><encoded rationale>
 #   end<TAB><key>
 # Field values are backslash-encoded (see fm_decision_encode) so a value can
@@ -33,6 +34,44 @@
 # block boundary. A block missing its `end` line is TRUNCATED and is never used
 # in part; the last COMPLETE block for a key wins, so re-raising a key after it
 # was resolved supersedes cleanly without rewriting history.
+#
+# THE FORMAT VERSION DID NOT CHANGE when `consequence` was added, and that is
+# the whole compatibility story rather than an oversight. A reader that predates
+# the line skips it, exactly as it already skips any line whose kind it does not
+# recognise, and renders the same question, options and recommendation it always
+# did. Bumping the version would have done the opposite: an older reader
+# discards a block whose version it does not know, so every decision carrying a
+# consequence would have gone dark on every surface that had not updated yet.
+# A line older readers ignore is additive; changing what an existing line MEANS
+# would not be, and would need the bump.
+#
+# PER-OPTION CONSEQUENCE - what follows if the captain picks THIS option.
+# A recommendation is only honest when the reader could have disagreed with it,
+# and three labels that cannot be weighed against each other are not a choice:
+# the marked one gets taken because it is the only argued one. The consequence
+# is where that weighing material lives, attached to the option it belongs to.
+#
+# It is OPTIONAL, and a decision without it is not a defective decision - it is
+# the ordinary decision this contract has always recorded. Nothing here compels
+# the field, because compulsion produces the degenerate case it is meant to
+# prevent: a worker required to write one consequence per option writes the same
+# sentence three times. What this file does instead is make a FAKED consequence
+# detectable (see DEGENERACY below) and make partial coverage VISIBLE, so an
+# unargued option is seen as unargued rather than presented as an equal choice.
+#
+# It is attached BY OPTION ID, never by position, for the same reason the option
+# id exists at all: identity is the half of this contract another surface has to
+# agree with, and a positional attachment would silently re-point every
+# consequence the moment an option row was dropped as unrenderable.
+#
+# COVERAGE IS A COUNT, NOT A GRADE. `covered of options` is a fact - it is
+# decided by matching ids, it cannot be argued with, and one of three is
+# decisive on its own. Nothing in this file scores, rates or grades a
+# consequence, and nothing may be added that does: a threshold standing in for
+# judgement becomes a target, and a worker clearing it writes three distinct
+# useless sentences that now look verified. Whether a consequence is TRUE, is
+# the RIGHT one, or would actually have let the reader disagree is a question
+# only a reader can answer, and this file must never appear to have answered it.
 #
 # OPTION IDENTITY - the half of this contract another surface must agree with.
 # An option is identified by the triple (task id, decision key, option id).
@@ -61,6 +100,15 @@
 # out so a record that reached the file some other way is shown as MALFORMED at
 # the relay rather than reaching the captain looking structured.
 #
+# That same function also publishes COVERAGE - how many options carry a
+# consequence - and coverage is deliberately NOT a defect. Every defect code
+# says "this is not structure" and costs the record its fields; coverage says
+# "this much of it is argued", which is true of a perfectly sound record and
+# must not withhold anything. Keeping the two apart is what lets a partially
+# covered decision be recorded, rendered and honestly labelled instead of
+# refused - and a refusal here would be the compulsion that manufactures the
+# padded field in the first place.
+#
 # Bash 3.2 compatible: no associative arrays, no ${var,,}.
 
 # Current record format version. Bump only on an incompatible field change; a
@@ -74,6 +122,25 @@ FM_DECISION_FORMAT_VERSION=1
 FM_DECISION_MAX_QUESTION=240
 FM_DECISION_MAX_OPTION=200
 FM_DECISION_MAX_RATIONALE=400
+# A consequence is what follows from ONE option - a sentence the captain weighs
+# against the other options' sentences. Past this it is the reasoning chain,
+# which belongs behind the decision like every other cap here says.
+FM_DECISION_MAX_CONSEQUENCE=240
+
+# "One consequence carrying everything": the shape of a field that swallowed the
+# whole blob while its siblings got a token. It trips when the longest
+# consequence outweighs ALL the others put together by this factor, and only
+# once that longest one is itself substantial - so a set of genuinely terse
+# consequences ("ships today" against "needs a store") never trips on the
+# ratio between two short strings.
+#
+# THIS MEASURES SHAPE, NOT QUALITY, and the distinction is the whole reason it
+# is allowed to exist. It says one field holds what the others were supposed to
+# hold; it says nothing about whether any of them is right, informative or worth
+# reading, and passing it is not evidence of anything. Nothing here may grow
+# into a score: a bar a worker must clear is a bar a worker writes to.
+FM_DECISION_CONSEQUENCE_BLOB_FACTOR=3
+FM_DECISION_CONSEQUENCE_BLOB_FLOOR=120
 # Refuse to parse an implausibly large record file rather than reading forever.
 FM_DECISION_MAX_FILE_BYTES=262144
 
@@ -104,6 +171,8 @@ FM_DECISION_MAX_RAW=$FM_DECISION_MAX_QUESTION
   || FM_DECISION_MAX_RAW=$FM_DECISION_MAX_OPTION
 [ "$FM_DECISION_MAX_RATIONALE" -le "$FM_DECISION_MAX_RAW" ] \
   || FM_DECISION_MAX_RAW=$FM_DECISION_MAX_RATIONALE
+[ "$FM_DECISION_MAX_CONSEQUENCE" -le "$FM_DECISION_MAX_RAW" ] \
+  || FM_DECISION_MAX_RAW=$FM_DECISION_MAX_CONSEQUENCE
 FM_DECISION_MAX_ENCODED=$((2 * FM_DECISION_MAX_RAW))
 FM_DECISION_MAX_RAW=$((FM_DECISION_MAX_RAW + 1))
 
@@ -321,6 +390,9 @@ fm_decision_reset() {
   FM_DECISION_QUESTION=
   FM_DECISION_OPTIONS=
   FM_DECISION_OPTION_COUNT=0
+  FM_DECISION_CONSEQUENCES=
+  FM_DECISION_CONSEQUENCE_COVERED=0
+  FM_DECISION_COVERAGE_CODE=
   FM_DECISION_RECOMMEND_ID=
   FM_DECISION_RECOMMEND_WHY=
   FM_DECISION_DEFECTS=
@@ -361,6 +433,45 @@ EOF
   return 1
 }
 
+# One option's CONSEQUENCE - what follows if the captain picks it. Prints the
+# text and returns 0 when <id> carries one; returns 1 when it does not, which is
+# the ordinary case for a decision that declined the field and for every option
+# a partially covered decision left unargued.
+#
+# The same decode discipline as fm_decision_option_label, and for the same
+# reason: FM_DECISION_CONSEQUENCES holds ENCODED text, and this hands back
+# exactly one value. Withheld text is a MISS rather than an empty consequence,
+# so a renderer never prints an empty `=>` where a field it could not read was.
+#
+# IT LOOKS THE ROW UP RATHER THAN WALKING TO IT, which its option-label sibling
+# does not need to: that one is called ONCE per record, to check the
+# recommendation, while this is called once per rendered OPTION. A walk would
+# make rendering cost options times consequences, and both lists come from the
+# same untrusted file - a record can carry thousands of each and still be sound,
+# so a product of two attacker-chosen counts sits on the path that runs at the
+# top of every wake-handling turn. Two parameter expansions cost one scan of the
+# accumulator instead of one loop turn per row in it.
+#
+# The match is exact for the same reason the format is safe: an encoded value
+# can hold neither a raw TAB nor a newline, so `<newline><id><TAB>` can only
+# begin a real row and the row ends at the next newline. The leading newline is
+# prepended so the first row is reachable by the same pattern as the rest, and
+# the SHORTEST match wins, so an id repeated by a hand-written record resolves
+# to its first row exactly as a walk would have.
+fm_decision_option_consequence() {  # <id> -> consequence text on stdout
+  local want=$1 all rest
+  all=$'\n'$FM_DECISION_CONSEQUENCES
+  case "$all" in
+    *$'\n'"$want"$'\t'*) : ;;
+    *) return 1 ;;
+  esac
+  rest=${all#*$'\n'"$want"$'\t'}
+  fm_decision_decode_var "${rest%%$'\n'*}"
+  [ "$FM_DECISION_VALUE_WITHHELD" -eq 0 ] || return 1
+  printf '%s' "$FM_DECISION_VALUE"
+  return 0
+}
+
 # --- reading ----------------------------------------------------------------
 # Parse the LAST COMPLETE record for <key> out of a task's record file into the
 # globals above, then re-run the defect check so no caller can render a record
@@ -380,7 +491,7 @@ fm_decision_record_read() {  # <record-file> <key>
   local line kind a b c
   local in_block=0 blk_key='' blk_ver='' blk_raised=''
   local blk_q='' blk_opts='' blk_rid='' blk_why='' blk_count=0 blk_seen_q=0
-  local blk_pd='' saw_truncated=0 bytes
+  local blk_cons='' blk_pd='' saw_truncated=0 bytes
 
   fm_decision_reset
   # The same guard the sibling fold uses on the status log this record is joined
@@ -408,7 +519,7 @@ EOF
         in_block=0
         blk_key=$b; blk_ver=$a; blk_raised=$c
         blk_q=''; blk_opts=''; blk_rid=''; blk_why=''; blk_count=0; blk_seen_q=0
-        blk_pd=''
+        blk_cons=''; blk_pd=''
         # Ignore a block written by a format version this reader does not know
         # rather than guessing at its fields.
         if [ "$blk_ver" = "$FM_DECISION_FORMAT_VERSION" ] && [ "$blk_key" = "$want" ]; then
@@ -447,6 +558,23 @@ EOF
 "
         blk_count=$((blk_count + 1))
         ;;
+      consequence)
+        [ "$in_block" -eq 1 ] || continue
+        # THE SAME ROW RULE AS `option` ABOVE, deliberately, because the two
+        # accumulators are read by the same discipline: a wholly empty row is
+        # not a row, a row too long to be any sound consequence never enters the
+        # accumulator so no consumer downstream can be handed it to decode, and
+        # the text stays ENCODED here so it can neither mint a row nor forge a
+        # field. A dropped row is not absorbed - the record simply covers fewer
+        # options, which is a fact the coverage count then states out loud.
+        [ -n "$a$b" ] || continue
+        if ! fm_decision_encoded_within_bound "$b"; then
+          blk_pd="$blk_pd oversized-field consequence-too-long"
+          continue
+        fi
+        blk_cons="$blk_cons$a	$b
+"
+        ;;
       recommend)
         [ "$in_block" -eq 1 ] || continue
         blk_rid=$a
@@ -465,6 +593,7 @@ EOF
           FM_DECISION_QUESTION=$blk_q
           FM_DECISION_OPTIONS=${blk_opts%$'\n'}
           FM_DECISION_OPTION_COUNT=$blk_count
+          FM_DECISION_CONSEQUENCES=${blk_cons%$'\n'}
           FM_DECISION_RECOMMEND_ID=$blk_rid
           FM_DECISION_RECOMMEND_WHY=$blk_why
           FM_DECISION_PARSE_DEFECTS=$blk_pd
@@ -500,10 +629,15 @@ EOF
 # the same blob into question, option and rationale is exactly what they detect.
 # Builtins only, for the same reason fm_decision_normalise_var is: every reader
 # re-runs this on every drain.
-fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
+fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES, FM_DECISION_CONSEQUENCE_COVERED, FM_DECISION_COVERAGE_CODE
   local d=$FM_DECISION_PARSE_DEFECTS
   local id label text ids='' norms=$'\n' n qn rn code out=''
   local dup_opt=0 empty_opt=0 long_opt=0 bad_id=0 dup_id=0 oversized=0
+  local opt_norms=$'\n' want_opt_norms=0 cid cn cids='' cnorms=$'\n' cseen covered=0
+  local dup_cons=0 empty_cons=0 long_cons=0 dup_cid=0 unknown_cid=0
+  local cons_rows=0 cons_total=0 cons_longest=0 clen
+
+  [ -z "$FM_DECISION_CONSEQUENCES" ] || want_opt_norms=1
 
   fm_decision_normalise_var "$FM_DECISION_QUESTION"; qn=$FM_DECISION_NORM
   fm_decision_normalise_var "$FM_DECISION_RECOMMEND_WHY"; rn=$FM_DECISION_NORM
@@ -543,6 +677,23 @@ fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
     # membership is an exact match without a grep per option.
     case "$norms" in *$'\n'"$n"$'\n'*) dup_opt=1 ;; esac
     norms="$norms$n"$'\n'
+    # Remember each option's normalised label against its id, so the
+    # consequence checks below can ask "is this consequence just its own
+    # option's label again?" without a second pass over the option list.
+    #
+    # THIS PUTS A DERIVED VALUE BACK INTO A DELIMITED STRUCTURE, which the
+    # header forbids for a DECODED one - so note exactly why it is safe here
+    # and only here: fm_decision_normalise_var replaces every newline, CR and
+    # TAB with a space, so a normalised label provably contains neither
+    # delimiter and cannot forge a row of this structure the way the decoded
+    # label it came from could. Nothing decoded may follow it in.
+    #
+    # Built only when there is something to check it against. Bash rebuilds the
+    # whole string on every append, so accumulating it costs more than linearly
+    # in the option count - and a record that declined consequences would be
+    # paying that for a comparison that never happens. Declining the field has
+    # to cost exactly what it cost before the field existed.
+    [ "$want_opt_norms" -eq 0 ] || opt_norms="$opt_norms$id"$'\t'"$n"$'\n'
     # The paste tells: a field holding the question again, or the rationale
     # again, is not that field being filled in.
     [ -z "$qn" ] || [ "$n" != "$qn" ] || d="$d question-duplicated"
@@ -551,12 +702,99 @@ fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
 $FM_DECISION_OPTIONS
 EOF
 
+  # --- consequences ---------------------------------------------------------
+  # Optional, so an EMPTY accumulator produces nothing at all here: no code, no
+  # coverage line, no trace. That silence is the contract - a decision that
+  # declined the field is an ordinary decision, and a surface must not be able
+  # to tell it apart from one raised before the field existed.
+  #
+  # What is checked is the same thing every check in this function checks: has
+  # this field been filled in, or does it hold text that was pasted rather than
+  # written for it? A consequence repeating its own option's label, another
+  # option's consequence, the rationale or the question is the padding tell, and
+  # it is exactly what a worker produces when made to fill a field it has
+  # nothing to put in.
+  while IFS=$'\t' read -r cid text; do
+    [ -n "$cid$text" ] || continue
+    cseen=0
+    case " $cids " in *" $cid "*) cseen=1 ;; esac
+    if [ "$cseen" -eq 1 ]; then
+      # Two consequences under one id: which one belongs to that option is
+      # unanswerable, so the attachment this whole field rests on is broken.
+      dup_cid=1
+    else
+      cids="$cids $cid"
+    fi
+    # A consequence attaches BY ID. One naming no option of this record is
+    # attached to nothing, and an unattached consequence cannot be weighed
+    # against anything - it is not the option's argument, it is a loose line.
+    case " $ids " in
+      *" $cid "*) [ "$cseen" -eq 1 ] || covered=$((covered + 1)) ;;
+      *) unknown_cid=1 ;;
+    esac
+    fm_decision_decode_var "$text"; text=$FM_DECISION_VALUE
+    if [ "$FM_DECISION_VALUE_WITHHELD" -ne 0 ]; then
+      oversized=1
+      long_cons=1
+      continue
+    fi
+    fm_decision_normalise_var "$text"; cn=$FM_DECISION_NORM
+    if [ -z "$cn" ]; then
+      empty_cons=1
+      continue
+    fi
+    [ "${#text}" -le "$FM_DECISION_MAX_CONSEQUENCE" ] || long_cons=1
+    # Two options whose stated consequence is the same sentence cannot be
+    # weighed against each other, which is the captain's own test failing.
+    case "$cnorms" in *$'\n'"$cn"$'\n'*) dup_cons=1 ;; esac
+    cnorms="$cnorms$cn"$'\n'
+    # Restating the label adds nothing: the reader already has the label.
+    case "$opt_norms" in *$'\n'"$cid"$'\t'"$cn"$'\n'*) d="$d consequence-duplicates-option" ;; esac
+    [ -z "$rn" ] || [ "$cn" != "$rn" ] || d="$d consequence-duplicates-rationale"
+    [ -z "$qn" ] || [ "$cn" != "$qn" ] || d="$d consequence-duplicates-question"
+    clen=${#text}
+    cons_rows=$((cons_rows + 1))
+    cons_total=$((cons_total + clen))
+    [ "$clen" -le "$cons_longest" ] || cons_longest=$clen
+  done <<EOF
+$FM_DECISION_CONSEQUENCES
+EOF
+
+  # The field holding the whole blob, in the one form it can still take once
+  # every duplicate check above has passed: one option argued at length and the
+  # rest waved at. See FM_DECISION_CONSEQUENCE_BLOB_FACTOR - shape, not quality.
+  if [ "$cons_rows" -ge 2 ] \
+    && [ "$cons_longest" -ge "$FM_DECISION_CONSEQUENCE_BLOB_FLOOR" ] \
+    && [ "$cons_longest" -gt $((FM_DECISION_CONSEQUENCE_BLOB_FACTOR * (cons_total - cons_longest))) ]; then
+    d="$d consequence-carries-everything"
+  fi
+
+  # COVERAGE, the strongest signal and the one that is purely a count. It is
+  # published rather than turned into a refusal on purpose: refusing a record
+  # for covering some options and not others would force a worker holding one
+  # real consequence to invent two, which is the degeneracy this field exists to
+  # avoid. So a partially covered decision is recorded, is rendered in full, and
+  # SAYS SO - the unargued options are visible as unargued instead of sitting
+  # beside an argued one looking like equal choices.
+  FM_DECISION_CONSEQUENCE_COVERED=$covered
+  # shellcheck disable=SC2034 # published output, read by this library's callers (the raise command and the wake digest), not here.
+  FM_DECISION_COVERAGE_CODE=
+  if [ "$covered" -gt 0 ] && [ "$covered" -lt "$FM_DECISION_OPTION_COUNT" ]; then
+    # shellcheck disable=SC2034 # published output, read by this library's callers, not here.
+    FM_DECISION_COVERAGE_CODE=consequences-partial
+  fi
+
   [ "$FM_DECISION_OPTION_COUNT" -ge 2 ] || d="$d too-few-options"
   [ "$bad_id" -eq 0 ] || d="$d bad-option-id"
   [ "$dup_id" -eq 0 ] || d="$d duplicate-option-id"
   [ "$empty_opt" -eq 0 ] || d="$d empty-option"
   [ "$long_opt" -eq 0 ] || d="$d option-too-long"
   [ "$dup_opt" -eq 0 ] || d="$d duplicate-options"
+  [ "$dup_cid" -eq 0 ] || d="$d duplicate-consequence-id"
+  [ "$unknown_cid" -eq 0 ] || d="$d consequence-unknown-option"
+  [ "$empty_cons" -eq 0 ] || d="$d empty-consequence"
+  [ "$long_cons" -eq 0 ] || d="$d consequence-too-long"
+  [ "$dup_cons" -eq 0 ] || d="$d duplicate-consequences"
   [ "$oversized" -eq 0 ] || d="$d oversized-field"
 
   if [ -z "$FM_DECISION_RECOMMEND_ID" ]; then
@@ -595,7 +833,13 @@ fm_decision_defects() {  # -> defect codes on stdout
 
 # Human-readable explanation for one defect code, used by the writer's refusal
 # and by the relay's MALFORMED banner so an operator sees the same words in
-# both places.
+# both places. It also explains FM_DECISION_COVERAGE_CODE, which is not a defect
+# but is reported in the same voice, so a surface needs one lookup rather than
+# two.
+#
+# `consequences-partial` reads the coverage counters the validator just set, so
+# ask for it while the record it describes is the one parsed - the same
+# already-parsed state every other caller of this file works from.
 fm_decision_defect_help() {  # <code>
   case "$1" in
     no-question) printf 'the question is empty - state in one sentence what is being asked' ;;
@@ -612,6 +856,17 @@ fm_decision_defect_help() {  # <code>
     no-rationale) printf 'no rationale - say why with --because' ;;
     rationale-too-long) printf 'the rationale is over %s characters - keep the reasoning chain behind the decision' "$FM_DECISION_MAX_RATIONALE" ;;
     rationale-duplicated) printf 'the rationale repeats an option label verbatim' ;;
+    empty-consequence) printf 'an option carries an empty consequence - drop it, or say what actually follows if that option is picked' ;;
+    consequence-too-long) printf 'a consequence is over %s characters - state what follows in a sentence and keep the reasoning chain behind the decision' "$FM_DECISION_MAX_CONSEQUENCE" ;;
+    duplicate-consequences) printf 'two options state the same consequence - options whose consequences are identical cannot be weighed against each other' ;;
+    duplicate-consequence-id) printf 'two consequences name the same option - a consequence must belong to exactly one option' ;;
+    consequence-unknown-option) printf 'a consequence names an option id that does not exist, so it is attached to nothing' ;;
+    consequence-duplicates-option) printf "a consequence repeats its own option's label - the reader already has the label; say what follows from it" ;;
+    consequence-duplicates-rationale) printf 'a consequence repeats the recommendation rationale - the same text in two fields is not two fields' ;;
+    consequence-duplicates-question) printf 'a consequence repeats the question - the same text in two fields is not two fields' ;;
+    consequence-carries-everything) printf 'one consequence is longer than all the others put together - that is one field holding the whole argument while the rest were waved at' ;;
+    consequences-partial) printf '%s of %s options carry a consequence - the rest are unargued, so they cannot be weighed against the ones that are' \
+      "$FM_DECISION_CONSEQUENCE_COVERED" "$FM_DECISION_OPTION_COUNT" ;;
     truncated-record) printf 'the record on disk is incomplete (a torn or interrupted write)' ;;
     oversized-record-file) printf 'the record file is implausibly large and was not parsed' ;;
     oversized-field) printf 'a field is longer than %s encoded characters - far past any field cap, so it was withheld rather than decoded; shorten it, or raise this as free text' "$FM_DECISION_MAX_ENCODED" ;;

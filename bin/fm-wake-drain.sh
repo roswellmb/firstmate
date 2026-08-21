@@ -95,6 +95,14 @@ acknowledge_inactive_outcomes() { # <mode> <newline-separated-fingerprints>
 # relay is worth nothing. The fields are joined to the fold by (task, key); the
 # fold itself is untouched and still reads only the status stream.
 #
+# An option that carries a CONSEQUENCE prints it under that option, and a
+# decision that argued some options and not others says how many. This is the
+# point at which the field is worth having: a recommendation is only honest when
+# the reader could have disagreed with it, and firstmate is the reader who has
+# to be able to. An option left unargued therefore has to be visible as unargued
+# HERE, before the decision is relayed onward, rather than arriving beside an
+# argued one looking like an equal choice.
+#
 # A record that is present but NOT actually structured prints a MALFORMED banner
 # INSTEAD of its fields. That is the point rather than a nicety: a required field
 # with nothing checking it becomes a field holding the whole blob, so a decision
@@ -104,8 +112,8 @@ acknowledge_inactive_outcomes() { # <mode> <newline-separated-fingerprints>
 print_open_decisions_section() {
   local open task key verb note line item_bytes=220 global_bytes=4000
   local output='' used=0 shown=0 omitted=0 bytes
-  local detail_used=0 detail_global=2400 detail_dropped=0
-  local record detail id label qn nn
+  local detail_used=0 detail_global=2400 detail_dropped=0 detail_over=0
+  local record detail id label consequence qn nn
 
   open=$(scan_open_decisions_incremental "$STATE") || return 0
   [ -n "$open" ] || return 0
@@ -134,6 +142,7 @@ print_open_decisions_section() {
     record=$(fm_decision_record_path "$STATE/$task.status")
     fm_decision_record_read "$record" "$key" || true
     detail=''
+    detail_over=0
     if [ -n "$FM_DECISION_DEFECTS" ]; then
       detail="    MALFORMED DECISION RECORD ($FM_DECISION_DEFECTS) - not structured; relay the note above, not these as options
 "
@@ -163,14 +172,50 @@ print_open_decisions_section() {
         fm_cap_line_var "    ($id) $FM_DECISION_FLAT" $((item_bytes - 1))
         detail="$detail$FM_LINE_CAP_LINE
 "
+        # What follows if this option is picked, under the option it belongs
+        # to - the material that lets the recommendation be disagreed with
+        # rather than simply taken as the only argued one. Optional, so an
+        # option without it adds no line at all. Untrusted prose, so it is
+        # decoded one value at a time and flattened before it is capped,
+        # exactly as the label above is.
+        if consequence=$(fm_decision_option_consequence "$id"); then
+          fm_decision_flatten_var "$consequence"
+          fm_cap_line_var "        => $FM_DECISION_FLAT" $((item_bytes - 1))
+          detail="$detail$FM_LINE_CAP_LINE
+"
+        fi
+        # STOP BUILDING A BLOCK THAT IS ALREADY OVER BUDGET. A detail block past
+        # the allowance is dropped whole below, and the block only grows, so
+        # every further row is work whose verdict is already decided. Without
+        # this the loop runs once per option row of a record nothing bounds -
+        # the option count is a crewmate's number, not a cap of ours - on the
+        # path that runs at the top of every wake-handling turn. What is printed
+        # does not change: the same block is dropped either way.
+        if [ $((detail_used + ${#detail})) -gt "$detail_global" ]; then
+          detail_over=1
+          break
+        fi
       done <<EOD
 $FM_DECISION_OPTIONS
 EOD
-      fm_decision_flatten_var "$FM_DECISION_RECOMMEND_WHY"
-      fm_cap_line_var "    -> recommends ($FM_DECISION_RECOMMEND_ID) $FM_DECISION_FLAT" \
-        $((item_bytes - 1))
-      detail="$detail$FM_LINE_CAP_LINE
+      # Coverage, printed only when it is partial. A fully argued decision has
+      # already said so option by option, and a decision that declined the
+      # field must look exactly as it did before the field existed - but an
+      # option left unargued beside one that was argued has to be visible as
+      # unargued, or this surface asserts more structure than it has.
+      if [ -n "$FM_DECISION_COVERAGE_CODE" ] && [ "$detail_over" -eq 0 ]; then
+        fm_cap_line_var "    consequences: $FM_DECISION_CONSEQUENCE_COVERED of $FM_DECISION_OPTION_COUNT options - the rest are unargued" \
+          $((item_bytes - 1))
+        detail="$detail$FM_LINE_CAP_LINE
 "
+      fi
+      if [ "$detail_over" -eq 0 ]; then
+        fm_decision_flatten_var "$FM_DECISION_RECOMMEND_WHY"
+        fm_cap_line_var "    -> recommends ($FM_DECISION_RECOMMEND_ID) $FM_DECISION_FLAT" \
+          $((item_bytes - 1))
+        detail="$detail$FM_LINE_CAP_LINE
+"
+      fi
     fi
     if [ -n "$detail" ]; then
       if [ $((detail_used + ${#detail})) -gt "$detail_global" ]; then
