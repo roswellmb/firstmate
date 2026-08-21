@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-decision-raise.sh - raise ONE decision as separate fields (the question,
-# the options, the recommendation) instead of a single line of prose, and read
-# one back.
+# the options, what each option would cost, the recommendation) instead of a
+# single line of prose, and read one back.
 #
 # The captain's test, which is why this exists: "If he has to READ to find the
 # question, it failed. A decision should present the question, the options, and
@@ -18,6 +18,7 @@
 #   fm-decision-raise.sh raise --status <status-file> --key <slug>
 #        --question <text>
 #        (--option <label> | --option-id <id> <label>)...
+#        [--consequence <option-id> <text>]...
 #        --recommend <id> --because <text>
 #        [--verb needs-decision|blocked] [--note <line>]
 #   fm-decision-raise.sh show   --status <status-file> --key <slug> [--json]
@@ -38,6 +39,26 @@
 # existing reader keep working byte-for-byte. The note defaults to the question,
 # which means even a reader that knows nothing about this record now sees the
 # question in the log instead of a blob.
+#
+# --consequence SAYS WHAT FOLLOWS IF THAT OPTION IS PICKED, and it is what
+# turns a recommendation into something the captain can disagree with. Without
+# it a set of labels gives him nothing to weigh, so he takes the marked one and
+# the decision is a rubber stamp wearing the costume of a decision. Ids default
+# to the option's 1-based ordinal, so `--option A --option B --consequence 1
+# "..." --consequence 2 "..."` is the whole of it.
+#
+# It is OPTIONAL and it is not all-or-nothing. Covering some options and not
+# others is recorded, rendered in full, and REPORTED as "n of m carry a
+# consequence", because the alternative - refusing the record - would make a
+# worker holding one real consequence invent two, which is the padded field this
+# whole path exists to keep out. What is refused is a consequence that was
+# padded rather than written: empty, the same sentence as another option's, the
+# option's own label again, the rationale again, or the question again. Nothing
+# scores or grades a consequence, here or in the library - not even by length
+# against another consequence, which is a quality proxy wearing a shape-fact
+# costume: whether it is TRUE or USEFUL is a question only the reader can
+# answer. A terse consequence beside a detailed one is accepted, because the
+# alternative is padding the terse one to clear a bar.
 #
 # STRUCTURE IS AVAILABLE, NOT COMPULSORY. Most decisions are not multiple choice.
 # A worker that writes a plain `needs-decision: ...` line is doing something
@@ -151,7 +172,7 @@ json_str() {  # <value> -> quoted JSON string on stdout
 # LIST, never a boolean: a surface that knows nothing else still learns that
 # this record must not be presented as clean structure, and which checks failed.
 emit_json() {  # <key> <structured:0|1> <note>
-  local key=$1 structured=$2 note=$3 id label first=1 code
+  local key=$1 structured=$2 note=$3 id label first=1 code consequence
   printf '{'
   printf '"key":%s' "$(json_str "$key")"
   printf ',"structured":%s' "$([ "$structured" = 1 ] && echo true || echo false)"
@@ -164,11 +185,27 @@ emit_json() {  # <key> <structured:0|1> <note>
       [ "$first" = 1 ] || printf ','
       first=0
       fm_decision_decode_var "$label"
-      printf '{"id":%s,"label":%s}' "$(json_str "$id")" "$(json_str "$FM_DECISION_VALUE")"
+      printf '{"id":%s,"label":%s' "$(json_str "$id")" "$(json_str "$FM_DECISION_VALUE")"
+      # null, never "", for an option carrying no consequence. Absence is
+      # load-bearing on this field - an unargued option and an option argued
+      # with an empty sentence are different things, and a surface that cannot
+      # tell them apart will render the second as if it were the first.
+      if consequence=$(fm_decision_option_consequence "$id"); then
+        printf ',"consequence":%s' "$(json_str "$consequence")"
+      else
+        printf ',"consequence":null'
+      fi
+      printf '}'
     done <<EOF
 $FM_DECISION_OPTIONS
 EOF
     printf ']'
+    printf ',"consequences":{"covered":%d,"of":%d,"partial":%s,"note":%s}' \
+      "$FM_DECISION_CONSEQUENCE_COVERED" "$FM_DECISION_OPTION_COUNT" \
+      "$([ -n "$FM_DECISION_COVERAGE_CODE" ] && echo true || echo false)" \
+      "$([ -n "$FM_DECISION_COVERAGE_CODE" ] \
+        && json_str "$(fm_decision_defect_help "$FM_DECISION_COVERAGE_CODE")" \
+        || printf 'null')"
     printf ',"recommend":{"option":%s,"because":%s}' \
       "$(json_str "$FM_DECISION_RECOMMEND_ID")" "$(json_str "$FM_DECISION_RECOMMEND_WHY")"
   fi
@@ -194,6 +231,7 @@ collapse() {  # <text>
 cmd_raise() {
   local question='' recommend='' because='' verb='needs-decision' note=''
   local opts='' pos=0 id label task='' defects code record block now
+  local cons='' text
   while [ $# -gt 0 ]; do
     case "$1" in
       --status) [ $# -ge 2 ] || fail "--status requires a path"; STATUS_FILE=$2; shift 2 ;;
@@ -210,6 +248,12 @@ cmd_raise() {
         pos=$((pos + 1))
         fm_decision_option_id_valid "$2" || fail "option id '$2' is not a slug (allowed: A-Z a-z 0-9 . _ -)"
         opts="$opts$2	$(fm_decision_encode "$3")
+"
+        shift 3 ;;
+      --consequence)
+        [ $# -ge 3 ] || fail "--consequence requires an option id and text"
+        fm_decision_option_id_valid "$2" || fail "option id '$2' is not a slug (allowed: A-Z a-z 0-9 . _ -)"
+        cons="$cons$2	$(fm_decision_encode "$3")
 "
         shift 3 ;;
       --recommend) [ $# -ge 2 ] || fail "--recommend requires an option id"; recommend=$2; shift 2 ;;
@@ -259,10 +303,15 @@ cmd_raise() {
   FM_DECISION_QUESTION=$question
   FM_DECISION_OPTIONS=${opts%$'\n'}
   FM_DECISION_OPTION_COUNT=$pos
+  FM_DECISION_CONSEQUENCES=${cons%$'\n'}
   FM_DECISION_RECOMMEND_ID=$recommend
   FM_DECISION_RECOMMEND_WHY=$because
 
-  defects=$(fm_decision_defects)
+  # Called in-process rather than through the printing wrapper: the check also
+  # publishes the coverage counters this command reports below, and a command
+  # substitution would lose them with the subshell.
+  fm_decision_defects_var
+  defects=$FM_DECISION_DEFECT_CODES
   if [ -n "$defects" ]; then
     {
       printf 'fm-decision-raise: refusing to record a decision that is not actually structured.\n'
@@ -325,6 +374,17 @@ question	$(fm_decision_encode "$question")
   done <<EOF
 $FM_DECISION_OPTIONS
 EOF
+  # Consequences follow the options as their own rows rather than being folded
+  # into them, which is what keeps the addition invisible to a reader that
+  # predates it: those rows are a kind it does not recognise, so it skips them
+  # and renders exactly the record it always did.
+  while IFS=$'\t' read -r id text; do
+    [ -n "$id$text" ] || continue
+    block="${block}consequence	$id	$text
+"
+  done <<EOF
+$FM_DECISION_CONSEQUENCES
+EOF
   block="${block}recommend	$recommend	$(fm_decision_encode "$because")
 end	$KEY
 "
@@ -332,8 +392,19 @@ end	$KEY
 
   printf '%s [key=%s]: %s\n' "$verb" "$KEY" "$note" >> "$STATUS_FILE" \
     || fail "record written to '$record' but the status line could not be appended to '$STATUS_FILE'"
-  printf 'raised %s [key=%s] with %d options; recommendation: %s\n' \
-    "$verb" "$KEY" "$FM_DECISION_OPTION_COUNT" "$recommend"
+  # A decision that declined consequences reports exactly what it always did:
+  # declining the field is not a lesser raise and must not read as one.
+  if [ "$FM_DECISION_CONSEQUENCE_COVERED" -eq 0 ]; then
+    printf 'raised %s [key=%s] with %d options; recommendation: %s\n' \
+      "$verb" "$KEY" "$FM_DECISION_OPTION_COUNT" "$recommend"
+    return 0
+  fi
+  printf 'raised %s [key=%s] with %d options, %d of them carrying a consequence; recommendation: %s\n' \
+    "$verb" "$KEY" "$FM_DECISION_OPTION_COUNT" "$FM_DECISION_CONSEQUENCE_COVERED" "$recommend"
+  # Partial coverage said in words as well as in numbers, at the moment the
+  # worker could still add the missing ones.
+  [ -z "$FM_DECISION_COVERAGE_CODE" ] \
+    || printf '  %s\n' "$(fm_decision_defect_help "$FM_DECISION_COVERAGE_CODE")"
 }
 
 # The still-open note for a key, empty when the key is not open. Read through
@@ -351,7 +422,7 @@ EOF
 }
 
 cmd_show() {
-  local as_json=0 task='' note structured=0 id label code rc=0
+  local as_json=0 task='' note structured=0 id label code consequence rc=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --status) [ $# -ge 2 ] || fail "--status requires a path"; STATUS_FILE=$2; shift 2 ;;
@@ -401,9 +472,25 @@ cmd_show() {
     [ -n "$id$label" ] || continue
     fm_decision_decode_var "$label"
     printf 'option %s: %s\n' "$id" "$FM_DECISION_VALUE"
+    # Directly under the option it belongs to, because an option and its
+    # consequence read as one thing and a separate list would make the reader
+    # do the joining that the id already did.
+    if consequence=$(fm_decision_option_consequence "$id"); then
+      printf '  => %s\n' "$consequence"
+    fi
   done <<EOF
 $FM_DECISION_OPTIONS
 EOF
+  # Silent when the decision declined the field, which is the ordinary case and
+  # not a lesser one; stated whenever any option carries a consequence, so a
+  # reader is never left to assume the ones without were argued somewhere else.
+  if [ "$FM_DECISION_CONSEQUENCE_COVERED" -gt 0 ]; then
+    printf 'consequences: %d of %d options\n' \
+      "$FM_DECISION_CONSEQUENCE_COVERED" "$FM_DECISION_OPTION_COUNT"
+    [ -z "$FM_DECISION_COVERAGE_CODE" ] \
+      || printf '  %-24s %s\n' "$FM_DECISION_COVERAGE_CODE" \
+        "$(fm_decision_defect_help "$FM_DECISION_COVERAGE_CODE")"
+  fi
   printf 'recommend: %s\n' "$FM_DECISION_RECOMMEND_ID"
   printf 'because: %s\n' "$FM_DECISION_RECOMMEND_WHY"
   return "$rc"

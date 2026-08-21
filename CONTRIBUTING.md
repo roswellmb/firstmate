@@ -13,6 +13,10 @@ A GitHub Actions check (`Require no-mistakes`) runs on PRs targeting `main` and 
 It evaluates every PR opening and body edit independently, so a later edit cannot replace an earlier pending compliance check.
 GitHub Actions and Dependabot are exempt so their automation keeps working, but regular contributor PRs without the signature will not be reviewed or merged.
 
+That signature lives in the `## Pipeline` section the pipeline writes into the PR body, so the pipeline owns that body once it has raised the PR.
+Never replace or hand-edit it: rewriting the body to add a narrative summary drops the `## Pipeline` section, and the check then fails a PR the pipeline really did raise.
+Put extra prose above that section or in a PR comment, and if the signature has already been lost, push through the gate again so the pipeline rewrites the body.
+
 ## Workflow
 
 1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent (`git@github.com:kunchenguid/firstmate.git`).
