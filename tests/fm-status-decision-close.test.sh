@@ -41,6 +41,8 @@
 #       removed, under wording that claims no authority nobody gave.
 #   (l) the substance of a deliberate close is stored whole - the durable log is
 #       the only copy - while still being exactly one line.
+#   (n) a structured decision record (bin/fm-decision-raise.sh) is removed with
+#       the status log it belongs to, so a reused task id cannot join a stale one.
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -676,6 +678,44 @@ SH
   pass "a decision opened after the gate is recorded when the log is removed, claiming no authority"
 }
 
+# --- (n) the structured record leaves with the log it belongs to ------------
+
+# A decision raised as separate fields (bin/fm-decision-raise.sh) leaves a
+# sidecar record beside the status log, joined to it by (task id, key). Task ids
+# are reused, so a record that outlived its log would silently join a later
+# task's decision to a dead one's options. Teardown must remove both.
+test_teardown_removes_the_structured_decision_record() {
+  local case_dir home record rc out
+  case_dir=$(make_teardown_case structured-record)
+  home="$case_dir/home"
+  FM_GATE_REFUSE_BYPASS=1 FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" \
+    "$ROOT/bin/fm-decision-raise.sh" raise --status "$home/state/task-x1.status" \
+      --key api-shape \
+      --question "Should the migration expose REST or gRPC?" \
+      --option-id rest "REST - every existing client already speaks it" \
+      --option-id grpc "gRPC - streaming, but a new client rollout" \
+      --recommend rest --because "No client is ready for a rollout this quarter." \
+      >/dev/null \
+    || fail "raising a structured decision against the teardown fixture failed"
+  record="$home/state/task-x1.decisions"
+  [ -f "$record" ] || fail "the raise wrote no record to tear down"
+
+  # Close it deliberately so only the removal - not the open-decision gate - is
+  # under test here; the gate itself is case (g).
+  run_close "$home" task-x1 --key api-shape \
+    --answered-elsewhere "the captain picked REST on the deck" >/dev/null \
+    || fail "the deliberate close failed"
+
+  out=$(run_teardown "$case_dir" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || fail "teardown did not complete after the decision was closed: $out"
+  [ ! -f "$home/state/task-x1.status" ] \
+    || fail "the completed teardown left the status log behind"
+  [ ! -f "$record" ] \
+    || fail "teardown removed the status log but left the decision record: $(cat "$record")"
+  pass "teardown removes a structured decision record with the log it belongs to"
+}
+
 # --- (a, concluded) the checkout is untouched -------------------------------
 
 test_checkout_is_unchanged_after_the_suite() {
@@ -701,4 +741,5 @@ test_force_refuses_when_the_record_cannot_be_written
 test_force_records_only_on_the_path_that_destroys
 test_close_substance_is_stored_whole
 test_unforced_teardown_records_a_decision_opened_after_the_gate
+test_teardown_removes_the_structured_decision_record
 test_checkout_is_unchanged_after_the_suite
