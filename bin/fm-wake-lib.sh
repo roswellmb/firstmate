@@ -793,7 +793,7 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    non-zero return as "did not get the lock" and must not proceed as if they
 #    had.
 fm_lock_acquire_wait() {  # <lockdir>
-  local lockdir=$1 budget deadline= now
+  local lockdir=$1 budget deadline='' now
   # _FM_LOCK_WAIT_BUDGET is the private, never-exported process override a
   # long-running caller sets for its OWN waits (bin/fm-watch.sh does). Reading
   # it here rather than overwriting FM_LOCK_WAIT_TIMEOUT leaves an operator's

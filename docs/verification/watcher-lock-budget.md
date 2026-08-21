@@ -27,9 +27,32 @@ N=2 max_beacon_age=77s observed_over=320s watcher_alive=yes guard_grace=300
 
 The watcher survived the wedge in all three runs and its beacon never left the 300s guard grace.
 
-Limitation, stated because the numbers invite the wrong reading: N=1 and N=2 placed one and two `state/*.check.sh` files, but their ages are indistinguishable from N=0, so the check sweep did not spend `FM_CHECK_TIMEOUT` on them.
-These runs therefore verify the contended-wait and cycle-tail terms only.
-The `FM_CHECK_TIMEOUT*N` term of the documented constraint remains an analytic bound that this measurement does not exercise, and the unbounded-N caveat recorded at the definition site is unaffected.
+### Independent corroboration
+
+Re-measured on 2026-08-21 on a clean host at pipeline head `dee201a`, with a separately written harness rather than the one above.
+It differs in three ways that matter: it samples the beacon every 0.5s and keeps the maximum instead of reading the age at cycle boundaries, it registers its probe checks through `bin/fm-check-register.sh`, and those probes genuinely sleep.
+
+Observed:
+
+```
+N=0 max_beacon_age=76s observed_over=200s watcher_alive=yes guard_grace=300
+N=1 max_beacon_age=76s observed_over=260s watcher_alive=yes guard_grace=300
+N=2 max_beacon_age=77s observed_over=320s watcher_alive=no  guard_grace=300
+```
+
+The two harnesses agree to within a second at every N.
+
+The `watcher_alive=no` on N=2 is an artifact of the instrument, not a watcher death.
+That run ended with the watcher printing `check: rearm-resurface` and leaving through `wake()` - `resurface_after_downtime` in `bin/fm-watch.sh` doing exactly its job.
+The harness's `watcher_alive` field treated any absent watcher as a death, so it could not tell a normal wake exit from one; read that row as a wake exit.
+
+### Why the per-check term stays unexercised
+
+N=1 and N=2 placed one and two `state/*.check.sh` files, yet their beacon ages are indistinguishable from N=0 in both harnesses, including the one whose probes really sleep.
+The reason is `FM_CHECK_INTERVAL` (default 300), not the probes: the sweep fires at most once per interval, and every observation window above is shorter than or barely equal to 300s, so the registered checks never ran inside the measured window however long they sleep.
+
+Exercising the `FM_CHECK_TIMEOUT*N` term therefore needs a lowered `FM_CHECK_INTERVAL` or an observation window several times longer than the interval.
+Until then it remains an analytic bound: these runs verify the contended-wait and cycle-tail terms only, and the unbounded-N caveat recorded at the definition site is unaffected.
 
 ## Coverage boundary
 

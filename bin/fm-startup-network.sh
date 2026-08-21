@@ -381,7 +381,7 @@ EOF
 }
 
 cmd_run() {  # <locked> <lock-pid> <generation>
-  local locked=$1 lock_pid=$2 generation=$3 phases started budget out rc sweep_locked=0 downgraded=0 internal=0 lease_held=0 timings stage_started
+  local locked=$1 lock_pid=$2 generation=$3 phases started budget out rc sweep_locked=0 downgrade_reason='' internal=0 lease_held=0 timings stage_started
   mkdir -p "$STATE" 2>/dev/null || return 1
   started=$(now)
   budget=$(stage_budget)
@@ -395,7 +395,7 @@ cmd_run() {  # <locked> <lock-pid> <generation>
     fm_lock_release "$PUBLISH_LOCK"
     [ "$internal" -eq 1 ] || return 1
   elif [ "$locked" = 1 ] && ! fm_session_lock_owned_by_self "$STATE"; then
-    downgraded=1
+    downgrade_reason=lock_moved
     locked=0
   fi
   if [ "$locked" = 1 ]; then
@@ -404,7 +404,7 @@ cmd_run() {  # <locked> <lock-pid> <generation>
       sweep_locked=1
       phases=probe,sweeps
     else
-      downgraded=1
+      downgrade_reason=lock_moved
     fi
   fi
 
@@ -438,17 +438,22 @@ EOF
   stage_started=$(fm_timing_now_ms)
   rc=0
   if [ "$sweep_locked" -eq 1 ]; then
+    # Two different faults land here and they are NOT interchangeable: the
+    # fleet lock moving to another session, and this worker failing to take the
+    # acquisition lease that keeps it from moving mid-sweep. Each carries its
+    # own reason so the reported line names the one that actually happened - an
+    # operator sent after the wrong session debugs the wrong thing.
     if fm_lock_acquire_wait "$STATE/.lock.acquire"; then
       lease_held=1
       if ! lock_unchanged "$lock_pid"; then
         sweep_locked=0
         phases=probe
-        downgraded=1
+        downgrade_reason=lock_moved
       fi
     else
       sweep_locked=0
       phases=probe
-      downgraded=1
+      downgrade_reason=lease_timeout
     fi
   fi
   if [ "$sweep_locked" -eq 1 ]; then
@@ -464,9 +469,15 @@ EOF
   # total even when the bound cut some of them off.
   fm_timing_record stage network-checks "$stage_started" "$phases"
 
-  if [ "$downgraded" -eq 1 ]; then
-    printf 'NETWORK_CHECKS: the fleet lock was no longer held by the session that requested these, so dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh were skipped; they belong to whichever session holds the lock now\n' >> "$out"
-  fi
+  case "$downgrade_reason" in
+    lock_moved)
+      printf 'NETWORK_CHECKS: the fleet lock was no longer held by the session that requested these, so dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh were skipped; they belong to whichever session holds the lock now\n' >> "$out"
+      ;;
+    lease_timeout)
+      printf 'NETWORK_CHECKS: could not take the fleet lock acquisition lease (%s) within the FM_LOCK_WAIT_TIMEOUT wait budget, so dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh were skipped; the fleet lock itself may still be held by the session that requested these, so rerun %s/bin/fm-startup-network.sh run --locked 1 once the lease holder has finished\n' \
+        "$STATE/.lock.acquire" "$FM_ROOT" >> "$out"
+      ;;
+  esac
   case "$rc" in
     0) publish "$generation" 'done' "$phases" "$sweep_locked" "$started" "$rc" "$out" "$timings" ;;
     124)
