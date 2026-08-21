@@ -53,10 +53,12 @@
 # worker holding one real consequence invent two, which is the padded field this
 # whole path exists to keep out. What is refused is a consequence that was
 # padded rather than written: empty, the same sentence as another option's, the
-# option's own label again, the rationale again, the question again, or one that
-# swallowed the argument while its siblings got a token. Nothing scores or
-# grades a consequence, here or in the library: whether it is TRUE or USEFUL is
-# a question only the reader can answer.
+# option's own label again, the rationale again, or the question again. Nothing
+# scores or grades a consequence, here or in the library - not even by length
+# against another consequence, which is a quality proxy wearing a shape-fact
+# costume: whether it is TRUE or USEFUL is a question only the reader can
+# answer. A terse consequence beside a detailed one is accepted, because the
+# alternative is padding the terse one to clear a bar.
 #
 # STRUCTURE IS AVAILABLE, NOT COMPULSORY. Most decisions are not multiple choice.
 # A worker that writes a plain `needs-decision: ...` line is doing something

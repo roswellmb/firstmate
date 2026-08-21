@@ -1211,23 +1211,48 @@ same-as-the-rationale|consequence-duplicates-rationale|Fewer moving parts than a
 same-as-the-question|consequence-duplicates-question|One endpoint or two?|Two services to run instead of one.
 EOF
 
-  # One field holding the whole argument while the other got a token. Both are
-  # inside the length cap, so this is the disproportion and nothing else.
-  err="$state/blob.err"
-  rc=0
-  "$RAISE" raise --status "$state/blob.status" --key blob \
-    --question "One endpoint or two?" \
-    --option "One endpoint" --option "Two endpoints" \
-    --consequence 1 "The read path stays on one service, so the cache stays warm, nothing new gets deployed, and the on-call rotation does not grow a second page target this quarter." \
-    --consequence 2 "Two." \
-    --recommend 1 --because "Fewer moving parts than a second service." \
-    >/dev/null 2>"$err" || rc=$?
-  [ "$rc" -ne 0 ] || fail "one consequence carrying the whole argument must be refused"
-  assert_grep 'consequence-carries-everything' "$err" \
-    "the field holding the whole blob must be named as that, not as a length problem"
-  assert_no_grep 'consequence-too-long' "$err" \
-    "the disproportion case must be the disproportion, not a cap it also happened to break"
   pass "every way a consequence can be pasted rather than written is refused by name"
+}
+
+# THE OTHER HALF OF THE RULING ABOVE, pinned as a positive so it cannot be
+# quietly undone: nothing compares one consequence's LENGTH against another's.
+# A check that did once lived here, and it refused honest pairs - one option
+# argued in detail beside one whose whole consequence genuinely is "Ships
+# today." Byte length cannot tell an honest terse consequence from a waved-at
+# one, because that distinction is about meaning; a ratio is a quality proxy
+# wearing a shape-fact costume, and a bar a worker must clear is a bar a worker
+# writes to. The worker's only escapes from it were padding the short
+# consequence or dropping the field - the exact compulsion this field exists to
+# avoid. What bounds the real blob is the length cap, the duplicate checks, and
+# the relay printing every consequence so a token is seen as a token.
+test_an_honest_asymmetric_pair_of_consequences_is_accepted() {
+  local state case_name terse out json long
+  long="The read path stays on one service, so the cache stays warm, nothing new gets deployed, and the on-call rotation does not grow a second page target this quarter."
+  state=$(make_state asymmetric)
+  while IFS='|' read -r case_name terse; do
+    [ -n "$case_name" ] || continue
+    out=$("$RAISE" raise --status "$state/$case_name.status" --key "$case_name" \
+      --question "One endpoint or two?" \
+      --option "One endpoint" --option "Two endpoints" \
+      --consequence 1 "$long" \
+      --consequence 2 "$terse" \
+      --recommend 1 --because "Fewer moving parts than a second service.") \
+      || fail "$case_name: a detailed consequence beside a terse one must be recorded, not refused"
+    [ "$out" = "raised needs-decision [key=$case_name] with 2 options, 2 of them carrying a consequence; recommendation: 1" ] \
+      || fail "$case_name: both options are argued, so coverage must be full, got: $out"
+    json=$("$RAISE" show --status "$state/$case_name.status" --key "$case_name" --json) \
+      || fail "$case_name: show --json must succeed for an accepted asymmetric pair"
+    assert_contains "$json" '"degenerate":[]' \
+      "$case_name: a terse consequence beside a detailed one is not a defect of any name"
+    assert_contains "$json" '"covered":2,"of":2,"partial":false' \
+      "$case_name: both options carry a consequence, so coverage is full and not partial"
+    assert_contains "$json" "\"consequence\":\"$terse\"" \
+      "$case_name: the terse consequence must be recorded as written, never padded"
+  done <<'EOF'
+against-a-sentence|Needs a store we do not run yet, so it lands after the freeze.
+against-two-words|Ships today.
+EOF
+  pass "a detailed consequence beside a terse one is accepted: nothing compares their lengths"
 }
 
 # A consequence attaches BY ID, which is the half of the contract an answering
@@ -1295,6 +1320,48 @@ test_a_faked_consequence_on_disk_is_visible_at_the_relay() {
   assert_contains "$json" '"code":"duplicate-consequences"' \
     "the machine payload must carry the defect, not just the human view"
   pass "a faked consequence on disk is malformed at the relay, not relayed as an argued option"
+}
+
+# COVERAGE MUST NEVER BE CLAIMED BY A ROW THAT IS ATTACHED TO NOTHING, and the
+# id is what decides attachment - so it is validated on the same terms an option
+# row's id is. The case that made this necessary: attachment is tested against a
+# SPACE-DELIMITED list of the record's option ids, which is sound only because
+# an option id is a slug and therefore cannot contain a space. A hand-written
+# `consequence<TAB>1 2` beside options `1` and `2` spells two ids joined by one,
+# so it matched the membership test and was credited as coverage, while the
+# per-option lookup - which matches ONE id exactly - found nothing under either.
+# The relay then printed "consequences: 1 of 2 options - the rest are unargued"
+# over a record where no option carried a consequence at all, with no banner.
+test_a_consequence_id_that_is_not_a_slug_claims_no_coverage() {
+  local state section json rc
+  state=$(make_state joined_consequence_id)
+  printf 'needs-decision [key=joined]: one endpoint or two?\n' >> "$state/joined.status"
+  {
+    printf 'decision\t1\tjoined\t1787000000\n'
+    printf 'question\tOne endpoint or two?\n'
+    printf 'option\t1\tOne endpoint\n'
+    printf 'option\t2\tTwo endpoints\n'
+    printf 'consequence\t1 2\tIt ships today.\n'
+    printf 'recommend\t1\tFewer moving parts.\n'
+    printf 'end\tjoined\n'
+  } >> "$state/joined.decisions"
+
+  section=$(drain_section "$state")
+  assert_contains "$section" 'MALFORMED DECISION RECORD (bad-consequence-option-id)' \
+    "a consequence id that is not a slug must be named by its own code at the relay"
+  assert_not_contains "$section" 'consequences: ' \
+    "a record whose only consequence attaches to nothing must claim no coverage"
+  assert_not_contains "$section" 'It ships today.' \
+    "an unattached consequence must never render as if it argued an option"
+
+  rc=0
+  json=$("$RAISE" show --status "$state/joined.status" --key joined --json) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a record with an unattachable consequence id must report failure to its caller"
+  assert_contains "$json" '"code":"bad-consequence-option-id"' \
+    "the machine payload must carry the defect under its own name"
+  assert_contains "$json" '"covered":0,"of":2,"partial":false' \
+    "nothing attached, so the payload must report zero coverage, never one of two"
+  pass "a consequence id that is not a slug is named, and is credited with no coverage"
 }
 
 # Consequence text is untrusted prose, exactly as a label is. It must not be

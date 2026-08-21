@@ -113,7 +113,7 @@ print_open_decisions_section() {
   local open task key verb note line item_bytes=220 global_bytes=4000
   local output='' used=0 shown=0 omitted=0 bytes
   local detail_used=0 detail_global=2400 detail_dropped=0 detail_over=0
-  local record detail id label consequence qn nn
+  local record detail id label qn nn
 
   open=$(scan_open_decisions_incremental "$STATE") || return 0
   [ -n "$open" ] || return 0
@@ -178,8 +178,16 @@ print_open_decisions_section() {
         # option without it adds no line at all. Untrusted prose, so it is
         # decoded one value at a time and flattened before it is capped,
         # exactly as the label above is.
-        if consequence=$(fm_decision_option_consequence "$id"); then
-          fm_decision_flatten_var "$consequence"
+        #
+        # THE ASSIGNING FORM, never the printing one: this runs once per
+        # rendered option on the path that runs at the top of every
+        # wake-handling turn, and the option count is a crewmate's number
+        # rather than a cap of ours - so a command substitution here is a fork
+        # per row of an untrusted file. Same discipline, same reason, as
+        # fm_decision_decode_var's header states for this caller.
+        fm_decision_option_consequence_var "$id"
+        if [ "$FM_DECISION_CONSEQUENCE_FOUND" -eq 1 ]; then
+          fm_decision_flatten_var "$FM_DECISION_CONSEQUENCE"
           fm_cap_line_var "        => $FM_DECISION_FLAT" $((item_bytes - 1))
           detail="$detail$FM_LINE_CAP_LINE
 "
