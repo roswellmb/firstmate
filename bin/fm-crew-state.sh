@@ -463,6 +463,9 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
     else
       # The answer belongs to another branch, so this crew's own run (if any) was
       # not reported: consult the runs list for the branch's own newest row.
+      # The same-branch-name known limit noted above applies to this bind too -
+      # the row is matched on branch name alone, which is not a worktree
+      # discriminator either.
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait

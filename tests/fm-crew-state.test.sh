@@ -1331,7 +1331,7 @@ test_unbindable_live_run_control_stale_run_alone_is_attributable() {
 
 test_unbindable_live_run_does_not_bind_a_superseded_terminal_run() {
   reset_fakes
-  local d heads tip rewritten short_tip short_rewritten out
+  local d heads tip rewritten short_tip short_rewritten out ctl
   d=$(new_case unbindable-live-run)
   heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-rebased)
   tip=${heads%% *}
@@ -1341,6 +1341,11 @@ test_unbindable_live_run_does_not_bind_a_superseded_terminal_run() {
   short_rewritten=$(git -C "$d/wt" rev-parse --short=8 "$rewritten")
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/rebased.meta" "window=fm:fm-rebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  # The crew's own task-keyed append, so the expected verdict is a real one and
+  # not merely the absence of a forbidden word.
+  printf 'working: implementing the fix\n' > "$d/state/rebased.status"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" rebased
   # The branch's live run sits on the rebased head, mid-flight at ci.
   FM_FAKE_RUN_HEAD="$rewritten"
   FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-rebased)"
@@ -1353,11 +1358,29 @@ test_unbindable_live_run_does_not_bind_a_superseded_terminal_run() {
 EOF
 )"
   out=$(run_crew_state "$d" rebased)
-  # The property, not the verdict word: the superseded run is never bound, so no
-  # terminal word can be derived from it. An unbindable run is simply absent.
+  # The unbindable run contributed nothing and the task's own keyed source
+  # answered - asserted positively, so an empty or missing line cannot pass.
+  assert_contains "$out" "state: working" "the crew's own append is what answers"
+  assert_contains "$out" "source: status-log" "and it is visibly sourced from that append"
   assert_not_contains "$out" "source: run-step" "an unbindable run must not be attributed at all"
   assert_not_contains "$out" "state: failed" "a live rebased run must never read as failed"
   assert_not_contains "$out" "cancelled" "a live rebased run must never read as cancelled"
+  # LIVENESS CONTROL, same case dir, same worktree at the same head, same fake
+  # CLI: drop only the superseding newest row and let the runs list be reached.
+  # The stale cancelled run then binds, proving it was genuinely AVAILABLE above
+  # and was declined. If this half ever stops binding, the assertions above are
+  # vacuous - they would be passing because there was nothing to misattribute -
+  # and must not be trusted.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaaa  2026-08-21 04:45
+  cancelled  fm/feat-rebased ${short_tip}  2026-08-20 23:51
+EOF
+)"
+  ctl=$(run_crew_state "$d" rebased)
+  assert_contains "$ctl" "state: failed" "liveness: the stale row binds once nothing supersedes it"
+  assert_contains "$ctl" "run cancelled" "liveness: and it is the cancelled run"
+  assert_contains "$ctl" "source: run-step" "liveness: bound through the run-step path"
   pass "a rebased live run does not bind the superseded cancelled run below it"
 }
 
@@ -1387,7 +1410,7 @@ EOF
 
 test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row() {
   reset_fakes
-  local d heads tip rewritten short_tip short_rewritten out
+  local d heads tip rewritten short_tip short_rewritten out ctl
   d=$(new_case unbindable-coarse-reach-past)
   heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-coarse-rebased)
   tip=${heads%% *}
@@ -1397,6 +1420,9 @@ test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row() {
   short_rewritten=$(git -C "$d/wt" rev-parse --short=8 "$rewritten")
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/coarserebased.meta" "window=fm:fm-coarserebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: implementing the fix\n' > "$d/state/coarserebased.status"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" coarserebased
   FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
   # Identical to the control list, plus ONE newer row for this branch that does
   # not bind. That single row is the whole difference between the two cases.
@@ -1407,9 +1433,26 @@ test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row() {
 EOF
 )"
   out=$(run_crew_state "$d" coarserebased)
+  assert_contains "$out" "state: working" "the crew's own append is what answers"
+  assert_contains "$out" "source: status-log" "and it is visibly sourced from that append"
   assert_not_contains "$out" "source: run-step" "an unbound newest row must not be attributed at all"
   assert_not_contains "$out" "state: failed" "an unbound newest row must not fall through to a stale terminal row"
   assert_not_contains "$out" "cancelled" "an unbound newest row must never read as cancelled"
+  # LIVENESS CONTROL, same case dir, same worktree at the same head, same fake
+  # CLI: the identical list with only the superseding newest row removed. The
+  # stale cancelled row then binds, proving it was genuinely AVAILABLE above and
+  # was declined. If this half ever stops binding, the assertions above are
+  # vacuous - they would be passing because there was nothing to misattribute -
+  # and must not be trusted.
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaaa  2026-08-21 04:45
+  cancelled  fm/feat-coarse-rebased ${short_tip}  2026-08-20 23:51
+EOF
+)"
+  ctl=$(run_crew_state "$d" coarserebased)
+  assert_contains "$ctl" "state: failed" "liveness: the stale row binds once nothing supersedes it"
+  assert_contains "$ctl" "run cancelled" "liveness: and it is the cancelled run"
+  assert_contains "$ctl" "source: run-step" "liveness: bound through the run-step path"
   pass "the runs-list scan never reaches past an unbound newest row"
 }
 
@@ -1422,7 +1465,7 @@ EOF
 # quiet: state/<id>.status is keyed to THIS task and cannot be another crew's.
 test_unbindable_run_still_surfaces_the_crews_own_terminal_append() {
   reset_fakes
-  local d heads tip rewritten out
+  local d heads tip rewritten out ctl
   d=$(new_case unbindable-own-append)
   heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-rebased-done)
   tip=${heads%% *}
@@ -1441,6 +1484,15 @@ test_unbindable_run_still_surfaces_the_crews_own_terminal_append() {
   assert_not_contains "$out" "source: run-step" "the unbindable run itself is still never attributed"
   assert_contains "$out" "state: done" "the crew's own terminal append still answers"
   assert_contains "$out" "source: status-log" "and it is visibly sourced from that append"
+  # LIVENESS CONTROL: the same run, moved onto the worktree head so it binds. It
+  # then answers through the run-step, proving the run really was present above
+  # and that the status log answered BECAUSE the run was unbindable, not because
+  # there was no run at all. If this half stops binding, the assertions above are
+  # vacuous and must not be trusted.
+  FM_FAKE_RUN_HEAD="$tip"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-rebased-done)"
+  ctl=$(run_crew_state "$d" rebaseddone)
+  assert_contains "$ctl" "source: run-step" "liveness: the same run binds once its head matches"
   pass "an unbindable run still lets the crew's own terminal append surface"
 }
 
