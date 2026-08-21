@@ -331,6 +331,12 @@ The update is fast-forward only: dirty, diverged, offline, and off-default targe
 Local homes share the guarded fast-forward helper, while remote updates delegate the same safety decision to the configured host through the generic transport.
 The mechanics are owned by the `/updatefirstmate` skill and firstmate's operating manual in [`AGENTS.md`](../AGENTS.md) (self-update).
 
+Updating is separate from noticing, and only the noticing happens automatically.
+Nothing else in the fleet compared a home against origin: the clone refresh above covers project clones, and the secondmate sweep converges secondmate homes to the primary's local commit, so a home could run months-old instructions, skills, and scripts and still start in silence.
+The session-start deferred network stage therefore reports how far this home - and every local secondmate home it owns - is from its origin default-branch commit, or reports that the comparison could not be made at all, which is never treated as a pass.
+It only reports: a home that fast-forwarded itself under a live validation run would be a worse failure than a stale one, so the repair stays with `/updatefirstmate` above.
+A remote-routed secondmate home is reported by that same check running in its own session start on its own host.
+
 ## Restart-proof
 
 Fleet state lives in each task's session-provider backend (tmux by hard default, herdr or cmux when selected or auto-detected, zellij/orca when explicitly selected), no-mistakes run records, status event logs, local markdown under `data/` including `data/captain.md`, `data/captain-shared.md`, and `data/learnings.md`, and persistent secondmate homes.
