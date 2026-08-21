@@ -162,33 +162,13 @@ Shared captain preferences that apply across secondmate domains live only in the
 It is gitignored, primary-authoritative, and inherited into every local and remote secondmate home through the same declared local-material channel as the other `config/` items, so a mark set in the primary home binds the whole fleet and clearing it there clears it downstream.
 The file lives in `config/` rather than on a `data/projects.md` registry line precisely because of that: the registry is per-home and propagates nowhere, and a control that binds only the home that set it is not a fleet control.
 
-One mark per line, with blank lines and `#` comments ignored:
+[`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) is the file's single reader, and its header owns the mark schema: the line format, the two kinds and who is allowed to clear each, the rule that two marks for one project resolve to the stricter, and the `--mark` output contract.
+[`bin/fm-project-mark-lib.sh`](../bin/fm-project-mark-lib.sh) owns the single copy of the refusal policy every enforcement point shares, so no two of them can reach opposite verdicts on the same mark.
 
-```
-<project-name> <kind> <YYYY-MM-DD> <reason to end of line>
-```
-
-The date is the date the mark was set, and the reason is free text to the end of the line.
-Both fields are required because a refusal that says only "blocked" cannot be acted on: the reader needs to know what was decided, when, and why.
-Two kinds exist, and they differ in who may clear them:
-
-- `excluded` is an authority state.
-  The captain decided it, the block is total, and only the captain lifts it by removing the line.
-  No condition, observation, or elapsed time clears it, and firstmate must never set or clear one on its own initiative; writing the line records a decision the captain already made.
-- `blocked-on-captain` is a feasibility state.
-  The work cannot succeed until something the captain owes arrives, so the block is partial: work that genuinely does not depend on that input may proceed on an explicit stated reason, and firstmate may observe that the named condition has been met.
-
-Two marks for the same project resolve to the stricter one.
-`bin/fm-project-mode.sh --mark <project>` is the single reader and owns the exact output contract, and `bin/fm-project-mark-lib.sh` owns the single copy of the refusal policy the enforcement points share.
-`bin/fm-spawn.sh` is the enforcement point where work starts, and refuses every ship, scout, and relaunch spawn into a marked project before any local copy, endpoint, or task record exists.
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) is the enforcement point where work starts, and refuses every ship, scout, and relaunch spawn into a marked project before any local copy, endpoint, or task record exists.
 An unparseable marks file refuses fleet-wide rather than reading as "not marked", because a marks file nobody can read may be hiding an exclusion.
-
-A relaunch is refused BEFORE the worker is stopped.
-`bin/fm-control.sh relaunch` asks the same shared policy in its preflight, alongside the other checks that prove the work is recoverable, so a mark cannot end a running task: a mark exists to stop new work, and a refusal that had already torn down the work it refuses to restart would do the opposite.
+A relaunch is refused earlier still, in [`bin/fm-control.sh`](../bin/fm-control.sh)'s preflight before the worker is stopped, because a mark exists to stop new work and a refusal that had already torn down the work it declines to restart would do the opposite of what it enforces; [`docs/agent-control.md`](agent-control.md#transactional-relaunch) owns that step and what each refusal reports.
 The spawn-side refusal stays as the backstop that catches every other route in.
-When an exclusion refuses a relaunch, the message names the recorded worktree the work is preserved in, because that work is untouched and the task can resume the moment the captain lifts the mark.
-For a `blocked-on-captain` mark, `bin/fm-control.sh <id> relaunch --despite-block "<why this task does not depend on it>"` resumes the task and records that stated reason; a relaunch with no flag resumes on the reason recorded when the task launched.
-An exclusion has no such flag at any layer.
 
 ## Operational learnings (data/learnings.md)
 

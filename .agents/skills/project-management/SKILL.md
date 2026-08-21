@@ -88,7 +88,7 @@ A mark records that the captain has decided firstmate must not quietly start wor
 Record one whenever the captain says not to work on a project, or that a project is waiting on something they owe.
 That instruction is durable state, not conversation memory: unrecorded, it dies with the session that heard it, and the next dispatch has nothing to refuse against.
 
-`docs/configuration.md` owns the `config/project-marks` schema and `bin/fm-project-mode.sh --mark` owns the reader; edit the file by hand in the primary home, one line per mark, and let the existing inherited-local-material propagation carry it to secondmate homes.
+Use the marks-file format and reader contract owned by the header of `bin/fm-project-mode.sh`, and see `docs/configuration.md` for the file's place in configuration and how it reaches every home; edit the file by hand in the primary home, one line per mark, and let the existing inherited-local-material propagation carry it to secondmate homes.
 Choose the kind by who is allowed to clear it, not by how serious the situation feels:
 
 - `excluded` when the captain decided the project is off; only they lift it.

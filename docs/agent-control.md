@@ -66,7 +66,10 @@ It is not deterministic across the verified adapters: codex and grok resume only
    For a `kind=secondmate` task, the home's identity marker must match and its child records must be readable, so a relaunch can never strand child work behind an unreadable home.
    A secondmate's own crewmates run in their own endpoints and outlive its relaunch; the relaunched secondmate reconciles them from its home's durable records at startup.
    A ship or scout task's project is checked here against this home's captain project marks, alongside the other proofs that the work is recoverable, so a mark can never end a running task.
-   [Captain project marks](configuration.md#captain-project-marks-configproject-marks) owns the kinds, the `--despite-block` acknowledgement a `blocked-on-captain` mark opens on, and what each refusal reports.
+   An `excluded` mark refuses outright, and the refusal names the recorded worktree the work is preserved in, because that work is untouched and the task can resume the moment the captain lifts the mark.
+   A `blocked-on-captain` mark refuses unless `--despite-block "<why this task does not depend on it>"` states why this one task does not depend on what the mark names, and that stated reason is recorded; a relaunch with no flag resumes on the reason recorded when the task launched, so a mark landing mid-flight never makes an in-flight task unrecoverable.
+   An exclusion has no such flag at any layer.
+   The header of [`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) owns the mark schema and its kinds, and [Captain project marks](configuration.md#captain-project-marks-configproject-marks) owns the file and how it reaches every home.
 3. **Record the note.**
    A ship or scout relaunch requires `--note`, because the replacement inherits the local copy but none of the conversation; the note is appended to the instructions it reads.
    A secondmate relaunch does not require one and never rewrites its standing charter.
