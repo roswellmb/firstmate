@@ -212,8 +212,16 @@ fm_decision_encoded_within_bound() {  # <encoded>
 # a value that reaches one must not be able to add another - a length cap bounds
 # size, it does not stop a forged line. Fork-free: this runs per rendered field
 # at the top of every wake-handling turn.
+#
+# It bounds its own input, like every other transform in this file, because the
+# value can arrive straight from a worker's command line: the five substitutions
+# below each rebuild the whole string on bash 3.2, so an unbounded value costs
+# more than linearly in its length. Every field this renders is already inside
+# its own cap by the time it gets here, so the cut is invisible to them; what it
+# does bound is the status note, which is one line of a log and is cut to the
+# same ceiling as the longest field a decision may carry.
 fm_decision_flatten_var() {  # <text> -> FM_DECISION_FLAT
-  local s=$1
+  local s=${1:0:$FM_DECISION_MAX_RAW}
   s=${s//$'\n'/ }
   s=${s//$'\r'/ }
   s=${s//$'\t'/ }

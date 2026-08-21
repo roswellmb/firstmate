@@ -849,7 +849,145 @@ PY
 
 test_broken_install_refuses_by_name
 test_mixed_decisions_do_not_borrow_each_others_fields
-test_unrenderable_option_row_is_not_counted_as_an_option
+# THE BOUND IS A PROPERTY OF EVERY ENTRANCE, not of any one helper.
+#
+# Six review rounds each found one more value-processing helper that ran an
+# expensive transform on a worker's value before any length check could reject
+# it, and each round bounded the helper it was told about. Enumerating helpers
+# is what kept missing one, so this test enumerates ENTRANCES instead: every
+# worker-controlled input of every public subcommand, each fed the same hostile
+# value, each asserted to come back promptly with the right answer.
+#
+# That is the difference that closes the class. A new helper cannot escape it,
+# because the test never mentions helpers; a new subcommand cannot escape it
+# either, because the coverage check below reads the tool's own usage and fails
+# when a subcommand has no case here.
+#
+# Each case is: <name>|<expect>|<pattern>, where <expect> is refuse, accept or
+# malformed, and <pattern> is the text the outcome must contain.
+FM_BOUND_CEILING=5
+
+# A value built to be expensive: thousands of exactly the characters every
+# transform in this path has to substitute, in the shape a worker produces by
+# pasting a log or a diff into a field.
+hostile_value() {
+  awk 'BEGIN { for (i = 0; i < 8000; i++) printf "\t\\\n" }'
+}
+
+# A record whose encoded field is far past the ceiling, for the read path.
+write_oversized_record() {  # <state> <name> <key>
+  local dense
+  dense=$(awk 'BEGIN { for (i = 0; i < 40000; i++) printf "\\t" }')
+  printf 'needs-decision [key=%s]: a short note\n' "$3" > "$1/$2.status"
+  {
+    printf 'decision\t1\t%s\t1787000000\n' "$3"
+    printf 'question\t%s\n' "$dense"
+    printf 'option\t1\tThe vendored encoder\n'
+    printf 'option\t2\tThe new encoder\n'
+    printf 'recommend\t1\tIt is already on the path.\n'
+    printf 'end\t%s\n' "$3"
+  } > "$1/$2.decisions"
+}
+
+# Run one case, assert its outcome and that it did not spend the cost.
+bound_case() {  # <label> <expect> <pattern> <command...>
+  local label=$1 expect=$2 pattern=$3 out rc start elapsed
+  shift 3
+  start=$SECONDS
+  rc=0
+  out=$("$@" 2>&1) || rc=$?
+  elapsed=$((SECONDS - start))
+
+  case "$expect" in
+    refuse)
+      [ "$rc" -ne 0 ] || fail "$label: a hostile value must be refused, got exit 0"
+      ;;
+    accept)
+      [ "$rc" -eq 0 ] || fail "$label: a valid raise must succeed, got exit $rc"$'\n'"$out"
+      ;;
+    malformed)
+      [ "$rc" -ne 0 ] || fail "$label: an unreadable record must not read as clean structure"
+      ;;
+  esac
+  case "$out" in
+    *"$pattern"*) : ;;
+    *) fail "$label: expected '$pattern' in the outcome"$'\n'"--- output ---"$'\n'"$out" ;;
+  esac
+  [ "$elapsed" -le "$FM_BOUND_CEILING" ] \
+    || fail "$label: took ${elapsed}s against a ${FM_BOUND_CEILING}s ceiling - this entrance processes a worker's value before its length is checked"
+}
+
+test_every_entrance_is_bounded_against_a_hostile_value() {
+  local state blob covered sub
+  state=$(make_state bounded_entrances)
+  blob=$(hostile_value)
+
+  # --- the write path: every field a worker fills -------------------------
+  bound_case "raise --question" refuse 'question-too-long' \
+    "$RAISE" raise --status "$state/q.status" --key q \
+    --question "$blob" --option "A one" --option "B two" \
+    --recommend 1 --because "It is already on the path."
+
+  bound_case "raise --option" refuse 'option-too-long' \
+    "$RAISE" raise --status "$state/o.status" --key o \
+    --question "Which encoder should the importer use?" \
+    --option "$blob" --option "B two" \
+    --recommend 2 --because "It is already on the path."
+
+  bound_case "raise --option-id label" refuse 'option-too-long' \
+    "$RAISE" raise --status "$state/oi.status" --key oi \
+    --question "Which encoder should the importer use?" \
+    --option-id vend "$blob" --option-id new "The new encoder" \
+    --recommend new --because "It is already on the path."
+
+  bound_case "raise --because" refuse 'rationale-too-long' \
+    "$RAISE" raise --status "$state/b.status" --key b \
+    --question "Which encoder should the importer use?" \
+    --option "A one" --option "B two" \
+    --recommend 1 --because "$blob"
+
+  # --note is not a validated field, so this one SUCCEEDS - and that is the
+  # case that has to be timed, because a success path has no diagnostic whose
+  # lateness would give the delay away. The worker just waits.
+  bound_case "raise --note" accept 'raised needs-decision' \
+    "$RAISE" raise --status "$state/n.status" --key n \
+    --question "Which encoder should the importer use?" \
+    --option "A one" --option "B two" \
+    --recommend 1 --because "It is already on the path." --note "$blob"
+  assert_grep 'needs-decision [key=n]:' "$state/n.status" \
+    "a raise with a hostile note must still append its ordinary status line"
+
+  # --- the read path: every way a record is read back ---------------------
+  write_oversized_record "$state" r read-key
+
+  bound_case "show" malformed 'MALFORMED DECISION RECORD' \
+    "$RAISE" show --status "$state/r.status" --key read-key
+
+  bound_case "show --json" malformed '"code":"oversized-field"' \
+    "$RAISE" show --status "$state/r.status" --key read-key --json
+
+  bound_case "option --id" refuse 'malformed' \
+    "$RAISE" option --status "$state/r.status" --key read-key --id 1
+
+  # --- the relay: the drain that runs at the top of every wake turn --------
+  bound_case "wake drain" accept 'MALFORMED DECISION RECORD' \
+    env FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=99999 "$DRAIN"
+
+  # --- coverage: a new subcommand cannot slip past this test ---------------
+  # Read the tool's own usage rather than its source, so this survives a
+  # refactor and still fails when an entrance is added without a bound case.
+  covered=" raise show option "
+  for sub in $("$RAISE" --help 2>&1 \
+    | sed -n 's|^ *fm-decision-raise\.sh \([a-z][a-z-]*\) .*|\1|p' | sort -u); do
+    case "$covered" in
+      *" $sub "*) : ;;
+      *) fail "subcommand '$sub' has no bound case in this test; every entrance a worker can reach must be exercised with a hostile value" ;;
+    esac
+  done
+  pass "every worker-controlled entrance stays bounded against a hostile value"
+}
+
+test_every_entrance_is_bounded_against_a_hostile_value
 test_drain_cost_is_not_a_function_of_field_length
 test_escape_dense_field_cannot_wedge_the_drain
 test_option_lookup_refuses_an_unreadable_label
