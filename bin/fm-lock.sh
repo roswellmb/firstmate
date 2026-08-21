@@ -73,7 +73,8 @@ if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
     echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
     exit 1
   fi
-  fm_lock_acquire_wait "$CLAIM_LOCK"
+  fm_lock_acquire_wait "$CLAIM_LOCK" \
+    || { echo "error: could not acquire the session claim lock" >&2; exit 1; }
 fi
 CLAIM_LOCK_HELD=1
 

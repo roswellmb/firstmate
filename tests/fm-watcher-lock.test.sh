@@ -34,6 +34,351 @@ drain_and_ack() {  # <state>
     --recovery-generation "$generation"
 }
 
+# A watcher that is signalled while it holds its own recovery-marker lock used to
+# re-enter that lock from its EXIT trap and wait on itself forever, so it never
+# released .watch.lock, stopped beating, and left arm/daemon/test teardown - all
+# of which send ONE signal and then wait(1) - blocked until a second signal
+# arrived. Pausing inside the critical section makes that a rendezvous instead of
+# a race: readlink is the first external command bin/fm-wake-lib.sh runs against
+# an already-claimed lock, so holding it there parks the watcher exactly where
+# the incident landed. Armed by the test only once the watcher is in its main
+# loop, so the pause lands after the EXIT trap is installed rather than during
+# startup, where a signal would terminate by default and prove nothing.
+install_recovery_marker_lock_fault() {  # <dir>
+  local dir=$1
+  REAL_READLINK=$(command -v readlink)
+  export REAL_READLINK
+  cat > "$dir/fakebin/readlink" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */.watcher-down.lock)
+    if [ -n "${FM_MARKER_LOCK_ARM:-}" ] && [ -e "$FM_MARKER_LOCK_ARM" ] \
+      && [ ! -e "$FM_MARKER_LOCK_READY" ] && [ -s "$1/pid" ]; then
+      printf '1\n' > "$FM_MARKER_LOCK_READY"
+      while [ ! -e "$FM_MARKER_LOCK_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$REAL_READLINK" "$@"
+SH
+  chmod +x "$dir/fakebin/readlink"
+}
+
+install_marker_quarantine_fault() {  # <dir>
+  local dir=$1
+  REAL_MKTEMP=$(command -v mktemp)
+  export REAL_MKTEMP
+  cat > "$dir/fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    */.watcher-down.invalid.XXXXXX) exit 1 ;;
+  esac
+done
+exec "$REAL_MKTEMP" "$@"
+SH
+  chmod +x "$dir/fakebin/mktemp"
+}
+
+wait_for_path() {  # <path> <ticks>
+  local path=$1 limit=$2 i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ -e "$path" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+test_watcher_signalled_inside_its_recovery_marker_lock_still_exits() {
+  local dir state fakebin out arm ready release pid status marker
+  dir=$(make_case watcher-signal-in-marker-lock)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  arm="$dir/marker-lock-arm"
+  ready="$dir/marker-lock-ready"
+  release="$dir/marker-lock-release"
+  mark_pr_check_migration_complete "$state"
+  install_recovery_marker_lock_fault "$dir"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_MARKER_LOCK_ARM="$arm" FM_MARKER_LOCK_READY="$ready" FM_MARKER_LOCK_RELEASE="$release" \
+    "$WATCH" > "$out" &
+  pid=$!
+  # The beacon is only touched inside the poll loop, so its arrival proves the
+  # EXIT trap is installed and the pause below lands in a signalled-during-cleanup
+  # window rather than during startup.
+  wait_for_path "$state/.last-watcher-beat" 100 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+  touch "$arm"
+  wait_for_path "$ready" 200 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never reached its recovery-marker critical section: $(cat "$out")"; }
+  [ "$(cat "$state/.watcher-down.lock/pid" 2>/dev/null || true)" = "$pid" ] \
+    || fail "the paused watcher does not hold its own recovery-marker lock"
+
+  # Exactly one signal, the way bin/fm-watch-arm.sh and bin/fm-supervise-daemon.sh
+  # stop a watcher before waiting on it.
+  kill -TERM "$pid" 2>/dev/null || fail "could not signal the paused watcher"
+  touch "$release"
+  wait_for_exit "$pid" 150
+  status=$?
+  [ "$status" -ne 124 ] \
+    || fail "the watcher did not exit after one signal delivered inside its recovery-marker lock"
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "the exiting watcher left its singleton lock behind"
+  # The interrupted critical section held the queue lock as well as the marker
+  # lock, so both halves must be unwound - otherwise the next fm-wake-drain pays
+  # a stale steal instead of a clean acquire.
+  [ ! -e "$state/.wake-queue.lock" ] && [ ! -L "$state/.wake-queue.lock" ] \
+    || fail "the exiting watcher left the wake-queue lock behind"
+  marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
+  case "$marker" in
+    pending:downtime:*) ;;
+    *) fail "cleanup did not publish downtime recovery state (got '$marker')" ;;
+  esac
+  pass "a watcher signalled inside its recovery-marker lock still exits and releases the singleton"
+}
+
+# A contended wake-queue lock is another process doing ordinary work, so the
+# read/reconcile path must skip the cycle and come back rather than killing the
+# watcher - which is the exact no-watcher/no-beacon symptom this branch repairs.
+# An unsafe marker is the opposite: it never resolves by retrying, so it must
+# still exit loudly. Both halves ride the same fm_recovery_marker_arm_check call
+# in the poll loop, so they are asserted together.
+test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher() {
+  local dir state out live pid i
+  dir=$(make_case watcher-armcheck-contended)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+
+  # The startup arm-check runs before the poll loop, so the lock is taken only
+  # once the watcher is provably cycling - otherwise this would test startup.
+  # The budget has to be the WATCHER's own (FM_WATCH_LOCK_WAIT_TIMEOUT): the
+  # watcher never reads the global ceiling, so setting only that one left the
+  # contended cycle sitting on the 30s default and the waits below timed out on
+  # a healthy watcher.
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_WATCH_LOCK_WAIT_TIMEOUT=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_path "$state/.last-watcher-beat" 100 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+
+  sleep 300 &
+  live=$!
+  i=0
+  until mkdir "$state/.wake-queue.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || { kill -KILL "$pid" "$live" 2>/dev/null || true
+                          wait "$pid" 2>/dev/null || true
+                          fail "could not take the wake-queue lock away from the watcher"; }
+    sleep 0.05
+  done
+  printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
+
+  # The beacon is touched at the TOP of the loop body and the contended
+  # arm-check runs further down, so ONE reappearance only proves a cycle
+  # started - it would still appear with the watcher about to die on the very
+  # contention under test. Wait for a SECOND touch: that one belongs to the
+  # following cycle, so it can only happen once the intervening cycle ran all
+  # the way through its arm-check without exiting.
+  rm -f "$state/.last-watcher-beat"
+  wait_for_path "$state/.last-watcher-beat" 200 \
+    || { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher stopped cycling while the wake-queue lock was held: $(cat "$out")"; }
+  rm -f "$state/.last-watcher-beat"
+  wait_for_path "$state/.last-watcher-beat" 300 \
+    || { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher did not survive a full cycle under the held wake-queue lock: $(cat "$out")"; }
+  kill -0 "$pid" 2>/dev/null \
+    || { kill -KILL "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher died on a contended wake-queue lock: $(cat "$out")"; }
+  grep -q "could not be consumed safely" "$out" \
+    && { kill -KILL "$pid" "$live" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "contention was misreported as an unsafe recovery marker"; }
+
+  kill -KILL "$live" 2>/dev/null || true
+  rm -rf "$state/.wake-queue.lock"
+  kill -TERM "$pid" 2>/dev/null || true
+  wait_for_exit "$pid" 150
+  pass "a contended wake-queue lock skips the cycle and leaves the watcher alive"
+}
+
+test_unsafe_recovery_marker_still_exits_the_watcher() {
+  local dir state out pid status
+  dir=$(make_case watcher-armcheck-unsafe-marker)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+  install_marker_quarantine_fault "$dir"
+
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_path "$state/.last-watcher-beat" 100 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+
+  # Unreadable marker plus a quarantine that cannot be created: unsafe, and no
+  # amount of retrying makes it safe.
+  printf 'not-a-marker-token\n' > "$state/.watcher-down"
+  wait_for_exit "$pid" 150
+  status=$?
+  [ "$status" -ne 124 ] \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "the watcher kept running with a recovery marker it could not consume"; }
+  [ "$status" -ne 0 ] \
+    || fail "the watcher exited cleanly on an unsafe recovery marker: $(cat "$out")"
+  grep -q "recovery state could not be consumed safely" "$out" \
+    || fail "the watcher did not report the unsafe recovery marker: $(cat "$out")"
+  pass "an unsafe recovery marker still exits the watcher loudly"
+}
+
+# The watcher's own locks get FM_WATCH_LOCK_WAIT_TIMEOUT, not the global
+# FM_LOCK_WAIT_TIMEOUT that is sized for the deliberate ~120s .lock.acquire
+# hold. Setting the global HIGH and the watcher budget LOW proves the split is
+# actually wired: if the watcher still read the global, it would sit on the
+# wedged lock far past the short budget and never print the give-up line.
+test_watcher_lock_waits_use_the_watch_budget_not_the_global_ceiling() {
+  local dir state out live pid waited
+  dir=$(make_case watcher-split-lock-budget)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+
+  sleep 300 &
+  live=$!
+  mkdir "$state/.wake-queue.lock"
+  printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
+
+  # Startup's own arm-check hits the wedged lock, so the give-up line is emitted
+  # before the poll loop and this stays fast.
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 \
+    FM_LOCK_WAIT_TIMEOUT=600 FM_WATCH_LOCK_WAIT_TIMEOUT=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 200
+  kill -KILL "$live" 2>/dev/null || true
+  rm -rf "$state/.wake-queue.lock"
+
+  waited=$(sed -n 's/^fm-lock: gave up after \([0-9][0-9]*\)s waiting for .*wake-queue\.lock.*/\1/p' "$out" | head -1)
+  [ -n "$waited" ] \
+    || fail "the watcher never gave up on the wedged wake-queue lock: $(cat "$out")"
+  [ "$waited" = 1 ] \
+    || fail "the watcher waited on the global ceiling (${waited}s), not the watch budget: $(cat "$out")"
+  grep -q "recovery state is locked by another process" "$out" \
+    || fail "contention was not reported as contention: $(cat "$out")"
+  pass "the watcher's own lock waits use FM_WATCH_LOCK_WAIT_TIMEOUT, not the global ceiling"
+}
+
+# The watcher budget is assigned to the watcher's whole shell, not passed at the
+# call sites someone remembered. fm_wake_append takes the same wake-queue lock
+# INTERNALLY and runs many times per poll cycle, so a per-call budget missed it
+# entirely and left that path on the 300s global. Driving a real contended
+# append (afk + a 1s heartbeat) proves the process-scoped form covers it: with a
+# per-call budget the watcher would sit on the global for ten minutes here.
+test_contended_wake_append_also_uses_the_watch_budget() {
+  local dir state out live pid status waited
+  dir=$(make_case watcher-append-budget)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+  : > "$state/.afk"
+
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_HEARTBEAT=1 \
+    FM_LOCK_WAIT_TIMEOUT=600 FM_WATCH_LOCK_WAIT_TIMEOUT=1 \
+    FM_CHECK_INTERVAL=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_path "$state/.last-watcher-beat" 200 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+
+  # Wedged only after startup, so the append inside the poll loop is the wait
+  # under test rather than the startup arm-check.
+  sleep 300 &
+  live=$!
+  i=0
+  until mkdir "$state/.wake-queue.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 400 ] || { kill -KILL "$pid" "$live" 2>/dev/null || true
+                          wait "$pid" 2>/dev/null || true
+                          fail "could not take the wake-queue lock away from the watcher"; }
+    sleep 0.05
+  done
+  printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
+
+  wait_for_exit "$pid" 400
+  status=$?
+  kill -KILL "$live" 2>/dev/null || true
+  rm -rf "$state/.wake-queue.lock"
+  [ "$status" -ne 124 ] \
+    || fail "the watcher waited on the global ceiling for a contended wake append: $(cat "$out")"
+  waited=$(sed -n 's/^fm-lock: gave up after \([0-9][0-9]*\)s waiting for .*wake-queue\.lock.*/\1/p' "$out" | tail -1)
+  [ "$waited" = 1 ] \
+    || fail "a contended wake append did not use the watch budget (got '${waited}'): $(cat "$out")"
+  pass "a contended fm_wake_append uses the watch budget, not the global ceiling"
+}
+
+test_lock_wait_returns_when_this_process_already_holds_it() {
+  local dir state out pid status
+  dir=$(make_case lock-wait-reentrant)
+  state="$dir/state"
+  out="$dir/reentrant.out"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_acquire_wait "$2" || { echo "first acquire failed"; exit 3; }
+    fm_lock_acquire_wait "$2" || { echo "second acquire failed"; exit 4; }
+    fm_lock_release "$2"
+    echo held-then-released
+  ' _ "$LIB" "$state/.reentrant.lock" > "$out" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 100
+  status=$?
+  [ "$status" -ne 124 ] \
+    || fail "fm_lock_acquire_wait waited on a lock this same process already holds"
+  [ "$status" -eq 0 ] || fail "re-entrant fm_lock_acquire_wait failed ($status): $(cat "$out")"
+  grep -qx held-then-released "$out" || fail "re-entrant acquire did not complete: $(cat "$out")"
+  [ ! -e "$state/.reentrant.lock" ] && [ ! -L "$state/.reentrant.lock" ] \
+    || fail "the re-entrant holder could not release its own lock"
+  pass "fm_lock_acquire_wait does not wait on a lock the calling process already holds"
+}
+
+test_lock_wait_gives_up_loudly_on_a_foreign_live_holder() {
+  local dir state live out pid status
+  dir=$(make_case lock-wait-foreign-holder)
+  state="$dir/state"
+  out="$dir/giveup.out"
+  sleep 300 &
+  live=$!
+  mkdir "$state/.foreign.lock"
+  printf '%s\n' "$live" > "$state/.foreign.lock/pid"
+  FM_STATE_OVERRIDE="$state" FM_LOCK_WAIT_TIMEOUT=1 bash -c '
+    . "$1"
+    fm_lock_acquire_wait "$2"
+  ' _ "$LIB" "$state/.foreign.lock" > "$out" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 150
+  status=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$status" -ne 124 ] || fail "fm_lock_acquire_wait waited past its ceiling on a live foreign holder"
+  [ "$status" -ne 0 ] || fail "fm_lock_acquire_wait reported success without the lock"
+  grep -qF "gave up after 1s waiting for $state/.foreign.lock" "$out" \
+    || fail "giving up on a live foreign holder was silent: $(cat "$out")"
+  [ "$(cat "$state/.foreign.lock/pid" 2>/dev/null || true)" = "$live" ] \
+    || fail "a live foreign holder's lock was stolen instead of waited on"
+  pass "fm_lock_acquire_wait gives up loudly rather than waiting forever on a live foreign holder"
+}
+
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
   dir=$(make_case singleton)
@@ -1099,6 +1444,13 @@ test_msys_pid_identity_uses_proc() {
 }
 
 test_singleton_start
+test_lock_wait_returns_when_this_process_already_holds_it
+test_lock_wait_gives_up_loudly_on_a_foreign_live_holder
+test_watcher_signalled_inside_its_recovery_marker_lock_still_exits
+test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher
+test_unsafe_recovery_marker_still_exits_the_watcher
+test_watcher_lock_waits_use_the_watch_budget_not_the_global_ceiling
+test_contended_wake_append_also_uses_the_watch_budget
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc

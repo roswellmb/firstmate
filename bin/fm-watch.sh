@@ -136,6 +136,15 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
+# Every lock THIS process waits on uses the watcher budget, not the global
+# ceiling that is sized for the deferred network sweep's deliberate ~120s
+# hold. Set on the whole shell rather than passed per call so it also covers
+# the locks taken inside fm_wake_append and inside the libraries sourced above.
+# _FM_LOCK_WAIT_BUDGET is private and never exported, so FM_LOCK_WAIT_TIMEOUT
+# is left exactly as the operator set it and still reaches the subprocesses
+# below, which face the long-hold locks and want the generous global.
+_FM_LOCK_WAIT_BUDGET=$FM_WATCH_LOCK_WAIT_TIMEOUT
+
 POLL=${FM_POLL:-15}                   # seconds between cycles
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
@@ -521,7 +530,10 @@ procevent_surface_queued() {
   local key reason
   PROCEVENT_SURFACED=
   [ -s "$FM_WAKE_QUEUE" ] || return 0
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  # A contended queue lock skips this cycle rather than killing the watcher: the
+  # queued procevent keys are still queued and still unmarked, so the next poll
+  # re-surfaces exactly the same set and nothing is lost.
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 0
   while IFS= read -r key; do
     case "$key" in procevent:*) ;; *) continue ;; esac
     [ -e "$(procevent_surfaced_marker "$key")" ] && continue
@@ -765,7 +777,12 @@ WATCHER_RECOVERY_PENDING=0
 if [ -n "${FM_LOCK_RECOVERED_PID:-}" ]; then
   WATCHER_RECOVERY_PENDING=1
 fi
-if ! fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER"; then
+armcheck_status=0
+fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER" || armcheck_status=$?
+if [ "$armcheck_status" -eq "$FM_RECOVERY_MARKER_CONTENDED" ]; then
+  echo "watcher: recovery state is locked by another process; not starting" >&2
+  exit 1
+elif [ "$armcheck_status" -ne 0 ]; then
   echo "watcher: recovery state could not be consumed safely; retaining stale lock evidence" >&2
   exit 1
 fi
@@ -790,6 +807,15 @@ watcher_cleanup() {
     && ! fm_recovery_transition "$WATCHER_DOWNTIME_MARKER" "$transition" "$WATCH_LOCK" downtime; then
     echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
     cleanup_status=1
+  fi
+  # A signal can unwind out of a queue-then-marker critical section
+  # (_fm_recovery_marker_arm_check holds both), leaving the outer queue lock held
+  # by a pid that is about to die. Release it only when this process is its
+  # recorded holder, never another's, and only after the marker above is
+  # published, so the outer lock still covers the marker write the way the
+  # interrupted section intended.
+  if fm_lock_held_by_current_process "$FM_WAKE_QUEUE_LOCK"; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   fi
   return "$cleanup_status"
 }
@@ -819,8 +845,16 @@ if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; the
 fi
 
 resurface_after_downtime() {
+  local status=0
   if [ "$WATCHER_RECOVERY_PENDING" -ne 1 ]; then
-    if ! fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER"; then
+    fm_recovery_marker_arm_check "$WATCHER_DOWNTIME_MARKER" || status=$?
+    # A lock another process holds is transient, and this runs every poll, so
+    # skip the cycle and re-read the marker on the next one. An unsafe marker
+    # never resolves by retrying and still exits.
+    if [ "$status" -eq "$FM_RECOVERY_MARKER_CONTENDED" ]; then
+      return 0
+    fi
+    if [ "$status" -ne 0 ]; then
       echo "watcher: recovery state could not be consumed safely" >&2
       exit 1
     fi
