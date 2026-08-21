@@ -89,6 +89,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
 projects/            cloned repos; gitignored; read-only except under hard rule 1's concrete captain-approved project operation exception
 state/               runtime records and signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
+  <id>.decisions     append-only structured decision records (question, options, recommendation) joined to an open status decision by key; written only by bin/fm-decision-raise.sh, removed by teardown, and absent for the ordinary free-text decision
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.kimi-turnend-token   firstmate-owned Kimi hook registry token for the task; removed by teardown

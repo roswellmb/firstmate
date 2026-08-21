@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-line-cap-lib.sh
 . "$SCRIPT_DIR/fm-line-cap-lib.sh"
+# shellcheck source=bin/fm-decision-lib.sh
+. "$SCRIPT_DIR/fm-decision-lib.sh"
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false
@@ -86,9 +88,24 @@ acknowledge_inactive_outcomes() { # <mode> <newline-separated-fingerprints>
 # fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold").
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
+#
+# A decision raised with separate fields (bin/fm-decision-raise.sh) prints those
+# fields here, indented under its own line, because this section is where
+# firstmate actually reads its decisions and a field flattened on the way to the
+# relay is worth nothing. The fields are joined to the fold by (task, key); the
+# fold itself is untouched and still reads only the status stream.
+#
+# A record that is present but NOT actually structured prints a MALFORMED banner
+# INSTEAD of its fields. That is the point rather than a nicety: a required field
+# with nothing checking it becomes a field holding the whole blob, so a decision
+# that arrived without a real question has to look wrong HERE, to firstmate,
+# rather than reaching the captain looking structured. A decision with no record
+# is an ordinary free-text decision and prints exactly as it always has.
 print_open_decisions_section() {
   local open task key verb note line item_bytes=220 global_bytes=4000
   local output='' used=0 shown=0 omitted=0 bytes
+  local detail_used=0 detail_global=2400 detail_dropped=0
+  local record detail id label qn nn
 
   open=$(scan_open_decisions_incremental "$STATE") || return 0
   [ -n "$open" ] || return 0
@@ -112,6 +129,45 @@ print_open_decisions_section() {
 "
     used=$((used + bytes))
     shown=$((shown + 1))
+
+    # Structured fields, joined to this folded decision by (task, key).
+    record=$(fm_decision_record_path "$STATE/$task.status")
+    fm_decision_record_read "$record" "$key" || true
+    detail=''
+    if [ -n "$FM_DECISION_DEFECTS" ]; then
+      detail="    MALFORMED DECISION RECORD ($FM_DECISION_DEFECTS) - not structured; relay the note above, not these as options
+"
+    elif [ "$FM_DECISION_FOUND" = 1 ]; then
+      # The note defaults to the question, so print the question again only when
+      # it actually differs - never hide a divergence, never pay for a repeat.
+      qn=$(fm_decision_normalise "$FM_DECISION_QUESTION")
+      nn=$(fm_decision_normalise "$note")
+      if [ "$qn" != "$nn" ]; then
+        fm_cap_line_var "    Q: $FM_DECISION_QUESTION" $((item_bytes - 1))
+        detail="$detail$FM_LINE_CAP_LINE
+"
+      fi
+      while IFS=$(printf '\t') read -r id label; do
+        [ -n "$id" ] || continue
+        fm_cap_line_var "    ($id) $label" $((item_bytes - 1))
+        detail="$detail$FM_LINE_CAP_LINE
+"
+      done <<EOD
+$FM_DECISION_OPTIONS
+EOD
+      fm_cap_line_var "    -> recommends ($FM_DECISION_RECOMMEND_ID) $FM_DECISION_RECOMMEND_WHY" \
+        $((item_bytes - 1))
+      detail="$detail$FM_LINE_CAP_LINE
+"
+    fi
+    if [ -n "$detail" ]; then
+      if [ $((detail_used + ${#detail})) -gt "$detail_global" ]; then
+        detail_dropped=$((detail_dropped + 1))
+      else
+        output="$output$detail"
+        detail_used=$((detail_used + ${#detail}))
+      fi
+    fi
   done <<EOF
 $open
 EOF
@@ -121,6 +177,11 @@ EOF
   printf '%s' "$output"
   if [ "$omitted" -gt 0 ]; then
     printf 'OPEN DECISIONS: %d more omitted (byte cap)\n' "$omitted"
+  fi
+  # Never let a bounded view read as a complete one: say what was cut.
+  if [ "$detail_dropped" -gt 0 ]; then
+    printf 'OPEN DECISIONS: fields omitted for %d (byte cap) - read them with bin/fm-decision-raise.sh show <task> --key <key>\n' \
+      "$detail_dropped"
   fi
   # Answerer-closes hint, printed at exactly the moment an answer gets written:
   # the send that answers a listed decision also closes it, so closure never
