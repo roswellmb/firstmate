@@ -29,18 +29,26 @@
 #      the same line of history). Local work that advanced past the run head, or
 #      diverged from it, invalidates attribution.
 #      Only the branch's CURRENT run is ever a candidate - the one `axi status`
-#      answers with, else the newest row for the branch in the runs list. When
-#      that run does not bind, this script reports `unknown` and stops; it never
-#      reaches past it to an older run that happens to match, and never lets a
-#      failed bind fall through to another source. The two consequential words
-#      here are `failed` and `cancelled` (`cancelled` says branch ownership has
-#      returned to the crew, which authorises a hand-push around what may be a
-#      live pipeline), so ambiguity resolves to non-terminal by construction, at
-#      one choke point, for every way the bind can fail. Until 2026-08-21 the
-#      paragraph above described an invariant the code did not hold: the coarse
-#      fallback skipped an unmatched newest row and bound an older, genuinely
-#      cancelled run pinned to the pre-rebase head, reporting a mid-flight run
-#      as `failed - run cancelled`.
+#      answers with, else the NEWEST row for the branch in the runs list. A run
+#      that does not bind is treated as NO run: it contributes nothing, never
+#      produces a verdict of its own, and attribution never reaches past it to a
+#      superseded run that happens to match. The two consequential words here are
+#      `failed` and `cancelled` (`cancelled` says branch ownership has returned
+#      to the crew, which authorises a hand-push around what may be a live
+#      pipeline), and neither is ever derived from a run this script could not
+#      bind. Until 2026-08-21 the paragraph above described an invariant the code
+#      did not hold: the coarse fallback skipped an unmatched newest row and
+#      bound an older, genuinely cancelled run pinned to the pre-rebase head,
+#      reporting a mid-flight run as `failed - run cancelled`.
+#      What this does NOT guarantee: the lookup fails open, so "could not ask"
+#      is indistinguishable from "no run exists". `nm_run` returns empty on
+#      timeout or error, and the newest-first runs scan is capped at
+#      FM_CREW_STATE_RUNS_LIMIT rows, so a timed-out `runs` call - or a branch
+#      whose own newest row sits past that cap on a busy fleet - reads as no run
+#      at all. Those land on the SAME no-run fallback as an unbindable run (4),
+#      where a terminal word can still come from the crew's own task-keyed
+#      status-log append, visibly labelled `source: status-log` - never from an
+#      attributed run.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -52,14 +60,16 @@
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
-#   4. No run for this crew (pre-validation, or kind=scout): fall back to the
-#      recorded backend's pane busy state, then the status log's last line only
-#      when its verb maps to a recognized run-state. Decision-only events such as
-#      `resolved` never become current state or detail.
+#   4. No run attributed to this crew (pre-validation, kind=scout, or a run that
+#      exists but does not bind): fall back to the recorded backend's pane busy
+#      state, then the status log's last line only when its verb maps to a
+#      recognized run-state. Both of those are keyed to THIS task
+#      (state/<id>.meta, state/<id>.status), so unlike a no-mistakes run they
+#      cannot belong to another crew. Decision-only events such as `resolved`
+#      never become current state or detail.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
-#      than trusting a stale status log. A run that exists but does not bind (2)
-#      also reports unknown · none, before any of the fallbacks in (4) run.
+#      than trusting a stale status log.
 #
 # Read-only and side-effect free. Always exits 0 on a successful read regardless
 # of state; exit 2 only on a usage error (no id).
@@ -89,9 +99,11 @@ LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
 case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
 # How many of the most recent `no-mistakes runs` rows the cross-branch fallback
-# (nm_runs_status_for_branch, below) scans. Generous enough to still find a
-# branch's own run on a busy multi-crew fleet without listing the entire
-# history every call.
+# (nm_runs_row_for_branch, below) scans for the branch's newest row; that lookup
+# only locates the row, it does not judge code identity. Generous enough to still
+# find a branch's own run on a busy multi-crew fleet without listing the entire
+# history every call. A branch whose newest row sits past this cap reads as no
+# run at all - see the fail-open note in the header.
 FM_CREW_STATE_RUNS_LIMIT=${FM_CREW_STATE_RUNS_LIMIT:-200}
 case "$FM_CREW_STATE_RUNS_LIMIT" in ''|*[!0-9]*) FM_CREW_STATE_RUNS_LIMIT=200 ;; esac
 SEP=' · '
@@ -401,45 +413,31 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"
 }
 
-# Why a run could not be bound, for the one line this script emits. Names both
-# heads so the reader can see the divergence without a second command.
-unbound_detail() {  # <run-head-or-empty>
-  local local_head
-  local_head=$(git -C "$WT" rev-parse --short=8 HEAD 2>/dev/null)
-  if [ -n "$1" ]; then
-    printf 'run head %s vs local %s; rewritten or diverged' "$1" "$local_head"
-  else
-    printf 'run reports no head; nothing to bind to local %s' "$local_head"
-  fi
-}
-
 # ATTRIBUTION is the single outcome of the whole run-lookup below, and the one
-# place a run is ever bound to this crew. It takes exactly one of four values:
+# place a run is ever bound to this crew. It takes exactly one of three values:
 #
-#   none       this branch has no run at all (pre-validation, scout, secondmate,
-#              no CLI, or the CLI did not answer) -> pane/log fallback, as before.
-#   full       the branch's current run is bound and $RUN_OUT carries its `axi
-#              status` TOON, so step/gate detail is available.
-#   coarse     the branch's current run is bound from the plain runs list, so
-#              only a bare status word is available.
-#   ambiguous  a run for this branch EXISTS but does not bind to the code
-#              identity in front of us.
+#   none    no run is attributed to this crew - either the branch has no run at
+#           all (pre-validation, scout, secondmate, no CLI, or the CLI did not
+#           answer), or the branch's current run EXISTS but does not bind to the
+#           code identity in front of us. Both mean the same thing to everything
+#           downstream: this run contributes nothing -> pane/log fallback.
+#   full    the branch's current run is bound and $RUN_OUT carries its `axi
+#           status` TOON, so step/gate detail is available.
+#   coarse  the branch's current run is bound from the plain runs list, so only
+#           a bare status word is available.
 #
-# `ambiguous` is a verdict, not a retry condition. This is the invariant the
-# 2026-08-21 misattribution broke: when this script cannot match a run to the
-# code identity in front of it, it must report that it cannot determine the
-# state, and must never resolve that ambiguity toward a terminal verdict.
-# `failed` and `cancelled` are the two most consequential words emitted here -
-# `cancelled` specifically means branch ownership has returned to the crew, and
-# a supervisor acting on it hand-pushes around what may be a live pipeline. So
-# a failed bind terminates the lookup with `unknown` rather than widening the
-# search until some run answers. There are exactly two ways the bind can fail
-# and both land here by construction, with no divergence shape special-cased:
-# `axi status` answered for this branch and its head did not bind, or the runs
-# list's newest row for this branch did not bind.
+# An unbindable run is ABSENT, not "unknown". This is the invariant the
+# 2026-08-21 misattribution broke: `failed` and `cancelled` are the two most
+# consequential words emitted here - `cancelled` specifically means branch
+# ownership has returned to the crew, and a supervisor acting on it hand-pushes
+# around what may be a live pipeline - so neither may ever be derived from a run
+# that did not bind. A failed bind therefore ends the SEARCH (it is never a
+# reason to widen it to some other run that does answer) without silencing the
+# crew's own task-keyed sources: the pane and the status log are keyed to this
+# id, so unlike a run they cannot be foreign, and a genuinely finished run whose
+# head diverged still surfaces through its own status-log append.
 ATTRIBUTION=none
 COARSE_STATUS=""
-UNBOUND_DETAIL=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
@@ -450,11 +448,17 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # This IS the branch's active-or-most-recent run, so no other run can be
       # more current: bind it or decline. Never fall through to the runs list
       # here - that list can only offer an OLDER, superseded run for the branch.
+      #
+      # KNOWN LIMIT, no available signal closes it: `axi status` and
+      # `no-mistakes runs` are repo-scoped, not worktree-scoped, so this branch
+      # name comparison is the only worktree discriminator this script has. Two
+      # worktrees checked out on the SAME branch name are indistinguishable from
+      # here, so the bind can still succeed against the other one's run and emit
+      # a terminal verdict for the wrong crew. Neither upstream surface exposes a
+      # run's worktree or path, so closing this needs that field upstream, not a
+      # heuristic here.
       if nm_run_head_matches_worktree; then
         ATTRIBUTION=full
-      else
-        ATTRIBUTION=ambiguous
-        UNBOUND_DETAIL=$(unbound_detail "$(strip_quotes "$(nm_field head)")")
       fi
     else
       # The answer belongs to another branch, so this crew's own run (if any) was
@@ -465,25 +469,14 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # for no better answer.
       coarse_row=$(nm_runs_row_for_branch "$CREW_BRANCH")
       if [ -n "$coarse_row" ]; then
-        COARSE_STATUS=${coarse_row%% *}
         coarse_sha=${coarse_row#* }
         if nm_coarse_head_matches_worktree "$coarse_sha"; then
+          COARSE_STATUS=${coarse_row%% *}
           ATTRIBUTION=coarse
-        else
-          ATTRIBUTION=ambiguous
-          COARSE_STATUS=""
-          UNBOUND_DETAIL=$(unbound_detail "$coarse_sha")
         fi
       fi
     fi
   fi
-fi
-
-# The choke point. Every path that failed to bind exits here, non-terminal, with
-# the one extra command a supervisor needs to resolve it by hand.
-if [ "$ATTRIBUTION" = ambiguous ]; then
-  emit unknown none \
-    "run on $CREW_BRANCH unbound to local code ($UNBOUND_DETAIL)${SEP}read \`no-mistakes axi status\` in the worktree"
 fi
 
 HAVE_RUN=0

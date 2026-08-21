@@ -1289,12 +1289,8 @@ test_historical_same_branch_rewritten_head_not_current() {
   out=$(run_crew_state "$d" wishlist)
   assert_not_contains "$out" "source: run-step" "historical rewritten head must not use run-step"
   assert_not_contains "$out" "parked at" "historical parked run must not mask current state"
-  # A run for this branch EXISTS but does not bind to the code in front of us,
-  # so the lookup stops there and says so. It no longer widens the search to the
-  # status log: that log is an append-only event history, and after a head
-  # rewrite nothing corroborates that its last verb is still current.
-  assert_contains "$out" "state: unknown" "an unbindable run reports undetermined state"
-  assert_contains "$out" "unbound to local code" "the verdict names why it could not bind"
+  assert_contains "$out" "source: status-log" "falls back to status-log after head mismatch"
+  assert_contains "$out" "state: working" "status-log working: remains current"
   pass "historical same-branch rewritten head is not attributed as current"
 }
 
@@ -1357,10 +1353,11 @@ test_unbindable_live_run_does_not_bind_a_superseded_terminal_run() {
 EOF
 )"
   out=$(run_crew_state "$d" rebased)
+  # The property, not the verdict word: the superseded run is never bound, so no
+  # terminal word can be derived from it. An unbindable run is simply absent.
+  assert_not_contains "$out" "source: run-step" "an unbindable run must not be attributed at all"
   assert_not_contains "$out" "state: failed" "a live rebased run must never read as failed"
   assert_not_contains "$out" "cancelled" "a live rebased run must never read as cancelled"
-  assert_not_contains "$out" "state: done" "an unbindable run must not resolve to done either"
-  assert_contains "$out" "state: unknown" "an unbindable live run reports undetermined state"
   pass "a rebased live run does not bind the superseded cancelled run below it"
 }
 
@@ -1410,10 +1407,41 @@ test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row() {
 EOF
 )"
   out=$(run_crew_state "$d" coarserebased)
+  assert_not_contains "$out" "source: run-step" "an unbound newest row must not be attributed at all"
   assert_not_contains "$out" "state: failed" "an unbound newest row must not fall through to a stale terminal row"
   assert_not_contains "$out" "cancelled" "an unbound newest row must never read as cancelled"
-  assert_contains "$out" "state: unknown" "an unbound newest runs-list row reports undetermined state"
   pass "the runs-list scan never reaches past an unbound newest row"
+}
+
+# The other half of "an unbindable run is ABSENT, not unknown": refusing to
+# derive a verdict FROM the unbindable run must not silence the crew's own
+# task-keyed sources. In the incident shape the divergence does not heal when the
+# run ends - the worktree stays at the pre-rebase head - so if a failed bind also
+# suppressed the status log, a genuinely finished crew would read undetermined
+# forever and never produce a terminal-outcome record downstream. It must not go
+# quiet: state/<id>.status is keyed to THIS task and cannot be another crew's.
+test_unbindable_run_still_surfaces_the_crews_own_terminal_append() {
+  reset_fakes
+  local d heads tip rewritten out
+  d=$(new_case unbindable-own-append)
+  heads=$(make_repo_with_rewritten_head "$d/wt" fm/feat-rebased-done)
+  tip=${heads%% *}
+  rewritten=${heads##* }
+  assert_diverged_from_worktree "$d/wt" "$tip" "$rewritten"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebaseddone.meta" "window=fm:fm-rebaseddone" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'done: PR https://github.com/o/r/pull/8 checks green\n' > "$d/state/rebaseddone.status"
+  # The branch's run finished on the rebased head, so it still cannot bind...
+  FM_FAKE_RUN_HEAD="$rewritten"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-rebased-done)"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" rebaseddone
+  out=$(run_crew_state "$d" rebaseddone)
+  assert_not_contains "$out" "source: run-step" "the unbindable run itself is still never attributed"
+  assert_contains "$out" "state: done" "the crew's own terminal append still answers"
+  assert_contains "$out" "source: status-log" "and it is visibly sourced from that append"
+  pass "an unbindable run still lets the crew's own terminal append surface"
 }
 
 # Counter-direction for the runs-list path: a genuinely failed run whose row DOES
@@ -1478,10 +1506,8 @@ test_local_advanced_past_run_head_invalidates() {
   arm_idle_record "$d/state" adv
   out=$(run_crew_state "$d" adv)
   assert_not_contains "$out" "source: run-step" "local-advanced tip must not use historical run"
-  # Same rule as the rewritten-head case: a run exists for this branch and does
-  # not bind, so the answer is "undetermined", not the status log's last verb.
-  assert_contains "$out" "state: unknown" "local-advanced tip reports undetermined state"
-  assert_contains "$out" "unbound to local code" "the verdict names why it could not bind"
+  assert_contains "$out" "source: status-log" "falls back after local advanced past run"
+  assert_contains "$out" "state: working" "status-log working: is current"
   pass "local work advanced past run head invalidates attribution"
 }
 
@@ -1499,12 +1525,9 @@ test_missing_run_head_falls_back_to_current_state() {
   arm_idle_record "$d/state" no-head
   out=$(run_crew_state "$d" no-head)
   assert_not_contains "$out" "source: run-step" "missing run head must not permit branch-only attribution"
-  # The strongest form of an unbindable run: a run exists for this branch and
-  # reports no code identity at all, so nothing can bind it and nothing else
-  # gets to answer in its place.
-  assert_contains "$out" "state: unknown" "missing run head reports undetermined state"
-  assert_contains "$out" "run reports no head" "the verdict names the missing code identity"
-  pass "missing run head reports undetermined instead of matching by branch"
+  assert_contains "$out" "source: status-log" "missing run head falls back to current state sources"
+  assert_contains "$out" "state: working" "status-log remains current after missing run head"
+  pass "missing run head falls back instead of matching by branch"
 }
 
 test_active_run_is_authoritative
@@ -1557,6 +1580,7 @@ test_unbindable_live_run_control_stale_run_alone_is_attributable
 test_unbindable_live_run_does_not_bind_a_superseded_terminal_run
 test_coarse_control_stale_row_alone_is_attributable
 test_coarse_unbound_newest_row_does_not_reach_past_to_a_stale_row
+test_unbindable_run_still_surfaces_the_crews_own_terminal_append
 test_coarse_bound_failed_row_still_reports_failed
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
