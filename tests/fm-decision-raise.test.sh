@@ -742,7 +742,7 @@ test_raise_refuses_a_recommended_blob_promptly() {
   state=$(make_state raisebound)
   status="$state/t.status"
   err="$state/err.txt"
-  blob=$(awk 'BEGIN { for (i = 0; i < 3000; i++) printf "\t" }')
+  blob=$(awk 'BEGIN { for (i = 0; i < 20000; i++) printf "\t" }')
 
   start=$SECONDS
   rc=0
@@ -760,6 +760,50 @@ test_raise_refuses_a_recommended_blob_promptly() {
   [ "$elapsed" -le 5 ] \
     || fail "refusing a recommended blob took ${elapsed}s; the raise decodes it before refusing"
   pass "a recommended blob is refused promptly, with the free-text line named"
+}
+
+# The blob does not have to be the recommended one, and it does not have to be
+# read back: a worker pastes it into --option and the raise ENCODES it on the
+# way in. The refusal is the diagnostic that points at the free-text line, so it
+# has to arrive whatever was pasted - and it must still name the ordinary cap,
+# not just the structural ceiling.
+test_raise_refuses_a_pasted_option_promptly() {
+  local state status blob err rc start elapsed
+  state=$(make_state encodebound)
+  status="$state/t.status"
+  err="$state/err.txt"
+  blob=$(awk 'BEGIN { for (i = 0; i < 20000; i++) printf "\t" }')
+
+  start=$SECONDS
+  rc=0
+  "$RAISE" raise --status "$status" --key k \
+    --question "Which encoder should the importer use?" \
+    --option "$blob" --option "The new encoder" \
+    --recommend 2 --because "It is already on the path." >/dev/null 2>"$err" || rc=$?
+  elapsed=$((SECONDS - start))
+
+  [ "$rc" -ne 0 ] || fail "a raise carrying a pasted option must be refused"
+  assert_grep 'option-too-long' "$err" \
+    "the refusal must name the ordinary option cap the worker actually exceeded"
+  assert_grep 'raise it as free text' "$err" \
+    "the refusal must point at the free-text line"
+  assert_absent "$status" "a refused raise must not append a status line"
+  assert_absent "${status%.status}.decisions" "a refused raise must not write a record"
+  [ "$elapsed" -le 5 ] \
+    || fail "refusing a pasted option took ${elapsed}s; the raise encodes it before checking its length"
+
+  # The same blob under an explicit option id takes the other handler.
+  start=$SECONDS
+  rc=0
+  "$RAISE" raise --status "$status" --key k2 \
+    --question "Which encoder should the importer use?" \
+    --option-id vend "$blob" --option-id new "The new encoder" \
+    --recommend new --because "It is already on the path." >/dev/null 2>"$err" || rc=$?
+  elapsed=$((SECONDS - start))
+  [ "$rc" -ne 0 ] || fail "a raise carrying a pasted --option-id label must be refused"
+  [ "$elapsed" -le 5 ] \
+    || fail "refusing a pasted --option-id label took ${elapsed}s; that handler encodes before checking"
+  pass "a pasted option label is refused promptly by both option handlers"
 }
 
 # The property the blank-line case was one instance of: a crewmate's value
@@ -810,6 +854,7 @@ test_drain_cost_is_not_a_function_of_field_length
 test_escape_dense_field_cannot_wedge_the_drain
 test_option_lookup_refuses_an_unreadable_label
 test_raise_refuses_a_recommended_blob_promptly
+test_raise_refuses_a_pasted_option_promptly
 test_awkward_values_round_trip_through_the_json_payload
 test_option_label_cannot_mint_an_option
 test_digest_cannot_be_forged_by_field_prose

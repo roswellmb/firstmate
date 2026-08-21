@@ -93,18 +93,38 @@ FM_DECISION_MAX_FILE_BYTES=262144
 # Rejecting it cannot change a verdict - it only declines to spend the work of
 # reaching one that is already certain. The exact per-field cap still decides
 # every field that clears this ceiling.
-FM_DECISION_MAX_ENCODED=$FM_DECISION_MAX_QUESTION
-[ "$FM_DECISION_MAX_OPTION" -le "$FM_DECISION_MAX_ENCODED" ] \
-  || FM_DECISION_MAX_ENCODED=$FM_DECISION_MAX_OPTION
-[ "$FM_DECISION_MAX_RATIONALE" -le "$FM_DECISION_MAX_ENCODED" ] \
-  || FM_DECISION_MAX_ENCODED=$FM_DECISION_MAX_RATIONALE
-FM_DECISION_MAX_ENCODED=$((2 * FM_DECISION_MAX_ENCODED))
+#
+# FM_DECISION_MAX_RAW is the same ceiling stated for a value that has not been
+# encoded yet: one past the largest cap, so a value longer than it has already
+# failed whichever cap applies to it. Both directions of the wire format cut
+# their input to their own ceiling, so no value a worker supplies can reach an
+# expensive transform before a length check has had the chance to reject it.
+FM_DECISION_MAX_RAW=$FM_DECISION_MAX_QUESTION
+[ "$FM_DECISION_MAX_OPTION" -le "$FM_DECISION_MAX_RAW" ] \
+  || FM_DECISION_MAX_RAW=$FM_DECISION_MAX_OPTION
+[ "$FM_DECISION_MAX_RATIONALE" -le "$FM_DECISION_MAX_RAW" ] \
+  || FM_DECISION_MAX_RAW=$FM_DECISION_MAX_RATIONALE
+FM_DECISION_MAX_ENCODED=$((2 * FM_DECISION_MAX_RAW))
+FM_DECISION_MAX_RAW=$((FM_DECISION_MAX_RAW + 1))
 
 # --- value encoding ---------------------------------------------------------
 # Encode one field value so it cannot contain a raw TAB or newline. Backslash is
 # escaped FIRST so decoding is unambiguous.
+#
+# THIS FUNCTION APPLIES THE BOUND, on the same terms and for the same reason as
+# fm_decision_decode_var applies it in the other direction: bash 3.2 rebuilds
+# the whole string on every substitution match, so encoding an unbounded value
+# costs more than linearly in its length, and the value here comes straight off
+# a worker's command line. Cutting to FM_DECISION_MAX_RAW makes the work
+# constant however much prose was pasted.
+#
+# The cut cannot reach anything that gets STORED. A value bound for the record
+# is encoded only after fm_decision_defects has passed it, so it is already
+# inside its own cap and shorter than this ceiling; a value still awaiting that
+# check is one the validator will reject, because what survives the cut is
+# longer than every cap and still trips the same *-too-long code it would have.
 fm_decision_encode() {  # <value> -> encoded on stdout
-  local s=$1
+  local s=${1:0:$FM_DECISION_MAX_RAW}
   s=${s//\\/\\\\}
   s=${s//$'\t'/\\t}
   s=${s//$'\n'/\\n}
@@ -232,22 +252,16 @@ fm_decision_option_id_valid() {  # <id>
 # every pattern-substitution match, so folding an unbounded value costs more
 # than linearly in its length - and a worker's status note has no length limit.
 # Firstmate's supervision latency must not be a function of what a crewmate
-# wrote, so the value is cut to FM_DECISION_NORMALISE_BOUND first and the work
-# below is therefore constant however long the input is.
+# wrote, so the value is cut to FM_DECISION_MAX_RAW first and the work below is
+# therefore constant however long the input is.
 #
 # The bound is one past the LARGEST field cap, which is what makes the cut
 # invisible to every verdict this function feeds: a value that passes its length
 # check is shorter than the bound and is normalised in full, so the duplicate
 # checks are exact; a value long enough to be cut here has already failed its
 # cap and made the record degenerate whatever the duplicate checks then say.
-FM_DECISION_NORMALISE_BOUND=$((FM_DECISION_MAX_QUESTION + 1))
-[ "$FM_DECISION_MAX_OPTION" -lt "$FM_DECISION_NORMALISE_BOUND" ] \
-  || FM_DECISION_NORMALISE_BOUND=$((FM_DECISION_MAX_OPTION + 1))
-[ "$FM_DECISION_MAX_RATIONALE" -lt "$FM_DECISION_NORMALISE_BOUND" ] \
-  || FM_DECISION_NORMALISE_BOUND=$((FM_DECISION_MAX_RATIONALE + 1))
-
 fm_decision_normalise_var() {  # <text> -> FM_DECISION_NORM
-  local s=${1:0:$FM_DECISION_NORMALISE_BOUND}
+  local s=${1:0:$FM_DECISION_MAX_RAW}
   s=${s//A/a}; s=${s//B/b}; s=${s//C/c}; s=${s//D/d}; s=${s//E/e}
   s=${s//F/f}; s=${s//G/g}; s=${s//H/h}; s=${s//I/i}; s=${s//J/j}
   s=${s//K/k}; s=${s//L/l}; s=${s//M/m}; s=${s//N/n}; s=${s//O/o}
