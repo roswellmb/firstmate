@@ -101,24 +101,36 @@ fm_decision_encode() {  # <value> -> encoded on stdout
 #
 # Assigns rather than prints so a caller on the drain path never pays a command
 # substitution per option.
+#
+# It also moves a RUN at a time rather than a character at a time. Every string
+# operation in bash copies the whole remaining string, so stepping one character
+# per iteration costs more than linearly in the value's length, and this runs on
+# every field of every open decision on every drain. Text carrying no escape -
+# which is what ordinary prose is - is therefore copied once, and the loop turns
+# only as many times as the value has escapes to resolve.
 fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE
-  local s=$1 out='' c rest bs=$'\\'
-  while [ -n "$s" ]; do
-    c=${s%"${s#?}"}
-    rest=${s#?}
-    if [ "$c" = "$bs" ] && [ -n "$rest" ]; then
-      c=${rest%"${rest#?}"}
-      rest=${rest#?}
-      case "$c" in
-        t) out="$out"$'\t' ;;
-        n) out="$out"$'\n' ;;
-        r) out="$out"$'\r' ;;
-        "$bs") out="$out$bs" ;;
-        *) out="$out\\$c" ;;
-      esac
-    else
-      out="$out$c"
+  local s=$1 out='' head rest c bs=$'\\'
+  while :; do
+    case "$s" in
+      *"$bs"*) : ;;
+      *) out="$out$s"; break ;;
+    esac
+    head=${s%%"$bs"*}
+    out="$out$head"
+    rest=${s#*"$bs"}
+    if [ -z "$rest" ]; then
+      out="$out$bs"
+      break
     fi
+    c=${rest%"${rest#?}"}
+    rest=${rest#?}
+    case "$c" in
+      t) out="$out"$'\t' ;;
+      n) out="$out"$'\n' ;;
+      r) out="$out"$'\r' ;;
+      "$bs") out="$out$bs" ;;
+      *) out="$out$bs$c" ;;
+    esac
     s=$rest
   done
   FM_DECISION_VALUE=$out
@@ -166,8 +178,27 @@ fm_decision_option_id_valid() {  # <id>
 # every open decision on every drain, and bin/fm-line-cap-lib.sh documents the
 # same intent for the same caller: this path must never pay a process per item.
 # Bash 3.2 has no ${var,,}, so the case fold is 26 substitutions instead.
+#
+# COST IS BOUNDED, NOT MERELY FORK-FREE. Bash 3.2 rebuilds the whole string on
+# every pattern-substitution match, so folding an unbounded value costs more
+# than linearly in its length - and a worker's status note has no length limit.
+# Firstmate's supervision latency must not be a function of what a crewmate
+# wrote, so the value is cut to FM_DECISION_NORMALISE_BOUND first and the work
+# below is therefore constant however long the input is.
+#
+# The bound is one past the LARGEST field cap, which is what makes the cut
+# invisible to every verdict this function feeds: a value that passes its length
+# check is shorter than the bound and is normalised in full, so the duplicate
+# checks are exact; a value long enough to be cut here has already failed its
+# cap and made the record degenerate whatever the duplicate checks then say.
+FM_DECISION_NORMALISE_BOUND=$((FM_DECISION_MAX_QUESTION + 1))
+[ "$FM_DECISION_MAX_OPTION" -lt "$FM_DECISION_NORMALISE_BOUND" ] \
+  || FM_DECISION_NORMALISE_BOUND=$((FM_DECISION_MAX_OPTION + 1))
+[ "$FM_DECISION_MAX_RATIONALE" -lt "$FM_DECISION_NORMALISE_BOUND" ] \
+  || FM_DECISION_NORMALISE_BOUND=$((FM_DECISION_MAX_RATIONALE + 1))
+
 fm_decision_normalise_var() {  # <text> -> FM_DECISION_NORM
-  local s=$1
+  local s=${1:0:$FM_DECISION_NORMALISE_BOUND}
   s=${s//A/a}; s=${s//B/b}; s=${s//C/c}; s=${s//D/d}; s=${s//E/e}
   s=${s//F/f}; s=${s//G/g}; s=${s//H/h}; s=${s//I/i}; s=${s//J/j}
   s=${s//K/k}; s=${s//L/l}; s=${s//M/m}; s=${s//N/n}; s=${s//O/o}
@@ -299,6 +330,13 @@ EOF
         ;;
       option)
         [ "$in_block" -eq 1 ] || continue
+        # ONE rule decides what an option row IS, and it governs the accumulator
+        # and the count in the same breath. A row every consumer would skip must
+        # not be counted as an option by the validator, or a record can satisfy
+        # too-few-options while rendering as a single option - the degeneracy
+        # check bypassing itself. A row dropped here is not absorbed: the record
+        # simply has fewer options, which is what makes it degenerate.
+        [ -n "$a$b" ] || continue
         # The label stays ENCODED here. Decoding it into this accumulator is
         # what would let a label carrying a newline mint an extra option row
         # with an id of its own choosing; fm_decision_defects and every

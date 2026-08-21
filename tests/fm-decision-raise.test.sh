@@ -585,8 +585,126 @@ test_duplicate_detection_ignores_case_whitespace_and_punctuation() {
   pass "duplicate detection stays case-, whitespace- and punctuation-insensitive"
 }
 
+# A row no consumer will render must not be counted as an option by the
+# validator, or a one-option "choice" passes the degeneracy check and reaches
+# firstmate looking like a real one - the check bypassing itself.
+test_unrenderable_option_row_is_not_counted_as_an_option() {
+  local state status json section rc
+  state=$(make_state emptyrow)
+  status="$state/t.status"
+  printf 'needs-decision [key=k]: which encoder?\n' > "$status"
+  {
+    printf 'decision\t1\tk\t1787000000\n'
+    printf 'question\tWhich encoder should the importer use?\n'
+    printf 'option\t\t\n'
+    printf 'option\t2\tUse the new one\n'
+    printf 'recommend\t2\tIt is smaller and already vendored.\n'
+    printf 'end\tk\n'
+  } > "$state/t.decisions"
+
+  rc=0
+  json=$("$RAISE" show --status "$status" --key k --json) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a record with only one renderable option must not read as clean structure"
+  assert_contains "$json" '"code":"too-few-options"' \
+    "an option row nobody renders must not satisfy the two-option requirement"
+
+  section=$(drain_section "$state")
+  assert_contains "$section" 'MALFORMED DECISION RECORD' \
+    "the relay must mark a single-option record rather than presenting it as a choice"
+  assert_not_contains "$section" '(2) Use the new one' \
+    "a malformed record's fields must not be rendered as options"
+  pass "a row no consumer renders is never counted as an option"
+}
+
+# Reading and checking a decision record runs at the top of every wake-handling
+# turn, for every open decision, so its cost must not be a function of how much
+# prose a worker put in a field. A record can hold a field far longer than any
+# cap - that is exactly the record this fold has to recognise as degenerate -
+# and recognising it must not cost more than rendering a sound one.
+#
+# The note here stays short on purpose: this bounds the decision record's own
+# cost, not the status-log fold that bin/fm-classify-lib.sh owns.
+test_drain_cost_is_not_a_function_of_field_length() {
+  local state status baseline big_elapsed start section huge
+  state=$(make_state bounded)
+  status="$state/t.status"
+  raise_sound "$status" retry-budget >/dev/null || fail "raising failed"
+
+  start=$SECONDS
+  drain_section "$state" >/dev/null
+  baseline=$((SECONDS - start))
+
+  huge=$(awk 'BEGIN { s = "Which Encoder Should The Importer Use In This Particular Pass? "
+    while (length(out) < 8000) out = out s; printf "%s", substr(out, 1, 8000) }')
+  printf 'needs-decision [key=huge]: a short note\n' >> "$state/big.status"
+  {
+    printf 'decision\t1\thuge\t1787000000\n'
+    printf 'question\t%s\n' "$huge"
+    printf 'option\t1\tThe vendored encoder\n'
+    printf 'option\t2\tThe new encoder\n'
+    printf 'recommend\t1\tIt is already on the path.\n'
+    printf 'end\thuge\n'
+  } > "$state/big.decisions"
+
+  start=$SECONDS
+  section=$(drain_section "$state")
+  big_elapsed=$((SECONDS - start))
+
+  assert_contains "$section" 'question-too-long' \
+    "an over-long field must still be recognised and named at the relay"
+  # Generous: a drain's fixed cost dominates, so an 8 KB field must add no
+  # measurable time. Any per-character walk blows straight through this.
+  [ "$big_elapsed" -le $((baseline + 5)) ] \
+    || fail "an 8 KB record field made one drain take ${big_elapsed}s against a ${baseline}s baseline; reading a decision record is not bounded"
+  pass "an over-long record field costs the drain no more than a sound one"
+}
+
+# The property the blank-line case was one instance of: a crewmate's value
+# crosses raise, the record and the JSON payload unchanged. The payload is the
+# layer a rendering surface reads, so a divergence here shows the captain
+# something the crewmate never wrote.
+test_awkward_values_round_trip_through_the_json_payload() {
+  local state status json label because tab
+  state=$(make_state roundtrip)
+  status="$state/t.status"
+  tab=$(printf '\t')
+  label="a label with${tab}a tab, a \"quote\", a \\ backslash and a trailing one \\"
+  because=$(printf 'Line one with a \\ backslash.\n\nLine three after a blank line, with a "quote" and a\ttab.')
+
+  "$RAISE" raise --status "$status" --key round \
+    --question "Which encoder should the importer use?" \
+    --option "$label" --option "An altogether different second option" \
+    --recommend 1 --because "$because" >/dev/null \
+    || fail "raising with awkward values failed"
+
+  json=$("$RAISE" show --status "$status" --key round --json) \
+    || fail "show --json failed for awkward values"
+
+  # Decode the payload and compare against exactly what was handed to the raise.
+  FM_EXPECT_LABEL=$label FM_EXPECT_BECAUSE=$because FM_JSON=$json python3 - <<'PY' \
+    || fail "the JSON payload did not decode back to the values the raise was given"
+import json, os, sys
+d = json.loads(os.environ["FM_JSON"])
+opts = d["options"]
+if len(opts) != 2:
+    sys.exit("expected 2 options, got %d" % len(opts))
+if opts[0]["label"] != os.environ["FM_EXPECT_LABEL"]:
+    sys.exit("label differs:\n got %r\nwant %r" % (opts[0]["label"], os.environ["FM_EXPECT_LABEL"]))
+if d["recommend"]["because"] != os.environ["FM_EXPECT_BECAUSE"]:
+    sys.exit("because differs:\n got %r\nwant %r" % (d["recommend"]["because"], os.environ["FM_EXPECT_BECAUSE"]))
+PY
+
+  # And the values really did travel through the record, one row per option.
+  [ "$(grep -c '^option	' "$state/t.decisions")" = 2 ] \
+    || fail "the record must hold exactly one row per option whatever the labels contain"
+  pass "awkward values cross the raise, the record and the JSON payload unchanged"
+}
+
 test_broken_install_refuses_by_name
 test_mixed_decisions_do_not_borrow_each_others_fields
+test_unrenderable_option_row_is_not_counted_as_an_option
+test_drain_cost_is_not_a_function_of_field_length
+test_awkward_values_round_trip_through_the_json_payload
 test_option_label_cannot_mint_an_option
 test_digest_cannot_be_forged_by_field_prose
 test_json_payload_preserves_a_blank_line
