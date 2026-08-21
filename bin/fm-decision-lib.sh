@@ -45,6 +45,13 @@
 # untrusted prose ever naming a button. Ids default to the option's 1-based
 # ordinal ("1", "2", ...) so the common case needs no ceremony.
 #
+# The separation only holds if the encoding does, so FM_DECISION_OPTIONS - the
+# in-memory option list, which is itself TAB/newline delimited - holds ENCODED
+# labels from parse to render, and each label is decoded only where exactly one
+# of them is being used. A decoded label put back into that list would let a
+# label carrying a newline mint an option under an id of its own choosing,
+# which is the identity contract failing at the last hop rather than the first.
+#
 # DEGENERACY - fields that can be faked are prose with extra steps.
 # A required field with nothing checking it becomes a field holding the whole
 # blob pasted three times, so fm_decision_defects is the ONE place that decides
@@ -82,9 +89,19 @@ fm_decision_encode() {  # <value> -> encoded on stdout
   printf '%s' "$s"
 }
 
-# Decode one encoded field value. Walks left to right so an escaped backslash is
-# never re-interpreted as introducing an escape.
-fm_decision_decode() {  # <encoded> -> value on stdout
+# Decode one encoded field value into FM_DECISION_VALUE. Walks left to right so
+# an escaped backslash is never re-interpreted as introducing an escape.
+#
+# DECODING IS THE BOUNDARY. An encoded value cannot hold a raw TAB or newline,
+# so it can never forge a field or a block boundary; a DECODED one can hold
+# both. Every accumulator that keeps more than one value - FM_DECISION_OPTIONS
+# above all - therefore holds ENCODED values, and decoding happens only at the
+# point a single value is finally used (measured, compared or rendered). A
+# decoded value must never be put back into a delimited structure.
+#
+# Assigns rather than prints so a caller on the drain path never pays a command
+# substitution per option.
+fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE
   local s=$1 out='' c rest bs=$'\\'
   while [ -n "$s" ]; do
     c=${s%"${s#?}"}
@@ -104,8 +121,30 @@ fm_decision_decode() {  # <encoded> -> value on stdout
     fi
     s=$rest
   done
-  printf '%s' "$out"
+  FM_DECISION_VALUE=$out
 }
+FM_DECISION_VALUE=
+
+# --- flattening for single-line surfaces ------------------------------------
+# Fold a value onto ONE line: every newline, CR, TAB and other whitespace run
+# becomes a single space, and the ends are trimmed. A digest line is a line, so
+# a value that reaches one must not be able to add another - a length cap bounds
+# size, it does not stop a forged line. Fork-free: this runs per rendered field
+# at the top of every wake-handling turn.
+fm_decision_flatten_var() {  # <text> -> FM_DECISION_FLAT
+  local s=$1
+  s=${s//$'\n'/ }
+  s=${s//$'\r'/ }
+  s=${s//$'\t'/ }
+  s=${s//$'\v'/ }
+  s=${s//$'\f'/ }
+  while [ "$s" != "${s//  / }" ]; do s=${s//  / }; done
+  s=${s# }
+  s=${s% }
+  FM_DECISION_FLAT=$s
+}
+# shellcheck disable=SC2034 # read by this library's callers (the wake digest and the raise command), not here.
+FM_DECISION_FLAT=
 
 # --- identifiers ------------------------------------------------------------
 # An option id uses the SAME charset as a decision key (fm-classify-lib.sh's
@@ -122,12 +161,36 @@ fm_decision_option_id_valid() {  # <id>
 # Lowercase, collapse whitespace, drop trailing sentence punctuation. Two fields
 # that normalise equal are the same text pasted twice, whatever their casing or
 # trailing period.
-fm_decision_normalise() {  # <text> -> normalised on stdout
-  printf '%s' "$1" \
-    | tr '[:upper:]' '[:lower:]' \
-    | tr -s '[:space:]' ' ' \
-    | sed -e 's/^ //' -e 's/ $//' -e 's/[.?!]*$//'
+#
+# Builtins only - no tr, no sed, no subshell. This is called for every field of
+# every open decision on every drain, and bin/fm-line-cap-lib.sh documents the
+# same intent for the same caller: this path must never pay a process per item.
+# Bash 3.2 has no ${var,,}, so the case fold is 26 substitutions instead.
+fm_decision_normalise_var() {  # <text> -> FM_DECISION_NORM
+  local s=$1
+  s=${s//A/a}; s=${s//B/b}; s=${s//C/c}; s=${s//D/d}; s=${s//E/e}
+  s=${s//F/f}; s=${s//G/g}; s=${s//H/h}; s=${s//I/i}; s=${s//J/j}
+  s=${s//K/k}; s=${s//L/l}; s=${s//M/m}; s=${s//N/n}; s=${s//O/o}
+  s=${s//P/p}; s=${s//Q/q}; s=${s//R/r}; s=${s//S/s}; s=${s//T/t}
+  s=${s//U/u}; s=${s//V/v}; s=${s//W/w}; s=${s//X/x}; s=${s//Y/y}
+  s=${s//Z/z}
+  s=${s//$'\n'/ }
+  s=${s//$'\r'/ }
+  s=${s//$'\t'/ }
+  s=${s//$'\v'/ }
+  s=${s//$'\f'/ }
+  while [ "$s" != "${s//  / }" ]; do s=${s//  / }; done
+  s=${s# }
+  s=${s% }
+  while :; do
+    case "$s" in
+      *[.?!]) s=${s%?} ;;
+      *) break ;;
+    esac
+  done
+  FM_DECISION_NORM=$s
 }
+FM_DECISION_NORM=
 
 # --- parsed-record globals --------------------------------------------------
 # Set by fm_decision_record_read and read by that function's CALLERS
@@ -157,12 +220,16 @@ fm_decision_record_path() {  # <status-file> -> record path on stdout
 # Look up one option's label. Prints the label and returns 0 when <id> is an
 # option of the record currently parsed; returns 1 when it is not. This is the
 # check that turns an answer into an answer instead of a coin flip.
+#
+# FM_DECISION_OPTIONS holds ENCODED labels (see fm_decision_decode_var), so this
+# is one of the few places allowed to decode: it hands back exactly one label.
 fm_decision_option_label() {  # <id> -> label on stdout
   local want=$1 id label
   while IFS=$'\t' read -r id label; do
-    [ -n "$id" ] || continue
+    [ -n "$id$label" ] || continue
     if [ "$id" = "$want" ]; then
-      printf '%s' "$label"
+      fm_decision_decode_var "$label"
+      printf '%s' "$FM_DECISION_VALUE"
       return 0
     fi
   done <<EOF
@@ -193,7 +260,11 @@ fm_decision_record_read() {  # <record-file> <key>
   local saw_truncated=0 bytes
 
   fm_decision_reset
-  [ -n "$file" ] && [ -f "$file" ] || return 1
+  # The same guard the sibling fold uses on the status log this record is joined
+  # to (bin/fm-classify-lib.sh's status_open_decisions): a record file that is
+  # itself a symlink - e.g. escaping the state directory - is rejected outright
+  # with a plain builtin check before any read.
+  [ -n "$file" ] && [ -f "$file" ] && [ -r "$file" ] && [ ! -L "$file" ] || return 1
 
   bytes=$(wc -c < "$file" 2>/dev/null || echo 0)
   bytes=${bytes//[[:space:]]/}
@@ -222,19 +293,25 @@ EOF
         ;;
       question)
         [ "$in_block" -eq 1 ] || continue
-        blk_q=$(fm_decision_decode "$a")
+        fm_decision_decode_var "$a"
+        blk_q=$FM_DECISION_VALUE
         blk_seen_q=1
         ;;
       option)
         [ "$in_block" -eq 1 ] || continue
-        blk_opts="$blk_opts$a	$(fm_decision_decode "$b")
+        # The label stays ENCODED here. Decoding it into this accumulator is
+        # what would let a label carrying a newline mint an extra option row
+        # with an id of its own choosing; fm_decision_defects and every
+        # renderer decode one label at a time instead.
+        blk_opts="$blk_opts$a	$b
 "
         blk_count=$((blk_count + 1))
         ;;
       recommend)
         [ "$in_block" -eq 1 ] || continue
         blk_rid=$a
-        blk_why=$(fm_decision_decode "$b")
+        fm_decision_decode_var "$b"
+        blk_why=$FM_DECISION_VALUE
         ;;
       end)
         [ "$in_block" -eq 1 ] || continue
@@ -263,7 +340,8 @@ EOF
     return 1
   fi
 
-  FM_DECISION_DEFECTS=$(fm_decision_defects)
+  fm_decision_defects_var
+  FM_DECISION_DEFECTS=$FM_DECISION_DEFECT_CODES
   return 0
 }
 
@@ -277,31 +355,39 @@ EOF
 # it is missing, or it holds text that was pasted rather than written for it.
 # The duplicate checks are what make the fields unfakeable by padding: pasting
 # the same blob into question, option and rationale is exactly what they detect.
-fm_decision_defects() {  # -> defect codes on stdout
-  local d='' id label ids='' norms='' n qn rn seen
+# Builtins only, for the same reason fm_decision_normalise_var is: every reader
+# re-runs this on every drain.
+fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
+  local d='' id label text ids='' norms=$'\n' n qn rn code out=''
   local dup_opt=0 empty_opt=0 long_opt=0 bad_id=0 dup_id=0
 
-  qn=$(fm_decision_normalise "$FM_DECISION_QUESTION")
-  rn=$(fm_decision_normalise "$FM_DECISION_RECOMMEND_WHY")
+  fm_decision_normalise_var "$FM_DECISION_QUESTION"; qn=$FM_DECISION_NORM
+  fm_decision_normalise_var "$FM_DECISION_RECOMMEND_WHY"; rn=$FM_DECISION_NORM
 
   [ -n "$qn" ] || d="$d no-question"
   [ "${#FM_DECISION_QUESTION}" -le "$FM_DECISION_MAX_QUESTION" ] || d="$d question-too-long"
 
   while IFS=$'\t' read -r id label; do
-    [ -n "$id" ] || continue
+    # Only a wholly empty accumulator line is skipped, so a row that carries a
+    # label under an EMPTY or non-slug id still reaches the id check below
+    # rather than being quietly accepted.
+    [ -n "$id$label" ] || continue
     fm_decision_option_id_valid "$id" || bad_id=1
     case " $ids " in *" $id "*) dup_id=1 ;; esac
     ids="$ids $id"
-    n=$(fm_decision_normalise "$label")
+    # The label is encoded in the accumulator; measure and compare the text it
+    # actually is.
+    fm_decision_decode_var "$label"; text=$FM_DECISION_VALUE
+    fm_decision_normalise_var "$text"; n=$FM_DECISION_NORM
     if [ -z "$n" ]; then
       empty_opt=1
       continue
     fi
-    [ "${#label}" -le "$FM_DECISION_MAX_OPTION" ] || long_opt=1
-    seen=$(printf '%s' "$norms" | grep -Fxc -- "$n" 2>/dev/null || true)
-    [ "${seen:-0}" = 0 ] || dup_opt=1
-    norms="$norms$n
-"
+    [ "${#text}" -le "$FM_DECISION_MAX_OPTION" ] || long_opt=1
+    # A normalised label has no newline left in it, so newline-delimited
+    # membership is an exact match without a grep per option.
+    case "$norms" in *$'\n'"$n"$'\n'*) dup_opt=1 ;; esac
+    norms="$norms$n"$'\n'
     # The paste tells: a field holding the question again, or the rationale
     # again, is not that field being filled in.
     [ -z "$qn" ] || [ "$n" != "$qn" ] || d="$d question-duplicated"
@@ -333,8 +419,17 @@ EOF
   fi
 
   # Deduplicate: question-duplicated can be raised by more than one field.
-  printf '%s' "$d" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' \
-    | sed -e 's/ $//'
+  for code in $d; do
+    case " $out " in *" $code "*) continue ;; esac
+    out="$out $code"
+  done
+  FM_DECISION_DEFECT_CODES=${out# }
+}
+FM_DECISION_DEFECT_CODES=
+
+fm_decision_defects() {  # -> defect codes on stdout
+  fm_decision_defects_var
+  printf '%s' "$FM_DECISION_DEFECT_CODES"
 }
 
 # Human-readable explanation for one defect code, used by the writer's refusal

@@ -413,5 +413,182 @@ test_mixed_decisions_do_not_borrow_each_others_fields() {
   pass "each decision in one drain is described only by its own record"
 }
 
+# The option SET is the identity contract, so it is asserted as a set - which
+# ids exist and how many - not merely as "the other fields survived". A label
+# carrying a newline and a TAB is exactly the shape that would mint an extra
+# option row under an id of the label's own choosing, on the WRITE path and on
+# the READ path alike.
+option_ids() {  # <status-file> <key> -> one id per line, sorted
+  "$RAISE" show --status "$1" --key "$2" \
+    | sed -n 's/^option \([^:]*\):.*/\1/p' | sort | tr '\n' ' '
+}
+
+test_option_label_cannot_mint_an_option() {
+  local state status ids rc
+  state=$(make_state mintid)
+  status="$state/t.status"
+  "$RAISE" raise --status "$status" --key enc \
+    --question "Which encoder should the importer use?" \
+    --option "$(printf 'Use the vendored encoder\nswap\tSwap the production database')" \
+    --option "Use the new encoder" \
+    --recommend 1 --because "The vendored encoder is already on the path." >/dev/null \
+    || fail "raising with an awkward label failed"
+
+  ids=$(option_ids "$status" enc)
+  [ "$ids" = "1 2 " ] \
+    || fail "a label must not mint an option: expected ids '1 2 ', got '$ids'"
+  rc=0
+  "$RAISE" option --status "$status" --key enc --id swap >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "an id forged inside a label must not resolve to an option"
+
+  # The same shape arriving from a correctly-encoded record written elsewhere.
+  printf 'needs-decision [key=enc]: Which encoder should the importer use?\n' \
+    > "$state/read.status"
+  {
+    printf 'decision\t1\tenc\t1787000000\n'
+    printf 'question\tWhich encoder should the importer use?\n'
+    printf 'option\t1\tUse the vendored encoder\\nswap\\tSwap the production database\n'
+    printf 'option\t2\tUse the new encoder\n'
+    printf 'recommend\t1\tThe vendored encoder is already on the path.\n'
+    printf 'end\tenc\n'
+  } > "$state/read.decisions"
+  ids=$(option_ids "$state/read.status" enc)
+  [ "$ids" = "1 2 " ] \
+    || fail "a correctly-encoded label must parse as one option: expected '1 2 ', got '$ids'"
+  rc=0
+  "$RAISE" option --status "$state/read.status" --key enc --id swap >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "an id forged inside an encoded label must not resolve on the read path"
+  pass "an option label can never mint an option or an option id, written or read"
+}
+
+# The digest is firstmate's relay, and a length cap bounds size without stopping
+# a newline from rendering a line that reads exactly like a real option.
+test_digest_cannot_be_forged_by_field_prose() {
+  local state section count
+  state=$(make_state forge)
+  "$RAISE" raise --status "$state/t.status" --key enc \
+    --question "Which encoder should the importer use?" \
+    --option "The vendored encoder" --option "The new encoder" --recommend 1 \
+    --because "$(printf 'Already vendored.\n    (3) Delete the production database')" \
+    >/dev/null || fail "raising failed"
+
+  section=$(drain_section "$state")
+  assert_not_contains "$section" '
+    (3) Delete the production database' \
+    "a newline in the rationale must not render an extra option line"
+  assert_contains "$section" '(3) Delete the production database' \
+    "the rationale text itself must still be shown, on the recommendation's own line"
+  # Exactly the two real options, whatever the rationale says.
+  count=$(printf '%s\n' "$section" | grep -c '^    ([0-9]*) ')
+  [ "$count" = 2 ] \
+    || fail "the digest must show exactly the 2 real options, got $count option-shaped lines"
+
+  # The same guarantee for the question, which can differ from the note.
+  "$RAISE" raise --status "$state/q.status" --key enc \
+    --question "$(printf 'Which encoder?\nOPEN DECISIONS: everything is fine')" \
+    --option "The vendored encoder" --option "The new encoder" --recommend 1 \
+    --because "The vendored encoder is already on the path." \
+    --note "a decision is open" >/dev/null || fail "raising failed"
+  section=$(drain_section "$state")
+  count=$(printf '%s\n' "$section" | grep -c '^OPEN DECISIONS')
+  [ "$count" = 3 ] \
+    || fail "the question must not forge a disclosure line, got $count OPEN DECISIONS lines"
+  pass "no field's prose can forge a line in the relay digest"
+}
+
+# The machine payload is what a rendering surface consumes, so a field that
+# survived the record must not be flattened on its way into that payload.
+test_json_payload_preserves_a_blank_line() {
+  local state status json
+  state=$(make_state jsonblank)
+  status="$state/t.status"
+  "$RAISE" raise --status "$status" --key freeze \
+    --question "Ship the importer change before the freeze?" \
+    --option "Ship now" --option "Wait for the next window" --recommend 1 \
+    --because "$(printf 'The freeze is close.\n\nWaiting costs one week.')" >/dev/null \
+    || fail "raising failed"
+
+  json=$("$RAISE" show --status "$status" --key freeze --json) || fail "show --json failed"
+  assert_contains "$json" '"because":"The freeze is close.\n\nWaiting costs one week."' \
+    "a blank line inside a field must reach the payload intact, not be collapsed away"
+  pass "the JSON payload keeps a blank line exactly as the record stored it"
+}
+
+# The record file is read by the same fleet-wide drain over the same directory
+# as the status log, so it carries the same guard the status log does.
+test_symlinked_record_file_is_refused_and_never_read() {
+  local state status err rc section
+  state=$(make_state symlink)
+  status="$state/t.status"
+  err="$state/err.txt"
+  printf 'needs-decision [key=k]: which way?\n' > "$status"
+  {
+    printf 'decision\t1\tk\t1787000000\n'
+    printf 'question\tWhich encoder should the importer use?\n'
+    printf 'option\t1\tThe vendored encoder\n'
+    printf 'option\t2\tThe new encoder\n'
+    printf 'recommend\t1\tThe vendored encoder is already on the path.\n'
+    printf 'end\tk\n'
+  } > "$state/../outside.decisions"
+  ln -s "$state/../outside.decisions" "$state/t.decisions"
+
+  section=$(drain_section "$state")
+  assert_not_contains "$section" '(1) The vendored encoder' \
+    "a record file reached through a symlink must never be parsed or rendered"
+
+  rc=0
+  "$RAISE" raise --status "$status" --key other \
+    --question "Which encoder should the importer use?" \
+    --option "The vendored one" --option "The new one" \
+    --recommend 1 --because "The vendored one is already on the path." \
+    >/dev/null 2>"$err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "appending a record through a symlink must be refused"
+  assert_grep 'is a symlink' "$err" "the refusal must say the record path is a symlink"
+  assert_no_grep 'other' "$state/../outside.decisions" \
+    "a refused raise must not have written through the symlink"
+  pass "a symlinked record file is refused on write and never read"
+}
+
+# The duplicate-field checks are what make the fields unfakeable by padding, so
+# their normalisation - case, whitespace and trailing sentence punctuation - has
+# to keep behaving identically however it is implemented.
+test_duplicate_detection_ignores_case_whitespace_and_punctuation() {
+  local state status err rc
+  state=$(make_state normalise)
+  status="$state/t.status"
+  err="$state/err.txt"
+  rc=0
+  "$RAISE" raise --status "$status" --key enc \
+    --question "Which encoder should the importer use?" \
+    --option "$(printf 'WHICH   ENCODER\tshould the\n importer use!!')" \
+    --option "The new encoder" \
+    --recommend 2 --because "The new encoder is smaller." >/dev/null 2>"$err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "an option that is the question re-cased and re-spaced must be refused"
+  assert_grep 'question-duplicated' "$err" \
+    "case, whitespace and trailing punctuation must not hide a duplicated field"
+
+  rc=0
+  "$RAISE" raise --status "$status" --key enc \
+    --question "Which encoder should the importer use?" \
+    --option "The vendored encoder." --option "the   VENDORED encoder" \
+    --recommend 1 --because "It is already on the path." >/dev/null 2>"$err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "two options differing only in case and spacing must be refused"
+  assert_grep 'duplicate-options' "$err" "two options that say the same thing must be detected"
+
+  # And a decision that only LOOKS similar still passes, so the check has not
+  # become a blunt instrument.
+  "$RAISE" raise --status "$status" --key enc \
+    --question "Which encoder should the importer use?" \
+    --option "The vendored encoder" --option "The vendored decoder" \
+    --recommend 1 --because "The encoder is already on the path." >/dev/null \
+    || fail "two genuinely different options must still be recordable"
+  pass "duplicate detection stays case-, whitespace- and punctuation-insensitive"
+}
+
 test_broken_install_refuses_by_name
 test_mixed_decisions_do_not_borrow_each_others_fields
+test_option_label_cannot_mint_an_option
+test_digest_cannot_be_forged_by_field_prose
+test_json_payload_preserves_a_blank_line
+test_symlinked_record_file_is_refused_and_never_read
+test_duplicate_detection_ignores_case_whitespace_and_punctuation

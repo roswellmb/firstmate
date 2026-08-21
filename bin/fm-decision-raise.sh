@@ -117,20 +117,34 @@ resolve_status() {  # <task-id-or-empty>
 
 # JSON string escaping, so the structured payload can leave this home without a
 # jq dependency on the core decision path (jq is required only for Relay).
+#
+# Done with the same parameter expansions fm_decision_encode uses rather than
+# through awk: awk stores RS as a C string, so the "read the whole input as one
+# record" idiom RS="\0" is an EMPTY RS - paragraph mode - on the BSD awk stock
+# macOS ships, which silently drops blank lines, their newlines and a trailing
+# newline. A field that survived the record and is flattened on its way into the
+# payload is worth nothing, so the escaping stays in the shell where the value
+# is never re-split. Control characters below 0x20 that have no short escape are
+# emitted as \u00XX, because a raw one makes the payload invalid per RFC 8259.
+# The codes and the characters they name, in the same order, so the loop below
+# never has to build a character from a variable.
+FM_JSON_CTL_CODES='01 02 03 04 05 06 07 0b 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f'
+FM_JSON_CTL_CHARS=$'\x01\x02\x03\x04\x05\x06\x07\x0b\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f'
 json_str() {  # <value> -> quoted JSON string on stdout
-  printf '%s' "$1" | LC_ALL=C awk '
-    BEGIN { RS = "\0"; ORS = ""; printf "\"" }
-    {
-      s = $0
-      gsub(/\\/, "\\\\", s)
-      gsub(/"/, "\\\"", s)
-      gsub(/\n/, "\\n", s)
-      gsub(/\r/, "\\r", s)
-      gsub(/\t/, "\\t", s)
-      printf "%s", s
-    }
-    END { printf "\"" }
-  '
+  local s=$1 ctl c i=0
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\b'/\\b}
+  s=${s//$'\f'/\\f}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  for ctl in $FM_JSON_CTL_CODES; do
+    c=${FM_JSON_CTL_CHARS:$i:1}
+    i=$((i + 1))
+    case "$s" in *"$c"*) s=${s//"$c"/\\u00$ctl} ;; esac
+  done
+  printf '"%s"' "$s"
 }
 
 # Emit the parsed record as JSON for a rendering surface. `degenerate` is a
@@ -146,10 +160,11 @@ emit_json() {  # <key> <structured:0|1> <note>
     printf ',"question":%s' "$(json_str "$FM_DECISION_QUESTION")"
     printf ',"options":['
     while IFS=$'\t' read -r id label; do
-      [ -n "$id" ] || continue
+      [ -n "$id$label" ] || continue
       [ "$first" = 1 ] || printf ','
       first=0
-      printf '{"id":%s,"label":%s}' "$(json_str "$id")" "$(json_str "$label")"
+      fm_decision_decode_var "$label"
+      printf '{"id":%s,"label":%s}' "$(json_str "$id")" "$(json_str "$FM_DECISION_VALUE")"
     done <<EOF
 $FM_DECISION_OPTIONS
 EOF
@@ -169,9 +184,11 @@ EOF
 }
 
 # The note the status line carries. Whitespace is collapsed because a status log
-# line is one line; the record keeps the question exactly as written.
+# line is one line; the record keeps the question exactly as written. The same
+# flattening the relay applies to every field it renders, from one owner.
 collapse() {  # <text>
-  printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
+  fm_decision_flatten_var "$1"
+  printf '%s' "$FM_DECISION_FLAT"
 }
 
 cmd_raise() {
@@ -214,24 +231,15 @@ cmd_raise() {
   fm_decision_option_id_valid "$KEY" || fail "invalid decision key '$KEY' (allowed: A-Z a-z 0-9 . _ -)"
 
   # Populate the shared globals so the ONE degeneracy check runs over exactly
-  # what would be recorded.
+  # what would be recorded - including the labels in their ENCODED form, which
+  # is the form the record holds and the only form that cannot forge a row.
+  # fm_decision_defects decodes each label itself to measure and compare it.
   fm_decision_reset
   FM_DECISION_QUESTION=$question
   FM_DECISION_OPTIONS=${opts%$'\n'}
   FM_DECISION_OPTION_COUNT=$pos
   FM_DECISION_RECOMMEND_ID=$recommend
   FM_DECISION_RECOMMEND_WHY=$because
-  # The record holds ENCODED labels; decode them for the check so a label with a
-  # tab is measured and compared as the text it is.
-  local decoded='' 
-  while IFS=$'\t' read -r id label; do
-    [ -n "$id" ] || continue
-    decoded="$decoded$id	$(fm_decision_decode "$label")
-"
-  done <<EOF
-$FM_DECISION_OPTIONS
-EOF
-  FM_DECISION_OPTIONS=${decoded%$'\n'}
 
   defects=$(fm_decision_defects)
   if [ -n "$defects" ]; then
@@ -275,16 +283,23 @@ EOF
   fi
   rm -f "$probe"
 
+  # The reader rejects a symlinked record file outright, exactly as the sibling
+  # fold rejects a symlinked status log; refuse to APPEND through one too, so a
+  # record path pointing out of the state directory is never written and never
+  # read. Checked before anything is created, so this refusal writes nothing.
+  record=$(fm_decision_record_path "$STATUS_FILE")
+  [ ! -L "$record" ] \
+    || fail "record path '$record' is a symlink; refusing to write a decision record through it"
+
   [ -f "$STATUS_FILE" ] || : > "$STATUS_FILE" 2>/dev/null \
     || fail "cannot write status file '$STATUS_FILE'"
-  record=$(fm_decision_record_path "$STATUS_FILE")
   now=$(date +%s)
   block="decision	$FM_DECISION_FORMAT_VERSION	$KEY	$now
 question	$(fm_decision_encode "$question")
 "
   while IFS=$'\t' read -r id label; do
-    [ -n "$id" ] || continue
-    block="${block}option	$id	$(fm_decision_encode "$label")
+    [ -n "$id$label" ] || continue
+    block="${block}option	$id	$label
 "
   done <<EOF
 $FM_DECISION_OPTIONS
@@ -362,8 +377,9 @@ cmd_show() {
   fi
   printf 'question: %s\n' "$FM_DECISION_QUESTION"
   while IFS=$'\t' read -r id label; do
-    [ -n "$id" ] || continue
-    printf 'option %s: %s\n' "$id" "$label"
+    [ -n "$id$label" ] || continue
+    fm_decision_decode_var "$label"
+    printf 'option %s: %s\n' "$id" "$FM_DECISION_VALUE"
   done <<EOF
 $FM_DECISION_OPTIONS
 EOF

@@ -238,6 +238,10 @@ Report only true captain-relevant outcomes or a declared external wait by append
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
+When a \`needs-decision\` you are escalating IS a choice between options, raise it with its fields separate so the question, the options and the recommendation reach the captain intact instead of as one blob - this hop is where a decision raised by one of your own crewmates would otherwise be flattened back into prose:
+   \`$FM_ROOT/bin/fm-decision-raise.sh raise --status $STATUS_FILE --key {slug} --question "{one sentence}" --option "{label}" --option "{label}" --recommend {id} --because "{why}"\`
+It appends the status line for you, and refuses rather than recording fields padded to pass; on a refusal the plain \`needs-decision:\` line above is the right answer, not longer fields.
+When the escalation answers a marked from-firstmate request, add \`--note "corr={id} {one short line}"\` so the status line it appends still carries the correlation token the main firstmate needs; the structure never replaces that contract.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
 This is also how you return the answer to a marked from-firstmate request above.
 A marked request requires one correlated answer after the work; it does not require a separate receipt or start acknowledgement.

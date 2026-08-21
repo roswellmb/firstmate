@@ -138,24 +138,36 @@ print_open_decisions_section() {
       detail="    MALFORMED DECISION RECORD ($FM_DECISION_DEFECTS) - not structured; relay the note above, not these as options
 "
     elif [ "$FM_DECISION_FOUND" = 1 ]; then
+      # Every value below is a worker's untrusted prose, so it is FLATTENED onto
+      # one line before it is capped. The cap bounds size; it does not stop a
+      # newline in a rationale from rendering a line that reads exactly like a
+      # real option. Untrusted text must not control what this surface says, and
+      # a multi-line item would also be charged to the byte budget as one.
+      #
       # The note defaults to the question, so print the question again only when
       # it actually differs - never hide a divergence, never pay for a repeat.
-      qn=$(fm_decision_normalise "$FM_DECISION_QUESTION")
-      nn=$(fm_decision_normalise "$note")
+      fm_decision_normalise_var "$FM_DECISION_QUESTION"; qn=$FM_DECISION_NORM
+      fm_decision_normalise_var "$note"; nn=$FM_DECISION_NORM
       if [ "$qn" != "$nn" ]; then
-        fm_cap_line_var "    Q: $FM_DECISION_QUESTION" $((item_bytes - 1))
+        fm_decision_flatten_var "$FM_DECISION_QUESTION"
+        fm_cap_line_var "    Q: $FM_DECISION_FLAT" $((item_bytes - 1))
         detail="$detail$FM_LINE_CAP_LINE
 "
       fi
       while IFS=$(printf '\t') read -r id label; do
-        [ -n "$id" ] || continue
-        fm_cap_line_var "    ($id) $label" $((item_bytes - 1))
+        [ -n "$id$label" ] || continue
+        # The option list holds ENCODED labels; decode exactly this one, then
+        # flatten it, so a label can neither mint a row nor forge a line.
+        fm_decision_decode_var "$label"
+        fm_decision_flatten_var "$FM_DECISION_VALUE"
+        fm_cap_line_var "    ($id) $FM_DECISION_FLAT" $((item_bytes - 1))
         detail="$detail$FM_LINE_CAP_LINE
 "
       done <<EOD
 $FM_DECISION_OPTIONS
 EOD
-      fm_cap_line_var "    -> recommends ($FM_DECISION_RECOMMEND_ID) $FM_DECISION_RECOMMEND_WHY" \
+      fm_decision_flatten_var "$FM_DECISION_RECOMMEND_WHY"
+      fm_cap_line_var "    -> recommends ($FM_DECISION_RECOMMEND_ID) $FM_DECISION_FLAT" \
         $((item_bytes - 1))
       detail="$detail$FM_LINE_CAP_LINE
 "
