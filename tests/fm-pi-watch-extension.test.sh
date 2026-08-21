@@ -482,7 +482,8 @@ if (stableRows.length !== 4) throw new Error(`single-flight recovery launched ${
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi must deliver the actionable wake after bounded hung-successor recovery"
+  # Not expect_code: this block has five distinct throws that all render as "expected exit 0, got 1". The failure must carry the code and $out or CI names no assertion.
+  [ "$status" -eq 0 ] || fail "Pi must deliver the actionable wake after bounded hung-successor recovery (exit $status): $out"
   [ -z "$out" ] || fail "Pi hung-successor test printed output: $out"
   pass "Pi hung successor falls back to one typed actionable wake"
 }
