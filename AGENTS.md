@@ -42,6 +42,7 @@ Shared tracked material is `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.
 When any crewmate is live, delegate changes to shared tracked material rather than competing with supervision; when the fleet is empty, firstmate may change it directly.
 This repo is a shared template, while `.env`, `data/`, `state/`, `config/`, `projects/`, and `.no-mistakes/` are captain-private and gitignored.
 Ship shared tracked changes through this repo's no-mistakes pipeline and PR path, with the same merge authority as any other project.
+The pipeline owns the body of the PR it raises, because its `## Pipeline` section carries the signature this repo's required check greps for (`CONTRIBUTING.md`); never replace or hand-edit that body to add a narrative, and relay the outcome to the captain instead.
 Never add an agent name as a commit co-author.
 
 ## 2. Layout and state
