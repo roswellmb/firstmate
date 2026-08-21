@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--despite-block <reason>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--despite-block <reason>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -16,6 +16,22 @@
 #   loud one-line deviation notice is printed and the spawn continues.
 #   no-mistakes-prod-only is a registry policy rather than a task mode and is
 #   refused as a flag value.
+#   Every ship, scout, and relaunch spawn additionally consults this home's
+#   captain project marks (bin/fm-project-mode.sh --mark, which owns the
+#   config/project-marks schema; bin/fm-project-mark-lib.sh owns the policy this
+#   script shares with bin/fm-control.sh) at that same point and REFUSES a marked
+#   project before any worktree, endpoint, or task record exists. An "excluded"
+#   mark is total and has no override: only the captain lifts it. A "blocked-on-captain"
+#   mark is partial, so --despite-block "<why this task does not depend on it>"
+#   proceeds and records that stated reason as block_override= in the task's meta;
+#   a relaunch with no flag resumes on the reason recorded at launch. An
+#   unreadable marks file refuses too. --despite-block is refused on an unmarked
+#   project, on an exclusion, on a --secondmate spawn or the relaunch of a
+#   secondmate task, and on a batch invocation (the stated reason is about ONE
+#   task), so it can never be carried habitually.
+#   A relaunch driven through bin/fm-control.sh is refused by that script's
+#   preflight BEFORE the running agent is stopped; this refusal is the backstop
+#   that catches every other way in.
 #        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
@@ -254,6 +270,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-project-mark-lib.sh
+. "$SCRIPT_DIR/fm-project-mark-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -276,6 +294,8 @@ BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
+BLOCK_OVERRIDE=
+BLOCK_OVERRIDE_SET=0
 RELAUNCH=0
 POS=()
 want_value=
@@ -292,6 +312,7 @@ for a in "$@"; do
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
       traceparent) TRACEPARENT_ARG=$a; TRACEPARENT_SET=1 ;;
+      despite-block) BLOCK_OVERRIDE=$a; BLOCK_OVERRIDE_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -315,6 +336,8 @@ for a in "$@"; do
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
+    --despite-block) want_value=despite-block ;;
+    --despite-block=*) BLOCK_OVERRIDE=${a#--despite-block=}; BLOCK_OVERRIDE_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -326,6 +349,12 @@ done
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
 [ "$TRACEPARENT_SET" -eq 0 ] || [ -n "$TRACEPARENT_ARG" ] || { echo "error: --traceparent requires a non-empty value" >&2; exit 1; }
+[ "$BLOCK_OVERRIDE_SET" -eq 0 ] || [ -n "$BLOCK_OVERRIDE" ] || { echo "error: --despite-block requires a non-empty value" >&2; exit 1; }
+# The stated reason is written into the task record as one key=value line, so a
+# value carrying a newline would forge a second field there.
+case "$BLOCK_OVERRIDE" in
+  *$'\n'*) echo "error: --despite-block must be a single line" >&2; exit 1 ;;
+esac
 # A parent-delivered carrier replaces this home's own resolution, so it is
 # refused unless it is a secondmate spawn carrying a strictly valid W3C value.
 # Nothing else may reach the pane's TRACEPARENT export.
@@ -388,6 +417,25 @@ else
       exit 1
     }
   fi
+fi
+# --despite-block acknowledges a captain mark on a PROJECT. A secondmate spawn
+# stands up a home, so there is no project for it to acknowledge; a scout keeps
+# the flag, because investigating a marked project is still working it.
+#
+# Called twice deliberately. A FRESH spawn knows its kind from the command line
+# and is refused here, before anything else runs. A RELAUNCH takes its kind from
+# the task's own record instead, which is not read until much later, so the same
+# check runs again the moment that kind is known - otherwise a secondmate
+# relaunch would sail past this guard as the default "ship", skip the mark check
+# that only non-secondmate work reaches, and persist the flag into a task record
+# with no mark ever consulted.
+refuse_block_override_for_secondmate() {
+  [ "$BLOCK_OVERRIDE_SET" -eq 1 ] || return 0
+  echo "error: --despite-block acknowledges a captain mark on a project; a secondmate spawn stands up a home, not work in a project" >&2
+  exit 1
+}
+if [ "$KIND" = secondmate ]; then
+  refuse_block_override_for_secondmate
 fi
 
 spawn_remote_secondmate() {
@@ -858,6 +906,16 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
     echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
     exit 1
   fi
+  # --despite-block states why ONE task does not depend on what a
+  # blocked-on-captain mark names, so unlike the harness or the delivery
+  # contract it is not a property a batch can share: spreading one reason across
+  # every pair would make it an assertion about work it was never inspected
+  # against. It is refused rather than dropped, because a silently ignored flag
+  # is exactly what this flag is refused elsewhere to prevent.
+  if [ "$BLOCK_OVERRIDE_SET" -eq 1 ]; then
+    echo "error: --despite-block states why ONE task does not depend on what a blocked-on-captain mark names, so it is not shareable across a batch; spawn each acknowledged task on its own with its own stated reason" >&2
+    exit 1
+  fi
   rc=0
   shared_args=()
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
@@ -991,6 +1049,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: --relaunch needs an existing task record; no $RELAUNCH_META" >&2
     exit 1
   }
+  # A relaunch's kind comes from the record rather than the command line, so the
+  # parse-time flag guard above saw only the default "ship". Re-apply it here,
+  # the moment the real kind is readable and before any endpoint work, so a
+  # secondmate relaunch cannot slip an acknowledgement past a check no mark is
+  # ever consulted for and into its task record.
+  if [ "$(fm_meta_get "$RELAUNCH_META" kind)" = secondmate ]; then
+    refuse_block_override_for_secondmate
+  fi
   fm_backend_validate_task_endpoint "$RELAUNCH_META" "$ID" || exit 1
   BACKEND=$FM_BACKEND_VALIDATED_BACKEND
   RELAUNCH_TARGET=$FM_BACKEND_VALIDATED_TARGET
@@ -1848,9 +1914,83 @@ if [ "$KIND" = secondmate ]; then
   fi
 else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+  PROJ_NAME=$(basename "$PROJ_ABS")
   WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi
+# Captain project marks (bin/fm-project-mode.sh --mark). This is the same
+# consultation point as the delivery-rigor notice below, and deliberately the
+# opposite verdict. A rigor deviation is a judgment firstmate is PERMITTED to
+# make on a current captain instruction or a stated intake judgment, so it is
+# announced and the spawn continues. A mark is not firstmate's judgment to make
+# at all - it records a decision the captain already took - so it REFUSES.
+#
+# It runs before the brief check, before any worktree, endpoint, or task record
+# exists, and it covers ship, scout, and relaunch alike: investigating a marked
+# project and resuming work on one are both starting work on it.
+enforce_project_mark() {  # <project-name>
+  local name=$1 recorded='' marked_on reason
+  # The excluded-vs-blocked-on-captain policy is shared with bin/fm-control.sh's
+  # relaunch preflight (bin/fm-project-mark-lib.sh), so the two can never reach
+  # opposite verdicts about the same project; the wording of each refusal stays
+  # with the caller, whose next action differs. This one is the backstop: it
+  # refuses however the spawn was reached.
+  if [ "$RELAUNCH" -eq 1 ]; then
+    recorded=$(fm_meta_get "$RELAUNCH_META" block_override)
+  fi
+  if fm_project_mark_decide "$name" "$BLOCK_OVERRIDE" "$recorded"; then
+    case "$FM_PROJECT_MARK_VERDICT" in
+      acknowledged)
+        echo "notice: $ID launches into $name despite its blocked-on-captain mark (set $FM_PROJECT_MARK_DATE): $FM_PROJECT_MARK_REASON - stated reason this task does not depend on it: $FM_PROJECT_MARK_ACK" >&2
+        ;;
+      recorded)
+        # A mark landing mid-flight must not make an in-flight task
+        # unrecoverable, so a relaunch resumes on the reason already recorded
+        # when it launched rather than needing it retyped.
+        BLOCK_OVERRIDE=$FM_PROJECT_MARK_ACK
+        echo "notice: $ID resumes in $name despite its blocked-on-captain mark (set $FM_PROJECT_MARK_DATE): $FM_PROJECT_MARK_REASON - carrying the reason recorded when it launched: $FM_PROJECT_MARK_ACK" >&2
+        ;;
+    esac
+    return 0
+  fi
+  marked_on=$FM_PROJECT_MARK_DATE
+  reason=$FM_PROJECT_MARK_REASON
+  case "$FM_PROJECT_MARK_VERDICT" in
+    unreadable)
+      echo "error: could not read this home's captain project marks, so it cannot be shown that $name is workable; refusing to create task $ID" >&2
+      exit 1
+      ;;
+    stray-acknowledgement)
+      echo "error: --despite-block acknowledges a blocked-on-captain mark, and $name carries no mark; drop the flag rather than carrying one that grants nothing" >&2
+      exit 1
+      ;;
+    excluded)
+      # An authority state: total, and liftable only by the captain removing the
+      # line. There is deliberately no flag that overrides this one.
+      [ "$BLOCK_OVERRIDE_SET" -eq 0 ] || echo "error: --despite-block does not apply to an exclusion; only the captain lifts one" >&2
+      echo "error: $name is marked excluded (set $marked_on): $reason" >&2
+      echo "       That mark records the captain's own decision, so nothing dispatches into $name - not a ship task, not an investigation, not a relaunch. Only the captain lifts it, by removing $name from config/project-marks; no condition, observation, or elapsed time clears it and firstmate must never clear it on its own. Refusing to create task $ID." >&2
+      exit 1
+      ;;
+    blocked)
+      # A feasibility state: the work cannot succeed until the named condition is
+      # met, so the block is partial. Proceeding needs an explicit statement of
+      # why THIS task does not depend on that input, recorded in the task record.
+      echo "error: $name is marked blocked-on-captain (set $marked_on): $reason" >&2
+      echo "       That mark records work that cannot succeed until the captain supplies what it names, so firstmate does not start work in $name on its own. The condition being met clears it, by removing $name from config/project-marks. If THIS task genuinely does not depend on that input, say so and it proceeds: re-run with --despite-block \"<why this task does not depend on it>\". Refusing to create task $ID." >&2
+      exit 1
+      ;;
+    *)
+      echo "error: $name carries an unrecognized mark kind \"$FM_PROJECT_MARK_KIND\" (set $marked_on): $reason; refusing to create task $ID rather than guessing what the captain meant" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [ "$KIND" != secondmate ]; then
+  enforce_project_mark "$PROJ_NAME"
+fi
+
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
@@ -1867,7 +2007,6 @@ delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task
 # line. A spawn that disagrees would launch a worker whose instructions and whose
 # recorded task delivery differ, which is the exact drift this contract prevents.
 if [ "$KIND" = ship ]; then
-  PROJ_NAME=$(basename "$PROJ_ABS")
   BRIEF_MODE=$(sed -n 's/^Delivery contract: mode=\([^ ]*\).*$/\1/p' "$BRIEF" | head -n 1)
   if [ -z "$BRIEF_MODE" ]; then
     echo "warning: $BRIEF records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode $MODE - confirm its definition of done matches" >&2
@@ -2831,7 +2970,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo block_override tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2846,6 +2985,13 @@ preserve_relaunch_meta() {
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
+  # Why this task was allowed to start in a project the captain marked
+  # blocked-on-captain. Recorded so the answer outlives the conversation that
+  # gave it - the exact failure the mark exists to close - and so a relaunch
+  # resumes on the reason already given rather than on none. A secondmate has no
+  # project and the flag is refused for one, so its record can never carry an
+  # acknowledgement that no mark was ever consulted for.
+  [ "$KIND" = secondmate ] || [ -z "$BLOCK_OVERRIDE" ] || echo "block_override=$BLOCK_OVERRIDE"
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"

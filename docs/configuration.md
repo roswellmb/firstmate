@@ -156,6 +156,20 @@ Before changing it, inspect the current file and curate the matching bullet in p
 Shared captain preferences that apply across secondmate domains live only in the primary home's optional `data/captain-shared.md`.
 `secondmate-provisioning` owns its propagation contract, including the required header, read-only secondmate copies, quarantine diagnostics, and the rollout rule that existing homes trim `data/captain.md` by hand after first propagation rather than deleting private content automatically.
 
+## Captain project marks (config/project-marks)
+
+`config/project-marks` records the projects the captain has decided firstmate must not quietly start work on.
+It is gitignored, primary-authoritative, and inherited into every local and remote secondmate home through the same declared local-material channel as the other `config/` items, so a mark set in the primary home binds the whole fleet and clearing it there clears it downstream.
+The file lives in `config/` rather than on a `data/projects.md` registry line precisely because of that: the registry is per-home and propagates nowhere, and a control that binds only the home that set it is not a fleet control.
+
+[`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) is the file's single reader, and its header owns the mark schema: the line format, the two kinds and who is allowed to clear each, the rule that two marks for one project resolve to the stricter, and the `--mark` output contract.
+[`bin/fm-project-mark-lib.sh`](../bin/fm-project-mark-lib.sh) owns the single copy of the refusal policy every enforcement point shares, so no two of them can reach opposite verdicts on the same mark.
+
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) is the enforcement point where work starts, and refuses every ship, scout, and relaunch spawn into a marked project before any local copy, endpoint, or task record exists.
+An unparseable marks file refuses fleet-wide rather than reading as "not marked", because a marks file nobody can read may be hiding an exclusion.
+A relaunch is refused earlier still, in [`bin/fm-control.sh`](../bin/fm-control.sh)'s preflight before the worker is stopped, because a mark exists to stop new work and a refusal that had already torn down the work it declines to restart would do the opposite of what it enforces; [`docs/agent-control.md`](agent-control.md#transactional-relaunch) owns that step and what each refusal reports.
+The spawn-side refusal stays as the backstop that catches every other route in.
+
 ## Operational learnings (data/learnings.md)
 
 Fleet-local operational facts and gotchas live locally in `data/learnings.md`; it is gitignored and printed after the captain-preference files in the session-start context digest.
@@ -341,7 +355,7 @@ When a running home advances and its loaded instruction surface (`AGENTS.md`, `b
 If that send fails, bootstrap keeps an idempotent retry marker and emits `NUDGE_SECONDMATES:` with the failure reason.
 The same bootstrap run emits `SECONDMATE_LIVENESS:` only when a registered secondmate is skipped or its relaunch fails; already-live and successfully relaunched secondmates are handled silently.
 For a mid-session inherited local-material edit where tracked-file sync is not needed, run `bin/fm-config-push.sh`.
-It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, `backend`, `herdr-presentation-spaces`, `startup-memory-budget`, `trace-context`, and `data/captain-shared.md` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero for real propagation errors or config-reread send failures.
+It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, `backend`, `herdr-presentation-spaces`, `startup-memory-budget`, `trace-context`, `project-marks`, and `data/captain-shared.md` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero for real propagation errors or config-reread send failures.
 When an allowlisted config item changes for an already-running local home, it sends the literal-content reread pointer described in [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md); unchanged allowlisted config sends no pointer unless a previous delivery is pending.
 A changed remote home instead receives one durably recorded marked re-read instruction after the allowlisted bytes have transferred because primary-local generation paths are not meaningful on another host.
 The locked bootstrap inheritance pass uses the same placement-specific behavior; see `secondmate-provisioning` for the single contract owner.

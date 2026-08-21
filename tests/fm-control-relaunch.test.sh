@@ -297,6 +297,140 @@ test_relaunch_preserves_durable_task_metadata() {
   pass "fm-control relaunch: durable task metadata survives replacement launch publication"
 }
 
+# A captain project mark is enforced at the spawn, which a relaunch goes through
+# too, so resuming a task is not a way around it. A feasibility block is partial
+# and the reason that opened it was recorded when the task launched, so the
+# resume carries that reason rather than needing it retyped - the whole point of
+# recording it is that the answer outlives the conversation that gave it.
+test_relaunch_resumes_a_blocked_project_on_the_recorded_reason() {
+  local dir out rc
+  dir=$(new_case marked-block rl90)
+  add_ship_task "$dir" rl90 claude
+  mkdir -p "$dir/home/config"
+  printf 'proj blocked-on-captain 2026-08-20 the archive holds 7 documents against the 60-100 these items need\n' \
+    > "$dir/home/config/project-marks"
+  printf 'block_override=%s\n' "reindexes the CLI, touches no scanned document" \
+    >> "$dir/home/state/rl90.meta"
+
+  out=$(run_control "$dir" rl90 relaunch --note "stopped mid-refactor"); rc=$?
+  expect_code 0 "$rc" "a relaunch should resume on the reason recorded at launch"$'\n'"$out"
+  assert_contains "$out" "carrying the reason recorded when it launched" \
+    "the resume did not say it was proceeding on the recorded reason"
+  [ "$(meta_field "$dir" rl90 block_override)" = "reindexes the CLI, touches no scanned document" ] \
+    || fail "the stated reason must survive relaunch"
+  [ "$(grep -c '^block_override=' "$dir/home/state/rl90.meta")" = 1 ] \
+    || fail "relaunch left more than one block_override line in the task record"
+  pass "fm-control relaunch: a feasibility block resumes on the reason recorded at launch"
+}
+
+# An exclusion is total and has no override, so it stops the relaunch - and it
+# must stop it in the PREFLIGHT, before the running agent is exited. A mark
+# exists to prevent NEW work; a refusal that had already torn down the work it
+# is refusing to restart would do the opposite of what the mark enforces. So
+# this pins the ORDERING, not just the refusal: the agent is still alive, the
+# transaction never opened, and the refusal says where the preserved work is.
+test_relaunch_into_an_excluded_project_refuses_before_stopping_the_agent() {
+  local dir out rc
+  dir=$(new_case marked-excl rl91)
+  add_ship_task "$dir" rl91 claude
+  mkdir -p "$dir/home/config"
+  printf 'proj excluded 2026-08-21 the captain said twice not to work on this\n' \
+    > "$dir/home/config/project-marks"
+
+  out=$(run_control "$dir" rl91 relaunch --note "stopped mid-refactor"); rc=$?
+  [ "$rc" -ne 0 ] || fail "a relaunch into an excluded project should exit non-zero"$'\n'"$out"
+  assert_contains "$out" "proj is marked excluded (set 2026-08-21): the captain said twice not to work on this" \
+    "the refusal did not name the kind, the date, and the reason"
+  assert_contains "$out" "not a relaunch" \
+    "the refusal did not say an exclusion covers resuming work too"
+
+  # The whole point: the worker was never stopped. The tmux stub records the
+  # exit command it was sent and models the agent it is running, so both are
+  # positive evidence rather than an absence of side effects.
+  assert_no_grep "/exit" "$dir/fake/literal" \
+    "the refusal exited the agent it was refusing to restart"
+  [ "$(cat "$dir/fake/command")" = claude ] \
+    || fail "the agent is no longer running after a refused relaunch (pane reads '$(cat "$dir/fake/command")')"
+  assert_absent "$dir/home/state/rl91.control-relaunch" \
+    "the refused relaunch opened the replacement transaction before checking the mark"
+
+  # And it says so, naming the worktree the work is preserved in, so a reader
+  # refused here can find the work rather than assume it was torn down.
+  assert_contains "$out" "Task rl91 has NOT been stopped and nothing of its work has been lost or torn down" \
+    "the refusal did not say the work is preserved"
+  assert_contains "$out" "stay exactly as they are at $dir/wt" \
+    "the refusal did not name the worktree the work is preserved in"
+  assert_contains "$out" "by removing proj from config/project-marks" \
+    "the refusal did not say the captain must lift the mark before the task can resume"
+  # An exclusion offers no way through, so the refusal must not point at one.
+  assert_not_contains "$out" "--despite-block \"" \
+    "the exclusion refusal advised a flag that an exclusion rejects"
+
+  assert_grep 'worktree=' "$dir/home/state/rl91.meta" "the refused relaunch lost the task record"
+  [ -d "$dir/wt" ] || fail "the refused relaunch removed the task's local copy"
+  pass "fm-control relaunch: an exclusion refuses in the preflight, leaving the agent alive and the work named"
+}
+
+# The acknowledgement has to reach the launch owner through the supported
+# command, or the refusal that advises it points at a flag nothing can pass.
+test_relaunch_carries_the_acknowledgement_through_to_the_launch() {
+  local dir out rc
+  dir=$(new_case marked-ack rl92)
+  add_ship_task "$dir" rl92 claude
+  mkdir -p "$dir/home/config"
+  printf 'proj blocked-on-captain 2026-08-20 the archive holds 7 documents against the 60-100 these items need\n' \
+    > "$dir/home/config/project-marks"
+
+  out=$(run_control "$dir" rl92 relaunch --note "stopped mid-refactor" \
+    --despite-block "reindexes the CLI, touches no scanned document"); rc=$?
+  expect_code 0 "$rc" "a stated reason should carry a relaunch past a feasibility block"$'\n'"$out"
+  assert_contains "$out" "despite its blocked-on-captain mark (set 2026-08-20)" \
+    "proceeding past a feasibility block was not announced"
+  assert_contains "$out" "stated reason this task does not depend on it: reindexes the CLI, touches no scanned document" \
+    "the announcement did not carry the stated reason"
+  [ "$(meta_field "$dir" rl92 block_override)" = "reindexes the CLI, touches no scanned document" ] \
+    || fail "the stated reason was not recorded in the task record"
+  pass "fm-control relaunch: --despite-block reaches the launch owner and is recorded"
+}
+
+# The same flag on an exclusion must be refused, and refused in the preflight
+# like every other exclusion verdict: an override firstmate can pass itself
+# would make the strongest mark advisory.
+test_relaunch_refuses_the_acknowledgement_on_an_exclusion() {
+  local dir out rc
+  dir=$(new_case marked-ack-excl rl93)
+  add_ship_task "$dir" rl93 claude
+  mkdir -p "$dir/home/config"
+  printf 'proj excluded 2026-08-21 the captain said twice not to work on this\n' \
+    > "$dir/home/config/project-marks"
+
+  out=$(run_control "$dir" rl93 relaunch --note "stopped mid-refactor" \
+    --despite-block "internal tooling only, touches no scanned document"); rc=$?
+  [ "$rc" -ne 0 ] || fail "--despite-block should not carry a relaunch past an exclusion"$'\n'"$out"
+  assert_contains "$out" "--despite-block does not apply to an exclusion" \
+    "the refusal did not say the flag has no authority over an exclusion"
+  assert_contains "$out" "proj is marked excluded (set 2026-08-21)" \
+    "the refusal stopped naming the mark once the flag was passed"
+  assert_no_grep "/exit" "$dir/fake/literal" \
+    "the refusal exited the agent it was refusing to restart"
+  [ "$(meta_field "$dir" rl93 block_override)" = "" ] \
+    || fail "a refused acknowledgement was written into the task record"
+
+  # And it is refused where it grants nothing at all, rather than ignored.
+  rm -f "$dir/home/config/project-marks"
+  out=$(run_control "$dir" rl93 relaunch --note "stopped mid-refactor" \
+    --despite-block "no reason to be here"); rc=$?
+  [ "$rc" -ne 0 ] || fail "--despite-block on an unmarked project should exit non-zero"$'\n'"$out"
+  assert_contains "$out" "carries no mark" \
+    "the refusal did not say the flag grants nothing on an unmarked project"
+
+  out=$(run_control "$dir" rl93 exit --despite-block "wrong verb"); rc=$?
+  [ "$rc" -ne 0 ] || fail "--despite-block on a non-relaunch verb should exit non-zero"$'\n'"$out"
+  assert_contains "$out" "apply to 'relaunch' only" \
+    "the refusal did not say the flag belongs to relaunch"
+  pass "fm-control relaunch: the acknowledgement is refused on an exclusion and wherever it grants nothing"
+}
+
 test_relaunch_serializes_concurrent_durable_metadata_publication() {
   local dir control_pid link_pid rc i=0 traceparent prepare ready exported release
   dir=$(new_case metadata-race rl28)
@@ -1302,6 +1436,10 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree() {
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
+test_relaunch_resumes_a_blocked_project_on_the_recorded_reason
+test_relaunch_into_an_excluded_project_refuses_before_stopping_the_agent
+test_relaunch_carries_the_acknowledgement_through_to_the_launch
+test_relaunch_refuses_the_acknowledgement_on_an_exclusion
 test_disabled_relaunch_clears_prior_trace_context
 test_relaunch_appends_the_progress_note_to_the_instructions
 test_relaunch_requires_a_note_for_a_ship_task
