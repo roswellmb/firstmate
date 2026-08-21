@@ -3,7 +3,8 @@
 #
 # WHY THIS EXISTS. Every external-network call a session start makes used to run
 # BEFORE the digest printed, on a hook that blocks session initialization: `gh
-# auth status`, the secondmate liveness and convergence sweeps (11 sequential,
+# auth status`, the read-only home-currency probe of this home and its local
+# secondmate homes, the secondmate liveness and convergence sweeps (11 sequential,
 # individually unbounded SSH connections per REMOTE secondmate), pending remote
 # handoff delivery, and the fleet-sync fetch of every project clone. None of
 # those calls is individually bounded, so one unreachable host could consume the
@@ -78,11 +79,12 @@
 #   .startup-network.timings  per-step elapsed times for the last run, in
 #                             bin/fm-timing-lib.sh's tab-separated format: the
 #                             stage total, one record per network phase (gh auth,
-#                             secondmate liveness, secondmate convergence, handoff
-#                             delivery, fleet sync), one per secondmate for the
-#                             remote-touching steps (id and host), and one per
-#                             project clone. Published for a timed-out or failed
-#                             run too, where a partial record is the answer.
+#                             home currency, secondmate liveness, secondmate
+#                             convergence, handoff delivery, fleet sync), one per
+#                             secondmate for the remote-touching steps (id and
+#                             host), and one per project clone. Published for a
+#                             timed-out or failed run too, where a partial record
+#                             is the answer.
 #                             Diagnostic only: nothing reads it to make a
 #                             decision, and losing it never downgrades a run.
 #   .startup-network.lock     serializes publication, harvest acknowledgement,
@@ -181,8 +183,8 @@ worker_alive() {
 # confirmed yet" is always answerable from the status record alone.
 phase_label() {  # <phases>
   case "$1" in
-    probe) printf 'GitHub authentication' ;;
-    probe,sweeps) printf 'GitHub authentication, dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh with its drift reporting' ;;
+    probe) printf 'GitHub authentication and home-currency reporting against origin' ;;
+    probe,sweeps) printf 'GitHub authentication, home-currency reporting against origin, dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh with its drift reporting' ;;
     *) printf 'the deferred network checks' ;;
   esac
 }

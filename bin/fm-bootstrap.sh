@@ -8,6 +8,9 @@
 #          Lines: "MISSING: <tool> (install: <command>)",
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
+#                 "HOME_CURRENCY: <home> is [at least] <n> commits behind|ahead
+#                  of|diverged from|not at origin/<branch> ...", or
+#                 "HOME_CURRENCY: cannot verify <home> against origin - <reason> ...",
 #                 "STARTUP_MEMORY_BUDGET: invalid config/startup-memory-budget - <reason>",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
@@ -48,6 +51,25 @@
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
+#          A HOME_CURRENCY line means a firstmate HOME is not at its origin
+#          default-branch commit, so it is running instructions, skills, and
+#          scripts that no longer match the fleet - or that the comparison could
+#          not be made at all, which is reported rather than passed. It is a
+#          READ-ONLY network check (bin/fm-home-currency-lib.sh owns the
+#          comparison): it never fetches, fast-forwards, or writes anything,
+#          because updating a home belongs to /updatefirstmate (AGENTS.md section
+#          12) and a home that fast-forwarded itself under a live validation run
+#          would be worse than a stale one. It covers the code root this instance
+#          actually loads from (FM_ROOT) plus every LOCAL live secondmate home,
+#          so a secondmate is reported both here and by its own session start.
+#          A remote-routed secondmate home is reported by that same check running
+#          in its own session start on its own host; reaching across ssh for it
+#          from here is deliberately not part of this check.
+#          Set FM_HOME_CURRENCY_TEST_SKIP=1 to suppress it entirely. That exists
+#          so firstmate's own test suite stays hermetic (tests/lib.sh exports it,
+#          the way it exports FM_GATE_REFUSE_BYPASS); a real home never sets it,
+#          and setting it is choosing to start without knowing whether this home
+#          matches the fleet.
 #          treehouse is also MISSING when its installed version lacks
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
@@ -136,6 +158,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-quota-axi-lib.sh"
 # shellcheck source=bin/fm-tangle-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tangle-lib.sh"
+# shellcheck source=bin/fm-home-currency-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-home-currency-lib.sh"
 # shellcheck source=bin/fm-ff-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh disable=SC1091
@@ -748,6 +772,38 @@ secondmate_handoff_detect() {
   done
 }
 
+# Report - never repair - how far this fleet's homes are from origin's default
+# branch. Read-only, so it runs on every network pass including the unlocked
+# detect-only one, exactly like the `gh auth status` probe beside it.
+#
+# EVERY HOME, not just the one starting. A secondmate home is where staleness
+# hides, because nobody opens a session in it and looks: on 2026-08-21 both
+# secondmate homes sat eight commits behind origin, one was told to adopt a tool
+# that existed only upstream, and the report that the adoption was in force was
+# wrong. So this reports the code root this instance loads from (FM_ROOT, which
+# IS the secondmate home when a secondmate is the one starting) AND every local
+# live secondmate home this home owns, so the primary sees the drift without
+# waiting for that secondmate to restart.
+home_currency_check() {
+  local id home meta home_real seen
+  [ "${FM_HOME_CURRENCY_TEST_SKIP:-0}" != 1 ] || return 0
+  seen=" $(resolve_path "$FM_ROOT") "
+  fm_home_currency_report 'this home' "$FM_ROOT"
+  [ -d "$STATE" ] || return 0
+  # The window field is not needed here: a home's currency does not depend on
+  # whether its agent happens to be running.
+  while IFS='|' read -r id home _ meta; do
+    grep -q '^remote_host=.' "$meta" 2>/dev/null && continue
+    [ -n "$home" ] || continue
+    # One line per distinct home, so two records naming the same directory do
+    # not report the same drift twice.
+    home_real=$(resolve_path "$home")
+    case "$seen" in *" $home_real "*) continue ;; esac
+    seen="$seen$home_real "
+    fm_home_currency_report "secondmate $id" "$home"
+  done < <(live_secondmate_meta_records "$STATE" "$DATA/secondmates.md")
+}
+
 install_cmd() {
   case "$1" in
     tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
@@ -1223,6 +1279,12 @@ if network_phase; then
   __fm_timing_stamp=$(fm_timing_now_ms)
   gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
   fm_timing_record phase gh-auth "$__fm_timing_stamp"
+  # Read-only, so it is deliberately NOT inside the FM_BOOTSTRAP_DETECT_ONLY
+  # guard below: a session that may not mutate anything still must not start
+  # without knowing whether it matches the fleet.
+  __fm_timing_stamp=$(fm_timing_now_ms)
+  home_currency_check
+  fm_timing_record phase home-currency "$__fm_timing_stamp"
 fi
 local_phase && detect_local_config
 
