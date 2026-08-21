@@ -156,6 +156,32 @@ Before changing it, inspect the current file and curate the matching bullet in p
 Shared captain preferences that apply across secondmate domains live only in the primary home's optional `data/captain-shared.md`.
 `secondmate-provisioning` owns its propagation contract, including the required header, read-only secondmate copies, quarantine diagnostics, and the rollout rule that existing homes trim `data/captain.md` by hand after first propagation rather than deleting private content automatically.
 
+## Captain project marks (config/project-marks)
+
+`config/project-marks` records the projects the captain has decided firstmate must not quietly start work on.
+It is gitignored, primary-authoritative, and inherited into every local and remote secondmate home through the same declared local-material channel as the other `config/` items, so a mark set in the primary home binds the whole fleet and clearing it there clears it downstream.
+The file lives in `config/` rather than on a `data/projects.md` registry line precisely because of that: the registry is per-home and propagates nowhere, and a control that binds only the home that set it is not a fleet control.
+
+One mark per line, with blank lines and `#` comments ignored:
+
+```
+<project-name> <kind> <YYYY-MM-DD> <reason to end of line>
+```
+
+The date is the date the mark was set, and the reason is free text to the end of the line.
+Both fields are required because a refusal that says only "blocked" cannot be acted on: the reader needs to know what was decided, when, and why.
+Two kinds exist, and they differ in who may clear them:
+
+- `excluded` is an authority state.
+  The captain decided it, the block is total, and only the captain lifts it by removing the line.
+  No condition, observation, or elapsed time clears it, and firstmate must never set or clear one on its own initiative; writing the line records a decision the captain already made.
+- `blocked-on-captain` is a feasibility state.
+  The work cannot succeed until something the captain owes arrives, so the block is partial: work that genuinely does not depend on that input may proceed on an explicit stated reason, and firstmate may observe that the named condition has been met.
+
+Two marks for the same project resolve to the stricter one.
+`bin/fm-project-mode.sh --mark <project>` is the single reader and owns the exact output contract; `bin/fm-spawn.sh` is the single enforcement point and refuses every ship, scout, and relaunch spawn into a marked project before any local copy, endpoint, or task record exists.
+An unparseable marks file refuses fleet-wide rather than reading as "not marked", because a marks file nobody can read may be hiding an exclusion.
+
 ## Operational learnings (data/learnings.md)
 
 Fleet-local operational facts and gotchas live locally in `data/learnings.md`; it is gitignored and printed after the captain-preference files in the session-start context digest.

@@ -297,6 +297,54 @@ test_relaunch_preserves_durable_task_metadata() {
   pass "fm-control relaunch: durable task metadata survives replacement launch publication"
 }
 
+# A captain project mark is enforced at the spawn, which a relaunch goes through
+# too, so resuming a task is not a way around it. A feasibility block is partial
+# and the reason that opened it was recorded when the task launched, so the
+# resume carries that reason rather than needing it retyped - the whole point of
+# recording it is that the answer outlives the conversation that gave it.
+test_relaunch_resumes_a_blocked_project_on_the_recorded_reason() {
+  local dir out rc
+  dir=$(new_case marked-block rl90)
+  add_ship_task "$dir" rl90 claude
+  mkdir -p "$dir/home/config"
+  printf 'proj blocked-on-captain 2026-08-20 the archive holds 7 documents against the 60-100 these items need\n' \
+    > "$dir/home/config/project-marks"
+  printf 'block_override=%s\n' "reindexes the CLI, touches no scanned document" \
+    >> "$dir/home/state/rl90.meta"
+
+  out=$(run_control "$dir" rl90 relaunch --note "stopped mid-refactor"); rc=$?
+  expect_code 0 "$rc" "a relaunch should resume on the reason recorded at launch"$'\n'"$out"
+  assert_contains "$out" "carrying the reason recorded when it launched" \
+    "the resume did not say it was proceeding on the recorded reason"
+  [ "$(meta_field "$dir" rl90 block_override)" = "reindexes the CLI, touches no scanned document" ] \
+    || fail "the stated reason must survive relaunch"
+  [ "$(grep -c '^block_override=' "$dir/home/state/rl90.meta")" = 1 ] \
+    || fail "relaunch left more than one block_override line in the task record"
+  pass "fm-control relaunch: a feasibility block resumes on the reason recorded at launch"
+}
+
+# An exclusion is total and has no override, so it stops the replacement launch
+# too. The agent is already stopped by then, which is the outcome an exclusion
+# wants: the task ends up stopped with its record and its work preserved.
+test_relaunch_into_an_excluded_project_refuses() {
+  local dir out rc
+  dir=$(new_case marked-excl rl91)
+  add_ship_task "$dir" rl91 claude
+  mkdir -p "$dir/home/config"
+  printf 'proj excluded 2026-08-21 the captain said twice not to work on this\n' \
+    > "$dir/home/config/project-marks"
+
+  out=$(run_control "$dir" rl91 relaunch --note "stopped mid-refactor"); rc=$?
+  [ "$rc" -ne 0 ] || fail "a relaunch into an excluded project should exit non-zero"$'\n'"$out"
+  assert_contains "$out" "proj is marked excluded (set 2026-08-21): the captain said twice not to work on this" \
+    "the refusal did not name the kind, the date, and the reason"
+  assert_contains "$out" "not a relaunch" \
+    "the refusal did not say an exclusion covers resuming work too"
+  assert_grep 'worktree=' "$dir/home/state/rl91.meta" "the refused relaunch lost the task record"
+  [ -d "$dir/wt" ] || fail "the refused relaunch removed the task's local copy"
+  pass "fm-control relaunch: an exclusion stops the replacement launch and preserves the work"
+}
+
 test_relaunch_serializes_concurrent_durable_metadata_publication() {
   local dir control_pid link_pid rc i=0 traceparent prepare ready exported release
   dir=$(new_case metadata-race rl28)
@@ -1302,6 +1350,8 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree() {
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
+test_relaunch_resumes_a_blocked_project_on_the_recorded_reason
+test_relaunch_into_an_excluded_project_refuses
 test_disabled_relaunch_clears_prior_trace_context
 test_relaunch_appends_the_progress_note_to_the_instructions
 test_relaunch_requires_a_note_for_a_ship_task
