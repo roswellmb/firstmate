@@ -77,6 +77,29 @@ FM_DECISION_MAX_RATIONALE=400
 # Refuse to parse an implausibly large record file rather than reading forever.
 FM_DECISION_MAX_FILE_BYTES=262144
 
+# The ceiling an ENCODED field must clear BEFORE anything decodes it.
+#
+# The caps above are the real limits, but they describe decoded text, so
+# enforcing them alone means the expensive operation runs before the check that
+# would have rejected its input. A field is crewmate-controlled and this path
+# runs at the top of every wake-handling turn, so the order is reversed here:
+# the cheap length test on the encoded form comes first, and a value past this
+# ceiling is never decoded at all.
+#
+# One ceiling covers all three fields. Encoding replaces a character with at
+# most two, so encoded length is never more than twice the text's length: a
+# field encoded longer than twice the LARGEST cap must decode to more than that
+# largest cap, and is therefore already too long whichever of the three it is.
+# Rejecting it cannot change a verdict - it only declines to spend the work of
+# reaching one that is already certain. The exact per-field cap still decides
+# every field that clears this ceiling.
+FM_DECISION_MAX_ENCODED=$FM_DECISION_MAX_QUESTION
+[ "$FM_DECISION_MAX_OPTION" -le "$FM_DECISION_MAX_ENCODED" ] \
+  || FM_DECISION_MAX_ENCODED=$FM_DECISION_MAX_OPTION
+[ "$FM_DECISION_MAX_RATIONALE" -le "$FM_DECISION_MAX_ENCODED" ] \
+  || FM_DECISION_MAX_ENCODED=$FM_DECISION_MAX_RATIONALE
+FM_DECISION_MAX_ENCODED=$((2 * FM_DECISION_MAX_ENCODED))
+
 # --- value encoding ---------------------------------------------------------
 # Encode one field value so it cannot contain a raw TAB or newline. Backslash is
 # escaped FIRST so decoding is unambiguous.
@@ -108,6 +131,11 @@ fm_decision_encode() {  # <value> -> encoded on stdout
 # every field of every open decision on every drain. Text carrying no escape -
 # which is what ordinary prose is - is therefore copied once, and the loop turns
 # only as many times as the value has escapes to resolve.
+#
+# Its cost is bounded because its INPUT is bounded: every caller gates the
+# encoded value through fm_decision_encoded_within_bound first, so no value
+# reaches this loop that a length cap has not already had the chance to reject.
+# The run-at-a-time walk is defence in depth behind that gate, not instead of it.
 fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE
   local s=$1 out='' head rest c bs=$'\\'
   while :; do
@@ -136,6 +164,13 @@ fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE
   FM_DECISION_VALUE=$out
 }
 FM_DECISION_VALUE=
+
+# The gate every decode site asks first: is this encoded value small enough to
+# be worth decoding at all? Returns 1 for a value that cannot belong to a sound
+# record, so its caller records a defect instead of paying to prove it.
+fm_decision_encoded_within_bound() {  # <encoded>
+  [ "${#1}" -le "$FM_DECISION_MAX_ENCODED" ]
+}
 
 # --- flattening for single-line surfaces ------------------------------------
 # Fold a value onto ONE line: every newline, CR, TAB and other whitespace run
@@ -238,6 +273,7 @@ fm_decision_reset() {
   FM_DECISION_RECOMMEND_ID=
   FM_DECISION_RECOMMEND_WHY=
   FM_DECISION_DEFECTS=
+  FM_DECISION_PARSE_DEFECTS=
 }
 fm_decision_reset
 
@@ -288,7 +324,7 @@ fm_decision_record_read() {  # <record-file> <key>
   local line kind a b c
   local in_block=0 blk_key='' blk_ver='' blk_raised=''
   local blk_q='' blk_opts='' blk_rid='' blk_why='' blk_count=0 blk_seen_q=0
-  local saw_truncated=0 bytes
+  local blk_pd='' saw_truncated=0 bytes
 
   fm_decision_reset
   # The same guard the sibling fold uses on the status log this record is joined
@@ -316,6 +352,7 @@ EOF
         in_block=0
         blk_key=$b; blk_ver=$a; blk_raised=$c
         blk_q=''; blk_opts=''; blk_rid=''; blk_why=''; blk_count=0; blk_seen_q=0
+        blk_pd=''
         # Ignore a block written by a format version this reader does not know
         # rather than guessing at its fields.
         if [ "$blk_ver" = "$FM_DECISION_FORMAT_VERSION" ] && [ "$blk_key" = "$want" ]; then
@@ -324,9 +361,14 @@ EOF
         ;;
       question)
         [ "$in_block" -eq 1 ] || continue
-        fm_decision_decode_var "$a"
-        blk_q=$FM_DECISION_VALUE
         blk_seen_q=1
+        if fm_decision_encoded_within_bound "$a"; then
+          fm_decision_decode_var "$a"
+          blk_q=$FM_DECISION_VALUE
+        else
+          blk_q=''
+          blk_pd="$blk_pd oversized-field question-too-long"
+        fi
         ;;
       option)
         [ "$in_block" -eq 1 ] || continue
@@ -337,6 +379,13 @@ EOF
         # check bypassing itself. A row dropped here is not absorbed: the record
         # simply has fewer options, which is what makes it degenerate.
         [ -n "$a$b" ] || continue
+        # A label too long to be any sound option never enters the accumulator,
+        # so no consumer downstream can be handed one to decode. Same shape as
+        # the empty-row rule above: what an option IS is decided here, once.
+        if ! fm_decision_encoded_within_bound "$b"; then
+          blk_pd="$blk_pd oversized-field option-too-long"
+          continue
+        fi
         # The label stays ENCODED here. Decoding it into this accumulator is
         # what would let a label carrying a newline mint an extra option row
         # with an id of its own choosing; fm_decision_defects and every
@@ -348,8 +397,13 @@ EOF
       recommend)
         [ "$in_block" -eq 1 ] || continue
         blk_rid=$a
-        fm_decision_decode_var "$b"
-        blk_why=$FM_DECISION_VALUE
+        if fm_decision_encoded_within_bound "$b"; then
+          fm_decision_decode_var "$b"
+          blk_why=$FM_DECISION_VALUE
+        else
+          blk_why=''
+          blk_pd="$blk_pd oversized-field rationale-too-long"
+        fi
         ;;
       end)
         [ "$in_block" -eq 1 ] || continue
@@ -363,6 +417,7 @@ EOF
           FM_DECISION_OPTION_COUNT=$blk_count
           FM_DECISION_RECOMMEND_ID=$blk_rid
           FM_DECISION_RECOMMEND_WHY=$blk_why
+          FM_DECISION_PARSE_DEFECTS=$blk_pd
           [ "$blk_seen_q" -eq 1 ] || FM_DECISION_QUESTION=''
         else
           saw_truncated=1
@@ -396,13 +451,19 @@ EOF
 # Builtins only, for the same reason fm_decision_normalise_var is: every reader
 # re-runs this on every drain.
 fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
-  local d='' id label text ids='' norms=$'\n' n qn rn code out=''
-  local dup_opt=0 empty_opt=0 long_opt=0 bad_id=0 dup_id=0
+  local d=$FM_DECISION_PARSE_DEFECTS
+  local id label text ids='' norms=$'\n' n qn rn code out=''
+  local dup_opt=0 empty_opt=0 long_opt=0 bad_id=0 dup_id=0 oversized=0
 
   fm_decision_normalise_var "$FM_DECISION_QUESTION"; qn=$FM_DECISION_NORM
   fm_decision_normalise_var "$FM_DECISION_RECOMMEND_WHY"; rn=$FM_DECISION_NORM
 
-  [ -n "$qn" ] || d="$d no-question"
+  # A field the parser withheld as oversized is not a MISSING field, so the
+  # "nothing there" codes stay quiet for it and the length code speaks instead.
+  case " $d " in
+    *' question-too-long '*) : ;;
+    *) [ -n "$qn" ] || d="$d no-question" ;;
+  esac
   [ "${#FM_DECISION_QUESTION}" -le "$FM_DECISION_MAX_QUESTION" ] || d="$d question-too-long"
 
   while IFS=$'\t' read -r id label; do
@@ -414,7 +475,13 @@ fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
     case " $ids " in *" $id "*) dup_id=1 ;; esac
     ids="$ids $id"
     # The label is encoded in the accumulator; measure and compare the text it
-    # actually is.
+    # actually is - but only once it has cleared the gate, so the writer refuses
+    # an oversized label on the same terms the reader withholds one.
+    if ! fm_decision_encoded_within_bound "$label"; then
+      oversized=1
+      long_opt=1
+      continue
+    fi
     fm_decision_decode_var "$label"; text=$FM_DECISION_VALUE
     fm_decision_normalise_var "$text"; n=$FM_DECISION_NORM
     if [ -z "$n" ]; then
@@ -440,6 +507,7 @@ EOF
   [ "$empty_opt" -eq 0 ] || d="$d empty-option"
   [ "$long_opt" -eq 0 ] || d="$d option-too-long"
   [ "$dup_opt" -eq 0 ] || d="$d duplicate-options"
+  [ "$oversized" -eq 0 ] || d="$d oversized-field"
 
   if [ -z "$FM_DECISION_RECOMMEND_ID" ]; then
     d="$d no-recommendation"
@@ -449,12 +517,17 @@ EOF
     d="$d recommend-unknown-option"
   fi
 
-  if [ -z "$rn" ]; then
-    d="$d no-rationale"
-  else
-    [ "${#FM_DECISION_RECOMMEND_WHY}" -le "$FM_DECISION_MAX_RATIONALE" ] || d="$d rationale-too-long"
-    [ -z "$qn" ] || [ "$rn" != "$qn" ] || d="$d question-duplicated"
-  fi
+  case " $d " in
+    *' rationale-too-long '*) : ;;
+    *)
+      if [ -z "$rn" ]; then
+        d="$d no-rationale"
+      else
+        [ "${#FM_DECISION_RECOMMEND_WHY}" -le "$FM_DECISION_MAX_RATIONALE" ] || d="$d rationale-too-long"
+        [ -z "$qn" ] || [ "$rn" != "$qn" ] || d="$d question-duplicated"
+      fi
+      ;;
+  esac
 
   # Deduplicate: question-duplicated can be raised by more than one field.
   for code in $d; do
@@ -491,6 +564,7 @@ fm_decision_defect_help() {  # <code>
     rationale-duplicated) printf 'the rationale repeats an option label verbatim' ;;
     truncated-record) printf 'the record on disk is incomplete (a torn or interrupted write)' ;;
     oversized-record-file) printf 'the record file is implausibly large and was not parsed' ;;
+    oversized-field) printf 'a field is longer than %s encoded characters - far past any field cap, so it was withheld rather than decoded; shorten it, or raise this as free text' "$FM_DECISION_MAX_ENCODED" ;;
     *) printf 'unrecognised defect' ;;
   esac
 }

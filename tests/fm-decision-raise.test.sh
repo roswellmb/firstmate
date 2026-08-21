@@ -659,6 +659,52 @@ test_drain_cost_is_not_a_function_of_field_length() {
   pass "an over-long record field costs the drain no more than a sound one"
 }
 
+# Length alone is not the hazard - what a field COSTS to read is. Escapes are
+# the expensive shape, so plain prose passing the test above proves nothing
+# about a field built to be slow. The cost of reading a field must be bounded by
+# what the record is ALLOWED to hold, not by what a crewmate chose to write.
+test_escape_dense_field_cannot_wedge_the_drain() {
+  local state status dense section baseline dense_elapsed start
+  state=$(make_state escapedense)
+  status="$state/t.status"
+  raise_sound "$status" retry-budget >/dev/null || fail "raising failed"
+
+  start=$SECONDS
+  drain_section "$state" >/dev/null
+  baseline=$((SECONDS - start))
+
+  # 40000 escapes in one field: well inside the record-file byte ceiling, so
+  # nothing else rejects it first.
+  dense=$(awk 'BEGIN { for (i = 0; i < 40000; i++) printf "\\n" }')
+  printf 'needs-decision [key=dense]: a short note\n' >> "$state/dense.status"
+  {
+    printf 'decision\t1\tdense\t1787000000\n'
+    printf 'question\t%s\n' "$dense"
+    printf 'option\t1\tThe vendored encoder\n'
+    printf 'option\t2\tThe new encoder\n'
+    printf 'recommend\t1\tIt is already on the path.\n'
+    printf 'end\tdense\n'
+  } > "$state/dense.decisions"
+
+  start=$SECONDS
+  section=$(drain_section "$state")
+  dense_elapsed=$((SECONDS - start))
+
+  assert_contains "$section" 'MALFORMED DECISION RECORD' \
+    "a field too big to read must surface as malformed, not as structure"
+  assert_contains "$section" 'oversized-field' \
+    "the relay must name the field that was withheld rather than decoded"
+  assert_not_contains "$section" '(1) The vendored encoder' \
+    "a malformed record's fields must stay withheld"
+  # The sound decision raised above must still be rendered: one unreadable
+  # record must not cost the whole section.
+  assert_contains "$section" '(per-request) Retry per request' \
+    "the other open decisions must still render"
+  [ "$dense_elapsed" -le $((baseline + 5)) ] \
+    || fail "a 40000-escape record field made one drain take ${dense_elapsed}s against a ${baseline}s baseline; the cost of reading a field is not bounded"
+  pass "a field built to be expensive is withheld, not paid for"
+}
+
 # The property the blank-line case was one instance of: a crewmate's value
 # crosses raise, the record and the JSON payload unchanged. The payload is the
 # layer a rendering surface reads, so a divergence here shows the captain
@@ -704,6 +750,7 @@ test_broken_install_refuses_by_name
 test_mixed_decisions_do_not_borrow_each_others_fields
 test_unrenderable_option_row_is_not_counted_as_an_option
 test_drain_cost_is_not_a_function_of_field_length
+test_escape_dense_field_cannot_wedge_the_drain
 test_awkward_values_round_trip_through_the_json_payload
 test_option_label_cannot_mint_an_option
 test_digest_cannot_be_forged_by_field_prose
