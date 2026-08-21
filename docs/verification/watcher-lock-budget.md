@@ -40,8 +40,7 @@ In-process, and therefore covered: `procevent_surface_queued`'s wake-queue acqui
 Subprocesses keep the global ceiling: `fm-pr-check-migrate.sh`, `fm-procevent.sh reconcile`, `fm-inactive-reconcile.sh scan`, `fm-dispatch-poll.sh scan`, `fm-x-poll.sh` and `fm-pr-poll.sh` via `run_check_capture`, every registered `*.check.sh`, and `fm-crew-state.sh`.
 No claim is made that these are covered by the watcher budget.
 
-Re-verified on 2026-08-21 after the mechanism changed from overwriting `FM_LOCK_WAIT_TIMEOUT` to reading a private variable.
-Both directions of the property were checked:
+Verified on 2026-08-21, in both directions of the property:
 
 ```
 operator exported nothing:            in-process budget=30  subprocess FM_LOCK_WAIT_TIMEOUT=<unset>
@@ -49,10 +48,7 @@ operator exported FM_LOCK_WAIT_TIMEOUT=555: in-process budget=30  subprocess FM_
                                            subprocess _FM_LOCK_WAIT_BUDGET=<unset>
 ```
 
-The watcher's own waits use the watcher budget in both cases, and an operator's exported global now reaches the watcher's subprocesses unchanged.
-
-This supersedes an earlier record on this branch which stated the opposite - that an operator exporting a tuned global lost it for the watcher's subprocesses.
-That was accurate for the `export -n` mechanism it described and is no longer accurate for the current one.
+The watcher's own waits use the watcher budget in both cases, and an operator's exported global reaches the watcher's subprocesses unchanged.
 
 A malformed override does not disable the ceiling.
 The empty/zero/non-numeric fallback is applied to the resolved value, so `_FM_LOCK_WAIT_BUDGET` set to empty, `abc`, or `0` all yield the documented 300 default rather than an unbounded wait.
