@@ -51,8 +51,42 @@ fm_home_currency_timeout() {
 
 # A credential or host in a git error message must not be echoed into a digest
 # the captain may paste elsewhere.
+#
+# ONE LINE, AND IT HAS TO BE THE LINE THAT NAMES THE CAUSE. A transport often
+# speaks first - "Warning: Permanently added '<host>' ..." under
+# StrictHostKeyChecking=accept-new, or git's "warning: redirecting to <url>" -
+# and reporting that preamble would give a "cannot verify" line whose stated
+# reason explains nothing while "Permission denied (publickey)" is dropped. The
+# first line that is not a benign preamble is chosen, falling back to the first
+# line when every line looks like one. Redaction applies to whichever line wins,
+# never only to line 1.
 fm_home_currency_sanitize() {
-  printf '%s' "$1" | sed -n '1s|://[^/@[:space:]]*@|://<redacted>@|g;1s/[[:space:]]\{1,\}/ /g;1p'
+  local line first="" chosen=""
+  while IFS= read -r line; do
+    line=$(printf '%s' "$line" \
+      | sed 's|://[^/@[:space:]]*@|://<redacted>@|g;s/[[:space:]]\{1,\}/ /g;s/^ //;s/ $//')
+    [ -n "$line" ] || continue
+    [ -n "$first" ] || first=$line
+    case "$line" in
+      [Ww][Aa][Rr][Nn][Ii][Nn][Gg]:*|[Nn][Oo][Tt][Ee]:*|[Hh][Ii][Nn][Tt]:*|Cloning\ into*)
+        continue
+        ;;
+    esac
+    chosen=$line
+    break
+  done <<EOF
+$1
+EOF
+  printf '%s' "${chosen:-$first}"
+}
+
+# origin's advertised tip has to look like a commit id before anything compares
+# against it. A value that is not one is a failed probe, never a stand-in SHA.
+fm_home_currency_is_sha() {  # <value>
+  case "$1" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -ge 7 ]
 }
 
 # --- origin probe -----------------------------------------------------------
@@ -61,21 +95,40 @@ fm_home_currency_sanitize() {
 # origin, so the advertised tip is cached per origin URL and one bootstrap run
 # pays for at most one round trip per distinct remote.
 
+# THE FIELD SEPARATOR MUST NOT BE IFS WHITESPACE. A tab, space, or newline in
+# IFS makes `read` collapse runs of the separator, so a cached FAILED probe -
+# whose sha and branch are both empty - would read back with the error text in
+# the sha field and no error at all, and the replay would look like a SUCCESS.
+# That turns the "cannot verify" path into a false drift claim on every other
+# home sharing the origin. A unit separator is not IFS whitespace, so each
+# occurrence delimits exactly one field and empty fields round-trip intact.
+FM_HOME_CURRENCY_FS=$'\x1f'
+
 FM_HOME_CURRENCY_CACHE=""
 FM_HOME_CURRENCY_PROBE_SHA=""
 FM_HOME_CURRENCY_PROBE_BRANCH=""
 FM_HOME_CURRENCY_PROBE_ERROR=""
 
+# A cache hit must be indistinguishable in outcome from re-running the probe:
+# a stored failure replays as a failure, carrying its original reason.
 fm_home_currency_cache_lookup() {  # <url>
   local url=$1 c_url c_sha c_branch c_err
   [ -n "$FM_HOME_CURRENCY_CACHE" ] || return 1
-  while IFS=$'\t' read -r c_url c_sha c_branch c_err; do
+  while IFS=$FM_HOME_CURRENCY_FS read -r c_url c_sha c_branch c_err; do
     [ "$c_url" = "$url" ] || continue
+    if [ -z "$c_err" ] && ! fm_home_currency_is_sha "$c_sha"; then
+      c_err="origin advertised no default branch commit"
+    fi
+    if [ -n "$c_err" ]; then
+      FM_HOME_CURRENCY_PROBE_SHA=""
+      FM_HOME_CURRENCY_PROBE_BRANCH=""
+      FM_HOME_CURRENCY_PROBE_ERROR=$c_err
+      return 1
+    fi
     FM_HOME_CURRENCY_PROBE_SHA=$c_sha
     FM_HOME_CURRENCY_PROBE_BRANCH=$c_branch
-    FM_HOME_CURRENCY_PROBE_ERROR=$c_err
-    [ -z "$c_err" ]
-    return
+    FM_HOME_CURRENCY_PROBE_ERROR=""
+    return 0
   done <<EOF
 $FM_HOME_CURRENCY_CACHE
 EOF
@@ -83,8 +136,14 @@ EOF
 }
 
 fm_home_currency_cache_store() {  # <url>
+  local entry
+  entry=$(printf '%s%s%s%s%s%s%s' \
+    "$1" "$FM_HOME_CURRENCY_FS" \
+    "$FM_HOME_CURRENCY_PROBE_SHA" "$FM_HOME_CURRENCY_FS" \
+    "$FM_HOME_CURRENCY_PROBE_BRANCH" "$FM_HOME_CURRENCY_FS" \
+    "$FM_HOME_CURRENCY_PROBE_ERROR")
   FM_HOME_CURRENCY_CACHE="${FM_HOME_CURRENCY_CACHE:+$FM_HOME_CURRENCY_CACHE
-}$1	$FM_HOME_CURRENCY_PROBE_SHA	$FM_HOME_CURRENCY_PROBE_BRANCH	$FM_HOME_CURRENCY_PROBE_ERROR"
+}$entry"
 }
 
 # Ask origin for its default branch tip. Sets FM_HOME_CURRENCY_PROBE_SHA and
@@ -122,8 +181,11 @@ fm_home_currency_probe() {  # <dir>
       | sed -n 's|^ref: refs/heads/\([^[:space:]]*\)[[:space:]].*|\1|p' | head -n 1)
     FM_HOME_CURRENCY_PROBE_SHA=$(printf '%s\n' "$out" \
       | sed -n 's/^\([0-9a-f]\{7,40\}\)[[:space:]].*$/\1/p' | head -n 1)
-    [ -n "$FM_HOME_CURRENCY_PROBE_SHA" ] \
-      || FM_HOME_CURRENCY_PROBE_ERROR="origin advertised no default branch commit"
+    fm_home_currency_is_sha "$FM_HOME_CURRENCY_PROBE_SHA" || {
+      FM_HOME_CURRENCY_PROBE_SHA=""
+      FM_HOME_CURRENCY_PROBE_BRANCH=""
+      FM_HOME_CURRENCY_PROBE_ERROR="origin advertised no default branch commit"
+    }
   fi
   fm_home_currency_cache_store "$url"
   [ -z "$FM_HOME_CURRENCY_PROBE_ERROR" ]

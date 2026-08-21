@@ -303,6 +303,100 @@ EOF
   pass "home currency: no origin, an unreachable origin, a missing home, and a non-git home each report unverified, not current"
 )
 
+# --- 10b. one unreachable origin, two homes: BOTH report unverified ---------
+#
+# The primary and its linked-worktree secondmate share one origin URL, so the
+# second home's probe is a CACHE HIT on the first home's FAILED probe. A cached
+# failure that replayed as a success would hand the error text back as origin's
+# commit and print a drift claim - a check that cannot check looking exactly
+# like a check that ran, which is the one thing this must never do. Both homes
+# are reported in ONE shell, the way bin/fm-bootstrap.sh reports them.
+(
+  dir="$TMP_ROOT/unreachable-shared"
+  read -r home _origin <<EOF
+$(make_fleet "$dir" 3)
+EOF
+  git -C "$home" worktree add -q --detach "$dir/ops-home" HEAD~1
+  git -C "$home" remote set-url origin "file://$dir/absent-origin.git"
+  # shellcheck source=bin/fm-home-currency-lib.sh disable=SC1091
+  . "$LIB"
+  FM_HOME_CURRENCY_CACHE=""
+  # Redirection, not command substitution: the cache has to survive from the
+  # first home to the second for this case to exercise the replay at all.
+  fm_home_currency_report 'this home' "$home" > "$dir/primary.out"
+  fm_home_currency_report 'secondmate ops' "$dir/ops-home" > "$dir/secondmate.out"
+  both=$(cat "$dir/primary.out" "$dir/secondmate.out")
+
+  assert_contains "$(cat "$dir/primary.out")" "HOME_CURRENCY: cannot verify this home against origin" \
+    "the first home on an unreachable origin did not report an unverifiable check"
+  assert_contains "$(cat "$dir/secondmate.out")" "HOME_CURRENCY: cannot verify secondmate ops against origin" \
+    "the second home sharing that unreachable origin did not report an unverifiable check"
+  assert_contains "$(cat "$dir/secondmate.out")" "origin could not be read" \
+    "the replayed failure lost the reason the first probe recorded"
+  for out_file in "$dir/primary.out" "$dir/secondmate.out"; do
+    assert_contains "$(cat "$out_file")" "UNVERIFIED against the fleet, which is not the same as confirmed current" \
+      "$out_file did not distinguish an unverifiable check from a pass"
+  done
+  for claim in "is not at origin/" "commits behind" "commits ahead" "has diverged"; do
+    assert_not_contains "$both" "$claim" \
+      "a check that could not reach origin claimed drift it never measured"
+  done
+
+  # And the replay itself, at the boundary: a cached failure is a failure.
+  url=$(git -C "$home" remote get-url origin)
+  FM_HOME_CURRENCY_PROBE_SHA=sentinel
+  FM_HOME_CURRENCY_PROBE_BRANCH=sentinel
+  if fm_home_currency_cache_lookup "$url"; then
+    fail "a cached failed probe replayed as a successful lookup"
+  fi
+  [ -n "$FM_HOME_CURRENCY_PROBE_ERROR" ] \
+    || fail "a cached failed probe replayed without the error it recorded"
+  [ -z "$FM_HOME_CURRENCY_PROBE_SHA" ] \
+    || fail "a cached failed probe replayed with '$FM_HOME_CURRENCY_PROBE_SHA' standing in for origin's commit"
+  [ -z "$FM_HOME_CURRENCY_PROBE_BRANCH" ] \
+    || fail "a cached failed probe replayed with '$FM_HOME_CURRENCY_PROBE_BRANCH' standing in for origin's branch"
+
+  pass "home currency: two homes on one unreachable origin both report unverified, and neither invents drift"
+)
+
+# --- 10c. one reachable origin, two homes, one round trip -------------------
+#
+# The cache still has to do its job: the primary checkout and every linked
+# worktree share an origin, and a bootstrap run pays for at most one probe per
+# distinct remote. Origin is moved away after the first probe, so the second
+# home can only be answered from the cache - and the control below shows it
+# would otherwise fail.
+(
+  dir="$TMP_ROOT/cache-hit"
+  read -r home origin <<EOF
+$(make_fleet "$dir" 5)
+EOF
+  git -C "$home" worktree add -q --detach "$dir/ops-home" HEAD~3
+  # shellcheck source=bin/fm-home-currency-lib.sh disable=SC1091
+  . "$LIB"
+  FM_HOME_CURRENCY_CACHE=""
+  fm_home_currency_report 'this home' "$home" > "$dir/primary.out"
+  [ -s "$dir/primary.out" ] \
+    && fail "a current home printed a line: $(cat "$dir/primary.out")"
+  entries=$(printf '%s\n' "$FM_HOME_CURRENCY_CACHE" | grep -c . || true)
+  [ "$entries" = 1 ] \
+    || fail "one distinct origin produced $entries cache entries, expected 1"
+
+  mv "$origin" "$origin.gone"
+  fm_home_currency_report 'secondmate ops' "$dir/ops-home" > "$dir/secondmate.out"
+  assert_contains "$(cat "$dir/secondmate.out")" "HOME_CURRENCY: secondmate ops is 3 commits behind origin/main" \
+    "the second home on the same origin was not answered from the first home's probe"
+
+  # The control: without the cache that same home cannot reach origin at all,
+  # which is what makes the line above proof of a cache hit rather than luck.
+  FM_HOME_CURRENCY_CACHE=""
+  fm_home_currency_report 'secondmate ops' "$dir/ops-home" > "$dir/nocache.out"
+  assert_contains "$(cat "$dir/nocache.out")" "HOME_CURRENCY: cannot verify secondmate ops against origin" \
+    "origin was still reachable, so this case never proved the cache was used"
+  mv "$origin.gone" "$origin"
+  pass "home currency: homes sharing one origin cost one round trip, and the cached tip answers the rest"
+)
+
 # --- 11. a credential in an origin URL never reaches the reported line ------
 (
   dir="$TMP_ROOT/redaction"
@@ -316,7 +410,35 @@ EOF
   assert_contains "$out" "HOME_CURRENCY: cannot verify this home against origin" \
     "an unreachable authenticated origin did not report an unverifiable check"
   assert_not_contains "$out" "s3cr3t-token" "the reported line leaked the origin credential"
-  pass "home currency: an origin credential is redacted out of the reported failure"
+
+  # A transport that speaks first must not become the reason. The reported line
+  # is still exactly one line, still whitespace-collapsed, and the redaction
+  # follows whichever line is chosen rather than only line 1.
+  reason=$(fm_home_currency_sanitize "Warning: Permanently added 'forge.invalid' (ED25519) to the list of known hosts.
+git@forge.invalid: Permission denied (publickey).
+fatal: Could not read from remote repository.")
+  assert_contains "$reason" "Permission denied (publickey)" \
+    "a benign ssh preamble was reported as the reason instead of the real cause"
+  [ "$(printf '%s\n' "$reason" | grep -c .)" = 1 ] \
+    || fail "the sanitized reason was not exactly one line: $reason"
+
+  reason=$(fm_home_currency_sanitize "warning: redirecting to https://fmtest:s3cr3t-token@127.0.0.1:1/firstmate.git
+fatal: unable to access 'https://fmtest:s3cr3t-token@127.0.0.1:1/firstmate.git':   could not resolve host")
+  assert_contains "$reason" "fatal: unable to access" \
+    "a redirect preamble was reported as the reason instead of the real cause"
+  assert_contains "$reason" "<redacted>@" \
+    "the chosen line's credential was not redacted"
+  assert_not_contains "$reason" "s3cr3t-token" \
+    "redaction followed line 1 instead of the line actually reported"
+  assert_not_contains "$reason" "':   could not" \
+    "the chosen line was not whitespace-collapsed"
+
+  reason=$(fm_home_currency_sanitize "warning: one
+warning: two")
+  [ "$reason" = "warning: one" ] \
+    || fail "an error made only of warnings did not fall back to its first line: $reason"
+
+  pass "home currency: an origin credential is redacted out of the reported failure, and the reason names the real cause"
 )
 
 # --- 12. the check never mutates the home it reports on ---------------------
