@@ -132,12 +132,24 @@ fm_decision_encode() {  # <value> -> encoded on stdout
 # which is what ordinary prose is - is therefore copied once, and the loop turns
 # only as many times as the value has escapes to resolve.
 #
-# Its cost is bounded because its INPUT is bounded: every caller gates the
-# encoded value through fm_decision_encoded_within_bound first, so no value
-# reaches this loop that a length cap has not already had the chance to reject.
-# The run-at-a-time walk is defence in depth behind that gate, not instead of it.
-fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE
+# Its cost is bounded because THIS FUNCTION applies the bound, before the loop
+# and on every path into it. A caller cannot forget the gate, because there is
+# no way past it: a value too long to belong to any sound field is WITHHELD -
+# FM_DECISION_VALUE is empty and FM_DECISION_VALUE_WITHHELD is 1 - and the loop
+# never runs. The run-at-a-time walk below is then defence in depth behind a
+# bound that holds structurally, rather than the whole of the defence.
+#
+# It never fails: a caller that does not care about the distinction reads an
+# empty value, and the record carries oversized-field through the one validator
+# so the withholding surfaces as a malformed record rather than as an error.
+fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE, FM_DECISION_VALUE_WITHHELD
   local s=$1 out='' head rest c bs=$'\\'
+  if ! fm_decision_encoded_within_bound "$s"; then
+    FM_DECISION_VALUE=
+    FM_DECISION_VALUE_WITHHELD=1
+    return 0
+  fi
+  FM_DECISION_VALUE_WITHHELD=0
   while :; do
     case "$s" in
       *"$bs"*) : ;;
@@ -164,10 +176,12 @@ fm_decision_decode_var() {  # <encoded> -> FM_DECISION_VALUE
   FM_DECISION_VALUE=$out
 }
 FM_DECISION_VALUE=
+FM_DECISION_VALUE_WITHHELD=0
 
-# The gate every decode site asks first: is this encoded value small enough to
-# be worth decoding at all? Returns 1 for a value that cannot belong to a sound
-# record, so its caller records a defect instead of paying to prove it.
+# The bound itself: is this encoded value small enough to be worth decoding at
+# all? fm_decision_decode_var applies it to every value it is given, so a caller
+# only asks this directly when it must decide something WITHOUT decoding - which
+# rows belong in the option list, say.
 fm_decision_encoded_within_bound() {  # <encoded>
   [ "${#1}" -le "$FM_DECISION_MAX_ENCODED" ]
 }
@@ -290,12 +304,17 @@ fm_decision_record_path() {  # <status-file> -> record path on stdout
 #
 # FM_DECISION_OPTIONS holds ENCODED labels (see fm_decision_decode_var), so this
 # is one of the few places allowed to decode: it hands back exactly one label.
+#
+# A label the decoder withheld is reported as a MISS rather than as an empty
+# label: an option whose text cannot be read is not an option a recommendation
+# can name, and every caller already treats a miss as recommend-unknown-option.
 fm_decision_option_label() {  # <id> -> label on stdout
   local want=$1 id label
   while IFS=$'\t' read -r id label; do
     [ -n "$id$label" ] || continue
     if [ "$id" = "$want" ]; then
       fm_decision_decode_var "$label"
+      [ "$FM_DECISION_VALUE_WITHHELD" -eq 0 ] || return 1
       printf '%s' "$FM_DECISION_VALUE"
       return 0
     fi
@@ -362,13 +381,10 @@ EOF
       question)
         [ "$in_block" -eq 1 ] || continue
         blk_seen_q=1
-        if fm_decision_encoded_within_bound "$a"; then
-          fm_decision_decode_var "$a"
-          blk_q=$FM_DECISION_VALUE
-        else
-          blk_q=''
-          blk_pd="$blk_pd oversized-field question-too-long"
-        fi
+        fm_decision_decode_var "$a"
+        blk_q=$FM_DECISION_VALUE
+        [ "$FM_DECISION_VALUE_WITHHELD" -eq 0 ] \
+          || blk_pd="$blk_pd oversized-field question-too-long"
         ;;
       option)
         [ "$in_block" -eq 1 ] || continue
@@ -397,13 +413,10 @@ EOF
       recommend)
         [ "$in_block" -eq 1 ] || continue
         blk_rid=$a
-        if fm_decision_encoded_within_bound "$b"; then
-          fm_decision_decode_var "$b"
-          blk_why=$FM_DECISION_VALUE
-        else
-          blk_why=''
-          blk_pd="$blk_pd oversized-field rationale-too-long"
-        fi
+        fm_decision_decode_var "$b"
+        blk_why=$FM_DECISION_VALUE
+        [ "$FM_DECISION_VALUE_WITHHELD" -eq 0 ] \
+          || blk_pd="$blk_pd oversized-field rationale-too-long"
         ;;
       end)
         [ "$in_block" -eq 1 ] || continue
@@ -475,14 +488,14 @@ fm_decision_defects_var() {  # -> FM_DECISION_DEFECT_CODES
     case " $ids " in *" $id "*) dup_id=1 ;; esac
     ids="$ids $id"
     # The label is encoded in the accumulator; measure and compare the text it
-    # actually is - but only once it has cleared the gate, so the writer refuses
-    # an oversized label on the same terms the reader withholds one.
-    if ! fm_decision_encoded_within_bound "$label"; then
+    # actually is. A label the decoder withheld is past every cap by definition,
+    # so the writer refuses it on the same terms the reader withholds one.
+    fm_decision_decode_var "$label"; text=$FM_DECISION_VALUE
+    if [ "$FM_DECISION_VALUE_WITHHELD" -ne 0 ]; then
       oversized=1
       long_opt=1
       continue
     fi
-    fm_decision_decode_var "$label"; text=$FM_DECISION_VALUE
     fm_decision_normalise_var "$text"; n=$FM_DECISION_NORM
     if [ -z "$n" ]; then
       empty_opt=1

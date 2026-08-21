@@ -705,6 +705,63 @@ test_escape_dense_field_cannot_wedge_the_drain() {
   pass "a field built to be expensive is withheld, not paid for"
 }
 
+# The bound has to hold wherever a label is READ BACK, not only where the record
+# is parsed. Resolving an option id is the lookup an answering surface makes, so
+# an unreadable label must come back as a refusal, promptly, rather than as the
+# cost of decoding it.
+test_option_lookup_refuses_an_unreadable_label() {
+  local state status dense rc start elapsed
+  state=$(make_state lookupbound)
+  status="$state/t.status"
+  dense=$(awk 'BEGIN { for (i = 0; i < 40000; i++) printf "\\t" }')
+  printf 'needs-decision [key=k]: a short note\n' > "$status"
+  {
+    printf 'decision\t1\tk\t1787000000\n'
+    printf 'question\tWhich encoder should the importer use?\n'
+    printf 'option\t1\t%s\n' "$dense"
+    printf 'option\t2\tThe new encoder\n'
+    printf 'recommend\t2\tIt is already on the path.\n'
+    printf 'end\tk\n'
+  } > "$state/t.decisions"
+
+  start=$SECONDS
+  rc=0
+  "$RAISE" option --status "$status" --key k --id 1 >/dev/null 2>&1 || rc=$?
+  elapsed=$((SECONDS - start))
+  [ "$rc" -ne 0 ] || fail "resolving an option whose label cannot be read must refuse"
+  [ "$elapsed" -le 5 ] \
+    || fail "resolving an unreadable option label took ${elapsed}s; the lookup pays the decode cost instead of refusing"
+  pass "an option id whose label is unreadable is refused, not decoded"
+}
+
+# The same bound on the WRITE side. A worker who pastes a blob into --option and
+# then recommends it must get the refusal that points at the free-text line
+# straight away - the diagnostic only works if it arrives.
+test_raise_refuses_a_recommended_blob_promptly() {
+  local state status blob err rc start elapsed
+  state=$(make_state raisebound)
+  status="$state/t.status"
+  err="$state/err.txt"
+  blob=$(awk 'BEGIN { for (i = 0; i < 3000; i++) printf "\t" }')
+
+  start=$SECONDS
+  rc=0
+  "$RAISE" raise --status "$status" --key k \
+    --question "Which encoder should the importer use?" \
+    --option "$blob" --option "The new encoder" \
+    --recommend 1 --because "It is already on the path." >/dev/null 2>"$err" || rc=$?
+  elapsed=$((SECONDS - start))
+
+  [ "$rc" -ne 0 ] || fail "a raise whose recommended option is a pasted blob must be refused"
+  assert_grep 'oversized-field' "$err" "the refusal must name the field that could not be read"
+  assert_grep 'raise it as free text' "$err" \
+    "the refusal must still point at the free-text line, which is the whole point of refusing"
+  assert_absent "$status" "a refused raise must not append a status line"
+  [ "$elapsed" -le 5 ] \
+    || fail "refusing a recommended blob took ${elapsed}s; the raise decodes it before refusing"
+  pass "a recommended blob is refused promptly, with the free-text line named"
+}
+
 # The property the blank-line case was one instance of: a crewmate's value
 # crosses raise, the record and the JSON payload unchanged. The payload is the
 # layer a rendering surface reads, so a divergence here shows the captain
@@ -751,6 +808,8 @@ test_mixed_decisions_do_not_borrow_each_others_fields
 test_unrenderable_option_row_is_not_counted_as_an_option
 test_drain_cost_is_not_a_function_of_field_length
 test_escape_dense_field_cannot_wedge_the_drain
+test_option_lookup_refuses_an_unreadable_label
+test_raise_refuses_a_recommended_blob_promptly
 test_awkward_values_round_trip_through_the_json_payload
 test_option_label_cannot_mint_an_option
 test_digest_cannot_be_forged_by_field_prose
