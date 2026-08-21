@@ -524,7 +524,7 @@ procevent_surface_queued() {
   # A contended queue lock skips this cycle rather than killing the watcher: the
   # queued procevent keys are still queued and still unmarked, so the next poll
   # re-surfaces exactly the same set and nothing is lost.
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" "$FM_WATCH_LOCK_WAIT_TIMEOUT" || return 0
   while IFS= read -r key; do
     case "$key" in procevent:*) ;; *) continue ;; esac
     [ -e "$(procevent_surfaced_marker "$key")" ] && continue

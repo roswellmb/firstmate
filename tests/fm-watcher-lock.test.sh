@@ -237,6 +237,44 @@ test_unsafe_recovery_marker_still_exits_the_watcher() {
   pass "an unsafe recovery marker still exits the watcher loudly"
 }
 
+# The watcher's own locks get FM_WATCH_LOCK_WAIT_TIMEOUT, not the global
+# FM_LOCK_WAIT_TIMEOUT that is sized for the deliberate ~120s .lock.acquire
+# hold. Setting the global HIGH and the watcher budget LOW proves the split is
+# actually wired: if the watcher still read the global, it would sit on the
+# wedged lock far past the short budget and never print the give-up line.
+test_watcher_lock_waits_use_the_watch_budget_not_the_global_ceiling() {
+  local dir state out live pid waited
+  dir=$(make_case watcher-split-lock-budget)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+
+  sleep 300 &
+  live=$!
+  mkdir "$state/.wake-queue.lock"
+  printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
+
+  # Startup's own arm-check hits the wedged lock, so the give-up line is emitted
+  # before the poll loop and this stays fast.
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 \
+    FM_LOCK_WAIT_TIMEOUT=600 FM_WATCH_LOCK_WAIT_TIMEOUT=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 200
+  kill -KILL "$live" 2>/dev/null || true
+  rm -rf "$state/.wake-queue.lock"
+
+  waited=$(sed -n 's/^fm-lock: gave up after \([0-9][0-9]*\)s waiting for .*wake-queue\.lock.*/\1/p' "$out" | head -1)
+  [ -n "$waited" ] \
+    || fail "the watcher never gave up on the wedged wake-queue lock: $(cat "$out")"
+  [ "$waited" = 1 ] \
+    || fail "the watcher waited on the global ceiling (${waited}s), not the watch budget: $(cat "$out")"
+  grep -q "recovery state is locked by another process" "$out" \
+    || fail "contention was not reported as contention: $(cat "$out")"
+  pass "the watcher's own lock waits use FM_WATCH_LOCK_WAIT_TIMEOUT, not the global ceiling"
+}
+
 test_lock_wait_returns_when_this_process_already_holds_it() {
   local dir state out pid status
   dir=$(make_case lock-wait-reentrant)
@@ -1358,6 +1396,7 @@ test_lock_wait_gives_up_loudly_on_a_foreign_live_holder
 test_watcher_signalled_inside_its_recovery_marker_lock_still_exits
 test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher
 test_unsafe_recovery_marker_still_exits_the_watcher
+test_watcher_lock_waits_use_the_watch_budget_not_the_global_ceiling
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc
