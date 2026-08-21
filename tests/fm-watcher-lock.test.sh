@@ -158,7 +158,11 @@ test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher() 
 
   # The startup arm-check runs before the poll loop, so the lock is taken only
   # once the watcher is provably cycling - otherwise this would test startup.
-  FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_LOCK_WAIT_TIMEOUT=1 \
+  # The budget has to be the WATCHER's own (FM_WATCH_LOCK_WAIT_TIMEOUT): the
+  # watcher never reads the global ceiling, so setting only that one left the
+  # contended cycle sitting on the 30s default and the waits below timed out on
+  # a healthy watcher.
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_WATCH_LOCK_WAIT_TIMEOUT=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     "$WATCH" > "$out" 2>&1 &
   pid=$!
