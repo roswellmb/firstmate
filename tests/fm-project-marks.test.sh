@@ -283,7 +283,50 @@ kind=forged"); status=$?
   [ "$status" -ne 0 ] || fail "--despite-block on a secondmate spawn should exit non-zero"
   assert_contains "$out" "a secondmate spawn stands up a home, not work in a project" \
     "the refusal did not say why the flag has no meaning for a secondmate spawn"
+
+  # A RELAUNCH takes its kind from the task record rather than the command line,
+  # so the parse-time guard above sees only the default "ship". The flag has to
+  # be refused again once the real kind is known, or a secondmate relaunch
+  # carries an acknowledgement that no mark was ever consulted for straight into
+  # its task record.
+  mkdir -p "$home/state"
+  {
+    printf 'window=fmses:fm-marks-hyg-sm2\n'
+    printf 'endpoint_task_id=marks-hyg-sm2\n'
+    printf 'worktree=%s\n' "$home"
+    printf 'home=%s\n' "$home"
+    printf 'harness=claude\n'
+    printf 'kind=secondmate\n'
+  } > "$home/state/marks-hyg-sm2.meta"
+  out=$(run_spawn "$home" "$fakebin" marks-hyg-sm2 --relaunch --despite-block "carried out of habit"); status=$?
+  [ "$status" -ne 0 ] || fail "--despite-block on a secondmate relaunch should exit non-zero"
+  assert_contains "$out" "a secondmate spawn stands up a home, not work in a project" \
+    "the refusal did not say why the flag has no meaning for a secondmate relaunch"
+  assert_no_grep "block_override=" "$home/state/marks-hyg-sm2.meta" \
+    "a refused acknowledgement was written into a secondmate task record"
   pass "fm-spawn: the override flag is refused where it grants nothing or would forge a record"
+}
+
+# The stated reason answers "why does THIS task not depend on the missing
+# input", which is not a property a batch can share. A silently dropped flag is
+# the pattern this script refuses everywhere else, so a batch refuses it.
+test_the_override_flag_is_refused_on_a_batch() {
+  local rec home proj fakebin out status
+  rec=$(make_home batch)
+  IFS='|' read -r home proj fakebin <<EOF
+$rec
+EOF
+  set_marks "$home" "$BLOCKED_MARK"
+  write_brief "$home" marks-batch-a no-mistakes
+  write_brief "$home" marks-batch-b no-mistakes
+  out=$(run_spawn "$home" "$fakebin" "marks-batch-a=$proj" "marks-batch-b=$proj" claude \
+    --mode no-mistakes --yolo off --despite-block "reindexes the CLI"); status=$?
+  [ "$status" -ne 0 ] || fail "--despite-block on a batch dispatch should exit non-zero"
+  assert_contains "$out" "not shareable across a batch" \
+    "the refusal did not say why one stated reason cannot cover several tasks"
+  assert_absent "$home/state/marks-batch-a.meta" "a refused batch wrote a task record"
+  assert_absent "$home/state/marks-batch-b.meta" "a refused batch wrote a task record"
+  pass "fm-spawn: a batch refuses the override flag rather than silently dropping it"
 }
 
 # An unreadable marks file must stop dispatch, not wave it through.
@@ -334,6 +377,7 @@ test_a_marked_project_refuses_every_spawn_and_names_the_mark
 test_no_flag_overrides_an_exclusion
 test_a_stated_reason_carries_a_spawn_past_a_feasibility_block
 test_the_override_flag_is_refused_where_it_grants_nothing
+test_the_override_flag_is_refused_on_a_batch
 test_an_unparseable_marks_file_refuses_the_spawn
 test_an_unmarked_project_is_entirely_unaffected
 echo "# all fm-project-marks tests passed"
