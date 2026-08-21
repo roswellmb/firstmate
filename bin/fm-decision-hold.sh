@@ -296,7 +296,7 @@ command_complete() {
   [ -f "$meta" ] && has_meta=1
   if [ "$has_meta" = 1 ]; then
     DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
-    fm_lock_acquire_wait "$DECISION_META_LOCK"
+    fm_lock_acquire_wait "$DECISION_META_LOCK" || fail "could not acquire the task metadata lock"
     DECISION_META_LOCK_HELD=1
     [ -f "$meta" ] || fail "task metadata disappeared while recording completion"
   fi
