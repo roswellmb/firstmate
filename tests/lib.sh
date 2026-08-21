@@ -50,6 +50,14 @@ export FM_HOME_CURRENCY_TEST_SKIP=1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # --- reporters --------------------------------------------------------------
+#
+# fail() ABORTS THE WHOLE FILE, and that is the contract bin/fm-test-run.sh
+# reads: it decides pass/fail from the script's exit code and never parses this
+# output, so a `not ok` line that does not also end the script is invisible to
+# the suite. `exit 1` only leaves the current shell, so a case wrapped in a
+# subshell must propagate that status itself (see tests/fm-home-currency.test.sh's
+# run_case); otherwise the file's status is merely its last case's, and a failure
+# anywhere earlier prints its `not ok` and still exits 0.
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2

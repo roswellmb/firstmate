@@ -112,7 +112,8 @@ boot_network() {
 }
 
 # --- 1. a current home is silent, and that silence is a verdict -------------
-(
+test_a_current_home_is_silent_and_that_silence_is_a_verdict() {
+  local home _origin out
   read -r home _origin <<EOF
 $(make_fleet "$TMP_ROOT/current" 3)
 EOF
@@ -126,10 +127,11 @@ EOF
     || fail "the origin default branch resolved to '$FM_HOME_CURRENCY_BRANCH', not main"
   [ -z "$out" ] || fail "a current home printed a line: $out"
   pass "home currency: a home at origin's default-branch tip reports current and prints nothing"
-)
+}
 
 # --- 2. behind, with the origin commits already in the object store ---------
-(
+test_behind_with_the_origin_commits_already_in_the_object_store() {
+  local dir home _origin out
   dir="$TMP_ROOT/behind"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -146,13 +148,14 @@ EOF
   assert_contains "$out" "/updatefirstmate" \
     "the behind line did not point at the path that actually updates a home"
   pass "home currency: a home behind origin reports exactly how far behind it is"
-)
+}
 
 # --- 3. behind, with the origin commit absent from the object store ---------
 #
 # The home has never fetched, so the distance cannot be counted. That must read
 # as "does not match the fleet", never as a pass.
-(
+test_behind_with_the_origin_commit_absent_from_the_object_store() {
+  local dir home _origin out
   dir="$TMP_ROOT/unfetched"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -173,7 +176,7 @@ EOF
   assert_contains "$out" "treat it as not matching the fleet" \
     "an unmeasurable distance was not resolved against the fleet"
   pass "home currency: a home that cannot measure its distance still reports not matching the fleet"
-)
+}
 
 # --- 3b. a stale home that fetched long ago still gets a truthful number ----
 #
@@ -181,7 +184,8 @@ EOF
 # remote-tracking ref is old, and origin has moved on past it. The exact
 # distance needs a fetch, but the old ref bounds it from below, which is far
 # more use than no number at all.
-(
+test_a_home_whose_origin_moved_past_its_last_fetch_reports_a_lower_bound() {
+  local dir home _origin out
   dir="$TMP_ROOT/lower-bound"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -200,13 +204,14 @@ EOF
   assert_contains "$out" "the exact distance needs a fetch this check will not perform" \
     "the line did not distinguish the bound from the exact distance"
   pass "home currency: a home whose origin moved past its last fetch reports a truthful lower bound"
-)
+}
 
 # --- 4. a detached HEAD at origin's tip is current, not an error ------------
 #
 # Secondmate homes are leased detached on the default branch, so detachment must
 # never be mistaken for a failed check.
-(
+test_a_detached_head_at_origins_tip_is_current_not_an_error() {
+  local dir home _origin out
   dir="$TMP_ROOT/detached"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 3)
@@ -222,10 +227,11 @@ EOF
     || fail "a detached home at origin's tip was classified $FM_HOME_CURRENCY_STATUS, not current"
   [ -z "$out" ] || fail "a detached home at origin's tip printed a line: $out"
   pass "home currency: a detached HEAD at origin's tip is current, the way a leased secondmate home sits"
-)
+}
 
 # --- 5. ahead ---------------------------------------------------------------
-(
+test_a_home_ahead_of_origin_names_what_the_fleet_does_not_have() {
+  local dir home _origin out
   dir="$TMP_ROOT/ahead"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -241,10 +247,11 @@ EOF
   assert_contains "$out" "the fleet does not have" \
     "the ahead line did not say what running unlanded instructions means"
   pass "home currency: a home ahead of origin reports the instructions the fleet does not have"
-)
+}
 
 # --- 6. diverged ------------------------------------------------------------
-(
+test_a_diverged_home_reports_both_distances() {
+  local dir home _origin out
   dir="$TMP_ROOT/diverged"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -260,10 +267,11 @@ EOF
   assert_contains "$out" "HOME_CURRENCY: this home has diverged from origin/main (1 commit ahead, 2 commits behind" \
     "a diverged home did not report both distances"
   pass "home currency: a diverged home reports both distances rather than picking one"
-)
+}
 
 # --- 7-10. a check that cannot check never looks like a check that passed ---
-(
+test_a_check_that_cannot_check_never_looks_like_a_check_that_passed() {
+  local dir home _origin out
   dir="$TMP_ROOT/unverifiable"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 1)
@@ -301,7 +309,7 @@ EOF
   assert_contains "$out" "not a git checkout" "the reason did not name the missing checkout"
 
   pass "home currency: no origin, an unreachable origin, a missing home, and a non-git home each report unverified, not current"
-)
+}
 
 # --- 10b. one unreachable origin, two homes: BOTH report unverified ---------
 #
@@ -311,7 +319,8 @@ EOF
 # commit and print a drift claim - a check that cannot check looking exactly
 # like a check that ran, which is the one thing this must never do. Both homes
 # are reported in ONE shell, the way bin/fm-bootstrap.sh reports them.
-(
+test_two_homes_on_one_unreachable_origin_both_report_unverified() {
+  local dir home _origin out out_file both claim url
   dir="$TMP_ROOT/unreachable-shared"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 3)
@@ -357,7 +366,7 @@ EOF
     || fail "a cached failed probe replayed with '$FM_HOME_CURRENCY_PROBE_BRANCH' standing in for origin's branch"
 
   pass "home currency: two homes on one unreachable origin both report unverified, and neither invents drift"
-)
+}
 
 # --- 10c. one reachable origin, two homes, one round trip -------------------
 #
@@ -366,7 +375,8 @@ EOF
 # distinct remote. Origin is moved away after the first probe, so the second
 # home can only be answered from the cache - and the control below shows it
 # would otherwise fail.
-(
+test_two_homes_on_one_reachable_origin_cost_one_round_trip() {
+  local dir home origin entries
   dir="$TMP_ROOT/cache-hit"
   read -r home origin <<EOF
 $(make_fleet "$dir" 5)
@@ -395,10 +405,11 @@ EOF
     "origin was still reachable, so this case never proved the cache was used"
   mv "$origin.gone" "$origin"
   pass "home currency: homes sharing one origin cost one round trip, and the cached tip answers the rest"
-)
+}
 
 # --- 11. a credential in an origin URL never reaches the reported line ------
-(
+test_an_origin_credential_never_reaches_the_reported_line() {
+  local dir home _origin out reason
   dir="$TMP_ROOT/redaction"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 1)
@@ -439,10 +450,11 @@ warning: two")
     || fail "an error made only of warnings did not fall back to its first line: $reason"
 
   pass "home currency: an origin credential is redacted out of the reported failure, and the reason names the real cause"
-)
+}
 
 # --- 12. the check never mutates the home it reports on ---------------------
-(
+test_the_check_never_mutates_the_home_it_reports_on() {
+  local dir home _origin out before after
   dir="$TMP_ROOT/readonly-lib"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -464,10 +476,11 @@ EOF
   [ "$(git -C "$home" rev-list --count HEAD)" = 2 ] \
     || fail "the home advanced past the commits it had before the check"
   pass "home currency: reporting a stale home leaves its refs, objects, and working tree byte-identical"
-)
+}
 
 # --- 13. bin/fm-bootstrap.sh reports a stale home in its network phase ------
-(
+test_bootstrap_reports_a_stale_home_in_its_network_phase() {
+  local dir home _origin fakebin out
   dir="$TMP_ROOT/boot-stale"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -481,10 +494,11 @@ EOF
     "bootstrap did not report its own home as behind the fleet"
   assert_contains "$out" "NEEDS_GH_AUTH" "the network phase did not run at all"
   pass "home currency: bin/fm-bootstrap.sh reports its own home as eight commits behind"
-)
+}
 
 # --- 14. a current home adds no line, and the run is proved to have happened -
-(
+test_bootstrap_adds_no_line_for_a_current_home() {
+  local dir home _origin fakebin out
   dir="$TMP_ROOT/boot-current"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 4)
@@ -496,14 +510,15 @@ EOF
     "the positive control is missing, so this run proves nothing about silence"
   assert_not_contains "$out" "HOME_CURRENCY" "a current home added routine noise to a clean start"
   pass "home currency: a current home stays silent while the surrounding network phase demonstrably ran"
-)
+}
 
 # --- 15. the case that failed: a stale SECONDMATE home, seen from its parent -
 #
 # Both secondmate homes stale on 2026-08-21 were linked worktrees leased detached
 # on the default branch, exactly this shape, and the home that owned them saw
 # nothing.
-(
+test_a_stale_secondmate_home_is_reported_by_its_parent_and_by_itself() {
+  local dir home _origin old fakebin out own
   dir="$TMP_ROOT/boot-secondmate"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 9)
@@ -527,10 +542,11 @@ EOF
     "a secondmate home did not report its own staleness at its own session start"
 
   pass "home currency: a stale secondmate home is reported both by its parent and by its own session start"
-)
+}
 
 # --- 16. a remote-routed secondmate is left to its own session start --------
-(
+test_a_remote_routed_secondmate_is_left_to_its_own_session_start() {
+  local dir home _origin old fakebin out lines
   dir="$TMP_ROOT/boot-remote-secondmate"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 9)
@@ -553,10 +569,11 @@ EOF
   [ "$lines" = 1 ] \
     || fail "one secondmate home produced $lines HOME_CURRENCY lines, expected 1"
   pass "home currency: a remote-routed secondmate is not probed from its parent, its local twin still is, and one home reports once"
-)
+}
 
 # --- 17. the check lives in the network half, not the blocking local one ----
-(
+test_the_origin_probe_lives_in_the_network_half_not_the_blocking_one() {
+  local dir home _origin fakebin skip_out only_out
   dir="$TMP_ROOT/boot-phase"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -574,14 +591,15 @@ EOF
   assert_not_contains "$skip_out" "HOME_CURRENCY" \
     "the local half made an origin call on the session start's blocking path"
   pass "home currency: the origin probe is in the network half, so no session start blocks on it"
-)
+}
 
 # --- 18. the suite's hermeticity suppression is a real, pinned switch -------
 #
 # tests/lib.sh exports FM_HOME_CURRENCY_TEST_SKIP so no case reaches the real
 # forge. Its meaning is pinned here in both directions, so it cannot quietly
 # become the reason a future regression goes unnoticed.
-(
+test_the_suites_hermeticity_suppression_is_pinned_in_both_directions() {
+  local dir home _origin fakebin suppressed unset_out
   dir="$TMP_ROOT/boot-skip"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 2)
@@ -606,10 +624,11 @@ EOF
   assert_contains "$unset_out" "HOME_CURRENCY: this home is 6 commits behind origin/main" \
     "the check did not run with the suppression variable unset, which is how a real home runs"
   pass "home currency: the suite's suppression switch is off by default and pinned in both directions"
-)
+}
 
 # --- 19. a full bootstrap network pass mutates no home it reported on -------
-(
+test_a_full_bootstrap_network_pass_mutates_no_home_it_reported_on() {
+  local dir home _origin old fakebin before_home before_sub out after_home after_sub
   dir="$TMP_ROOT/boot-readonly"
   read -r home _origin <<EOF
 $(make_fleet "$dir" 9)
@@ -633,4 +652,59 @@ EOF
   [ "$(git -C "$dir/ops-home" rev-parse HEAD)" = "$old" ] \
     || fail "the stale secondmate home was fast-forwarded by a check that only reports"
   pass "home currency: a bootstrap network pass reports drift and fast-forwards nothing"
-)
+}
+
+# --- run --------------------------------------------------------------------
+#
+# Every case runs inside its own subshell, because a case sources
+# bin/fm-home-currency-lib.sh and then reads the FM_HOME_CURRENCY_* globals that
+# library sets; without that isolation one case's leftover verdict could satisfy
+# the next case's assertion, and a case that never ran the check at all could
+# still pass.
+#
+# A subshell also contains tests/lib.sh's fail(), whose `exit 1` leaves only the
+# subshell - so run_case has to propagate the status itself. Without that, this
+# file's exit code would be nothing but its LAST case's, and a case failing in
+# any other position would print its `not ok` line and still exit 0.
+# bin/fm-test-run.sh decides pass/fail from the exit code and does not read the
+# output, so the suite would have recorded a green run over a red case: a
+# reporter staying silent about its own failure, which is the exact shape this
+# whole file exists to pin. It must not be the shape of the file itself.
+FM_CASES_RUN=
+
+run_case() {
+  ( "$1" ) || exit 1
+  FM_CASES_RUN="$FM_CASES_RUN $1"
+}
+
+run_case test_a_current_home_is_silent_and_that_silence_is_a_verdict
+run_case test_behind_with_the_origin_commits_already_in_the_object_store
+run_case test_behind_with_the_origin_commit_absent_from_the_object_store
+run_case test_a_home_whose_origin_moved_past_its_last_fetch_reports_a_lower_bound
+run_case test_a_detached_head_at_origins_tip_is_current_not_an_error
+run_case test_a_home_ahead_of_origin_names_what_the_fleet_does_not_have
+run_case test_a_diverged_home_reports_both_distances
+run_case test_a_check_that_cannot_check_never_looks_like_a_check_that_passed
+run_case test_two_homes_on_one_unreachable_origin_both_report_unverified
+run_case test_two_homes_on_one_reachable_origin_cost_one_round_trip
+run_case test_an_origin_credential_never_reaches_the_reported_line
+run_case test_the_check_never_mutates_the_home_it_reports_on
+run_case test_bootstrap_reports_a_stale_home_in_its_network_phase
+run_case test_bootstrap_adds_no_line_for_a_current_home
+run_case test_a_stale_secondmate_home_is_reported_by_its_parent_and_by_itself
+run_case test_a_remote_routed_secondmate_is_left_to_its_own_session_start
+run_case test_the_origin_probe_lives_in_the_network_half_not_the_blocking_one
+run_case test_the_suites_hermeticity_suppression_is_pinned_in_both_directions
+run_case test_a_full_bootstrap_network_pass_mutates_no_home_it_reported_on
+
+# Declaring a case is not enough - it has to be run. The list above is a second
+# place to edit, and an edit that adds only the function leaves a case that
+# reads as covered while never executing, which is worse than a missing case.
+# This asks the shell which cases exist rather than reading this file's text, so
+# a case that was never wired up fails the file instead of disappearing quietly.
+for fn in $(declare -F | sed -n 's/^declare -f \(test_[a-z_]*\)$/\1/p'); do
+  case " $FM_CASES_RUN " in
+    *" $fn "*) ;;
+    *) fail "$fn is declared but was never run" ;;
+  esac
+done
