@@ -9,23 +9,42 @@ STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
-# Ceiling for fm_lock_acquire_wait. Every legitimate hold in this repo is a few
-# file operations long, and the slowest (a remote push under a home lock) is
-# still far below this, so reaching it means the holder is never going to
-# release. Generous by design: it exists to convert a permanent wedge into one
-# diagnostic line, not to arbitrate ordinary contention.
+# Ceiling for fm_lock_acquire_wait: it exists to convert a permanent wedge into
+# one diagnostic line, not to arbitrate ordinary contention. This value is
+# pinned inside a NARROW WINDOW by two unrelated constraints, so it cannot be
+# tuned by feel. Both bounds, and the reason for each:
 #
-# CONSTRAINT: this must stay below HALF of FM_GUARD_GRACE (default 300, and the
-# default for FM_WATCHER_STALE_GRACE through it). One watcher poll cycle can
-# contain TWO contended waits - procevent_surface_queued takes the wake-queue
-# lock, then resurface_after_downtime's arm-check takes it again - and the
-# beacon is touched only at the top of the loop, so a wedged lock ages the
-# beacon by about 2*(budget+1) before the next touch. At 120 that is ~242s and
-# stays inside the grace; at 300 it was ~602s, so a watcher that survived a
-# wedge exactly as designed still read as stale and the re-arm path told the
-# operator to stop it. Raising either knob without re-checking the other
-# re-creates that: a live, correctly degrading watcher reported as dead.
-FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-120}"
+#   LOWER, about 120s - the longest DELIBERATE hold in this repo. Not every
+#   hold here is a few file operations: bin/fm-startup-network.sh takes
+#   $STATE/.lock.acquire and keeps it across the whole deferred network sweep,
+#   a fm_run_timed hard bound of FM_STARTUP_NETWORK_TIMEOUT (default 120). That
+#   is designed behavior, not a wedge. A ceiling at or under it makes a session
+#   on the start path give up on the fleet lock and fall back to read-only.
+#
+#   UPPER, about 149s - half of FM_GUARD_GRACE (default 300, and the default
+#   for FM_WATCHER_STALE_GRACE through it). One watcher poll cycle can contain
+#   TWO contended waits - procevent_surface_queued takes the wake-queue lock,
+#   then resurface_after_downtime's arm-check takes it again - and the beacon is
+#   touched only at the top of the loop, so a wedged lock ages the beacon by
+#   about 2*(budget+1) before the next touch. Above this the beacon leaves the
+#   grace and a watcher that survived a wedge exactly as designed reads as
+#   stale, so the re-arm path tells the operator to stop it.
+#
+# 140 sits MID-WINDOW on purpose: ~20s of headroom over the startup sweep, and
+# ~18s of beacon-age margin under the guard grace. Raising FM_GUARD_GRACE,
+# FM_STARTUP_NETWORK_TIMEOUT, or this value without re-checking the other two
+# collapses the window, and each failure is silent at the definition site -
+# read-only sessions at one end, a live watcher reported dead at the other.
+#
+# KNOWN LIMITATION: the window is only ~29s wide because ONE value serves TWO
+# unrelated kinds of lock. The watcher's own locks (wake-queue, recovery
+# marker) are held for sub-millisecond file operations and want a tight budget;
+# $STATE/.lock.acquire is deliberately held for about two minutes and wants a
+# generous one. The structural fix is a separate, tighter budget for the
+# watcher's own waits, leaving this ceiling generous for the long-hold locks.
+# Not done here: this change repairs a supervision deadlock and should not also
+# carry that refactor.
+FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-140}"
 # Resolved once at source time: fm_pid_identity and fm_path_mtime run inside 0.2s
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
@@ -770,11 +789,11 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    had.
 fm_lock_acquire_wait() {  # <lockdir>
   local lockdir=$1 budget deadline= now
-  budget=${FM_LOCK_WAIT_TIMEOUT:-120}
+  budget=${FM_LOCK_WAIT_TIMEOUT:-140}
   # An unreadable override must not silently disable the ceiling that exists to
   # stop a permanent wait, so fall back to the default rather than to zero.
   case "$budget" in
-    ''|*[!0-9]*|0) budget=120 ;;
+    ''|*[!0-9]*|0) budget=140 ;;
   esac
   while ! fm_lock_try_acquire "$lockdir"; do
     if fm_lock_held_by_current_process "$lockdir"; then
