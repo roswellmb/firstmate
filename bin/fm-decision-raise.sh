@@ -230,6 +230,27 @@ cmd_raise() {
   [ -n "$KEY" ] || fail "--key is required: a structured decision must be answerable by key"
   fm_decision_option_id_valid "$KEY" || fail "invalid decision key '$KEY' (allowed: A-Z a-z 0-9 . _ -)"
 
+  # Checked on the RAW argument, before anything transforms it and before
+  # anything is written, so the refusal costs a length test however much prose
+  # was pasted - and so the words are still in front of the worker who can
+  # shorten them, rather than shortened for them somewhere they cannot see.
+  if [ "${#note}" -gt "$FM_DECISION_MAX_NOTE" ]; then
+    {
+      printf 'fm-decision-raise: refusing to write a status note that would not fit the line.\n'
+      printf 'Nothing was written - no record and no status line.\n\n'
+      printf '  --note is %s characters; the limit is %s.\n\n' \
+        "${#note}" "$FM_DECISION_MAX_NOTE"
+      printf 'The note is one line of a durable log, so it is refused rather than\n'
+      printf 'shortened: your words are still yours to edit. Shorten it, or put the\n'
+      printf 'detail in the report and leave the note pointing at it.\n\n'
+      printf 'If this is not a set of options at all, the plain free-text line is\n'
+      printf 'still the honest alternative, and it folds, wakes and closes as before:\n'
+      printf "  echo '%s [key=%s]: <the question>' >> %s\n" \
+        "$verb" "${KEY:-<slug>}" "$STATUS_FILE"
+    } >&2
+    exit 2
+  fi
+
   # Populate the shared globals so the ONE degeneracy check runs over exactly
   # what would be recorded - including the labels in their ENCODED form, which
   # is the form the record holds and the only form that cannot forge a row.

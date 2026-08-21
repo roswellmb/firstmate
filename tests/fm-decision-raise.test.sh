@@ -369,17 +369,6 @@ test_broken_install_refuses_by_name() {
   pass "an unusable library refuses by name instead of silently writing nothing"
 }
 
-test_structured_decision_survives_the_relay
-test_free_text_decision_is_unchanged
-test_padded_blob_is_refused_and_writes_nothing
-test_recommendation_must_name_a_real_option
-test_degenerate_record_on_disk_is_visible_at_the_relay
-test_truncated_record_is_never_partly_used
-test_option_identity_resolves_or_refuses
-test_option_label_cannot_forge_a_field
-test_key_holds_one_open_decision_then_supersedes
-test_key_that_would_not_open_is_refused
-test_record_follows_the_status_file_across_homes
 # One drain renders many decisions in a row. Each must be described by its OWN
 # record: a structured decision must not lend its fields to the free-text one
 # after it, and a malformed one must not borrow the sound one before it.
@@ -847,8 +836,6 @@ PY
   pass "awkward values cross the raise, the record and the JSON payload unchanged"
 }
 
-test_broken_install_refuses_by_name
-test_mixed_decisions_do_not_borrow_each_others_fields
 # THE BOUND IS A PROPERTY OF EVERY ENTRANCE, not of any one helper.
 #
 # Six review rounds each found one more value-processing helper that ran an
@@ -946,16 +933,25 @@ test_every_entrance_is_bounded_against_a_hostile_value() {
     --option "A one" --option "B two" \
     --recommend 1 --because "$blob"
 
-  # --note is not a validated field, so this one SUCCEEDS - and that is the
-  # case that has to be timed, because a success path has no diagnostic whose
-  # lateness would give the delay away. The worker just waits.
-  bound_case "raise --note" accept 'raised needs-decision' \
+  bound_case "raise --note" refuse 'the limit is' \
     "$RAISE" raise --status "$state/n.status" --key n \
     --question "Which encoder should the importer use?" \
     --option "A one" --option "B two" \
     --recommend 1 --because "It is already on the path." --note "$blob"
-  assert_grep 'needs-decision [key=n]:' "$state/n.status" \
-    "a raise with a hostile note must still append its ordinary status line"
+  assert_absent "$state/n.status" "a refused raise must not append a status line"
+
+  # A note that IS within the cap but whitespace-dense still does the real
+  # flattening work, and that is the case that has to be timed: a success path
+  # has no diagnostic whose lateness would give a delay away. The worker just
+  # waits.
+  bound_case "raise --note at the cap" accept 'raised needs-decision' \
+    "$RAISE" raise --status "$state/nc.status" --key nc \
+    --question "Which encoder should the importer use?" \
+    --option "A one" --option "B two" \
+    --recommend 1 --because "It is already on the path." \
+    --note "$(awk 'BEGIN { for (i = 0; i < 133; i++) printf "\t \n" }')"
+  assert_grep 'needs-decision [key=nc]:' "$state/nc.status" \
+    "a raise with a dense but legal note must still append its ordinary status line"
 
   # --- the read path: every way a record is read back ---------------------
   write_oversized_record "$state" r read-key
@@ -987,15 +983,64 @@ test_every_entrance_is_bounded_against_a_hostile_value() {
   pass "every worker-controlled entrance stays bounded against a hostile value"
 }
 
-test_every_entrance_is_bounded_against_a_hostile_value
-test_drain_cost_is_not_a_function_of_field_length
-test_escape_dense_field_cannot_wedge_the_drain
-test_option_lookup_refuses_an_unreadable_label
-test_raise_refuses_a_recommended_blob_promptly
-test_raise_refuses_a_pasted_option_promptly
-test_awkward_values_round_trip_through_the_json_payload
-test_option_label_cannot_mint_an_option
-test_digest_cannot_be_forged_by_field_prose
-test_json_payload_preserves_a_blank_line
-test_symlinked_record_file_is_refused_and_never_read
-test_duplicate_detection_ignores_case_whitespace_and_punctuation
+# A durable log line is never shortened behind the worker's back. An over-long
+# note is refused while the words are still theirs to edit, and the refusal
+# carries both numbers so shortening is one edit rather than a guessing game.
+test_over_long_note_is_refused_rather_than_truncated() {
+  local state status note err rc stored
+  state=$(make_state notecap)
+  status="$state/t.status"
+  err="$state/err.txt"
+  note="corr=ab12cd34 $(awk 'BEGIN { for (i = 0; i < 500; i++) printf "x" }')"
+
+  rc=0
+  "$RAISE" raise --status "$status" --key k \
+    --question "Which encoder should the importer use?" \
+    --option "A one" --option "B two" \
+    --recommend 1 --because "It is already on the path." \
+    --note "$note" >/dev/null 2>"$err" || rc=$?
+
+  [ "$rc" -ne 0 ] || fail "an over-long note must be refused, not silently shortened"
+  assert_grep "${#note} characters" "$err" \
+    "the refusal must say how long the note actually is"
+  assert_grep 'the limit is' "$err" "the refusal must say what the limit is"
+  assert_grep 'echo ' "$err" \
+    "the refusal must still point at the plain free-text line"
+  assert_absent "$status" "a refused raise must not append a status line"
+  assert_absent "${status%.status}.decisions" "a refused raise must not write a record"
+
+  # And nothing that DOES land is ever cut: a note one character under the
+  # limit is stored whole.
+  note=$(awk 'BEGIN { for (i = 0; i < 399; i++) printf "y" }')
+  "$RAISE" raise --status "$status" --key k2 \
+    --question "Which encoder should the importer use?" \
+    --option "A one" --option "B two" \
+    --recommend 1 --because "It is already on the path." \
+    --note "$note" >/dev/null 2>&1 || fail "a note inside the limit must be accepted"
+  stored=$(sed 's/^[^:]*: //' "$status")
+  [ "$stored" = "$note" ] \
+    || fail "a note inside the limit must be stored whole: wrote ${#note}, log holds ${#stored}"
+  pass "an over-long note is refused with both numbers, and a legal note is never cut"
+}
+
+# Run EVERY test this file declares, rather than a hand-kept list of names.
+#
+# A list has to be edited in two places to add a test and in two places to keep
+# one, and an edit that touches only the definitions leaves a test that still
+# looks present while never running - which is worse than a missing test,
+# because the file reads as if the case is covered. This loop removes the
+# second place: declaring a test IS running it, so a guard cannot be dropped by
+# an edit somewhere else in the file.
+#
+# It asks the shell which functions exist rather than reading this file's text,
+# so it keeps working however the tests are laid out.
+fm_run_declared_tests() {
+  local fn ran=0
+  for fn in $(declare -F | sed -n 's/^declare -f \(test_[a-z_]*\)$/\1/p' | sort); do
+    "$fn"
+    ran=$((ran + 1))
+  done
+  [ "$ran" -gt 0 ] || fail "no test functions were declared - this file ran nothing"
+}
+
+fm_run_declared_tests

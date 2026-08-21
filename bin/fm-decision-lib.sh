@@ -107,6 +107,21 @@ FM_DECISION_MAX_RAW=$FM_DECISION_MAX_QUESTION
 FM_DECISION_MAX_ENCODED=$((2 * FM_DECISION_MAX_RAW))
 FM_DECISION_MAX_RAW=$((FM_DECISION_MAX_RAW + 1))
 
+# The status note carries its own cap, because it is the one bounded value that
+# gets STORED. Everywhere else a bound is invisible - a cut value is already
+# past its own cap and is therefore refused, so the cut can never reach the
+# record - but the note is written to a durable append-only log, and shortening
+# it there would lose a worker's words in the one place they no longer exist.
+# So an over-long note is REFUSED at write time, while the words are still in
+# front of the person who can shorten them.
+#
+# The cap sits one BELOW FM_DECISION_MAX_RAW, which is what makes truncation
+# unreachable rather than merely unlikely: a note that passes this check is
+# shorter than the cut fm_decision_flatten_var applies, so that cut is a cost
+# guard that can never alter what lands.
+# shellcheck disable=SC2034 # read by bin/fm-decision-raise.sh's note refusal, not here.
+FM_DECISION_MAX_NOTE=$((FM_DECISION_MAX_RAW - 1))
+
 # --- value encoding ---------------------------------------------------------
 # Encode one field value so it cannot contain a raw TAB or newline. Backslash is
 # escaped FIRST so decoding is unambiguous.
