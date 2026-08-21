@@ -275,6 +275,55 @@ test_watcher_lock_waits_use_the_watch_budget_not_the_global_ceiling() {
   pass "the watcher's own lock waits use FM_WATCH_LOCK_WAIT_TIMEOUT, not the global ceiling"
 }
 
+# The watcher budget is assigned to the watcher's whole shell, not passed at the
+# call sites someone remembered. fm_wake_append takes the same wake-queue lock
+# INTERNALLY and runs many times per poll cycle, so a per-call budget missed it
+# entirely and left that path on the 300s global. Driving a real contended
+# append (afk + a 1s heartbeat) proves the process-scoped form covers it: with a
+# per-call budget the watcher would sit on the global for ten minutes here.
+test_contended_wake_append_also_uses_the_watch_budget() {
+  local dir state out live pid status waited
+  dir=$(make_case watcher-append-budget)
+  state="$dir/state"
+  out="$dir/watch.out"
+  mark_pr_check_migration_complete "$state"
+  : > "$state/.afk"
+
+  FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_HEARTBEAT=1 \
+    FM_LOCK_WAIT_TIMEOUT=600 FM_WATCH_LOCK_WAIT_TIMEOUT=1 \
+    FM_CHECK_INTERVAL=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_for_path "$state/.last-watcher-beat" 200 \
+    || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+         fail "watcher never entered its poll loop: $(cat "$out")"; }
+
+  # Wedged only after startup, so the append inside the poll loop is the wait
+  # under test rather than the startup arm-check.
+  sleep 300 &
+  live=$!
+  i=0
+  until mkdir "$state/.wake-queue.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 400 ] || { kill -KILL "$pid" "$live" 2>/dev/null || true
+                          wait "$pid" 2>/dev/null || true
+                          fail "could not take the wake-queue lock away from the watcher"; }
+    sleep 0.05
+  done
+  printf '%s\n' "$live" > "$state/.wake-queue.lock/pid"
+
+  wait_for_exit "$pid" 400
+  status=$?
+  kill -KILL "$live" 2>/dev/null || true
+  rm -rf "$state/.wake-queue.lock"
+  [ "$status" -ne 124 ] \
+    || fail "the watcher waited on the global ceiling for a contended wake append: $(cat "$out")"
+  waited=$(sed -n 's/^fm-lock: gave up after \([0-9][0-9]*\)s waiting for .*wake-queue\.lock.*/\1/p' "$out" | tail -1)
+  [ "$waited" = 1 ] \
+    || fail "a contended wake append did not use the watch budget (got '${waited}'): $(cat "$out")"
+  pass "a contended fm_wake_append uses the watch budget, not the global ceiling"
+}
+
 test_lock_wait_returns_when_this_process_already_holds_it() {
   local dir state out pid status
   dir=$(make_case lock-wait-reentrant)
@@ -1397,6 +1446,7 @@ test_watcher_signalled_inside_its_recovery_marker_lock_still_exits
 test_contended_wake_queue_lock_skips_the_cycle_instead_of_killing_the_watcher
 test_unsafe_recovery_marker_still_exits_the_watcher
 test_watcher_lock_waits_use_the_watch_budget_not_the_global_ceiling
+test_contended_wake_append_also_uses_the_watch_budget
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc

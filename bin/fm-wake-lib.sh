@@ -9,41 +9,42 @@ STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
-# Default ceiling for fm_lock_acquire_wait, used by every caller that does not
-# pass its own budget. It exists to convert a permanent wedge into one
-# diagnostic line, not to arbitrate ordinary contention, so it is sized for the
-# locks with DELIBERATE long holds. The longest is $STATE/.lock.acquire, which
-# bin/fm-startup-network.sh keeps across the whole deferred network sweep - a
-# fm_run_timed hard bound of FM_STARTUP_NETWORK_TIMEOUT (default 120). That
-# knob is therefore the LOWER bound here: at or under it, a session on the
-# start path gives up on the fleet lock and falls back to read-only.
-#
-# This is deliberately NOT coupled to FM_GUARD_GRACE. It used to be, because
-# the watcher waited on its own locks with this budget; it now passes
-# FM_WATCH_LOCK_WAIT_TIMEOUT instead, so the beacon-freshness constraint lives
-# there and this value is free to stay generous.
+# Default ceiling for fm_lock_acquire_wait. It exists to convert a permanent
+# wedge into one diagnostic line, not to arbitrate ordinary contention, so it is
+# sized for the locks with DELIBERATE long holds. The longest is
+# $STATE/.lock.acquire, which bin/fm-startup-network.sh keeps across the whole
+# deferred network sweep - a fm_run_timed hard bound of
+# FM_STARTUP_NETWORK_TIMEOUT (default 120). That knob is therefore the LOWER
+# bound here: at or under it, a session on the start path gives up on the fleet
+# lock and falls back to read-only.
 FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-300}"
-# Ceiling for the watcher's OWN lock waits (the wake queue and the recovery
-# marker). Those are held for sub-millisecond file operations, so anything past
-# a few seconds is already a wedge; a tight budget here is what keeps the
-# watcher's liveness beacon fresh while it degrades.
+# The value bin/fm-watch.sh assigns to its OWN shell's FM_LOCK_WAIT_TIMEOUT at
+# startup, unexported, so it governs every lock the watcher process waits on
+# while its subprocesses keep the generous global above.
+#
+# PROCESS-SCOPED ON PURPOSE. The first attempt at this passed a per-call budget
+# to fm_lock_acquire_wait at the three call sites the watcher was known to
+# reach. That silently missed fm_wake_append, which takes the same wake-queue
+# lock internally and runs about eleven times per poll cycle, and it would have
+# gone on missing every lock taken by a library sourced into the watcher's own
+# shell (fm-pending-reply-lib.sh's tick, fm-x-lib.sh's fmx_meta_ helpers). A
+# budget that has to be remembered at each call site is a budget that will be
+# forgotten at the next one; scoping it to the process covers them all,
+# including ones not yet written.
 #
 # CONSTRAINT: 2*(budget+1) + cycle_tail + FM_CHECK_TIMEOUT*N < FM_GUARD_GRACE.
 # The beacon is touched only at the TOP of the poll loop, so its worst-case age
-# is the WHOLE cycle: BOTH contended waits (procevent_surface_queued takes the
-# wake-queue lock, then resurface_after_downtime's arm-check takes it again),
-# PLUS the tail - fm-inactive-reconcile's scan (FM_INACTIVE_RECONCILE_BUDGET_SECS,
+# is the WHOLE cycle: the contended waits (procevent_surface_queued and
+# resurface_after_downtime's arm-check both take the wake-queue lock), PLUS the
+# tail - fm-inactive-reconcile's scan (FM_INACTIVE_RECONCILE_BUDGET_SECS,
 # default 10) and event_wait_or_sleep, which sleeps or blocks FM_POLL (default
 # 15) on every branch - PLUS the check sweep, which spends up to
 # FM_CHECK_TIMEOUT (default 30) on each of the N registered $STATE/*.check.sh.
-# At stock defaults and 30 that is 62 + 25 + 30*N, leaving room for N up to 7.
 #
 # N IS UNBOUNDED, and this budget cannot fix that: with enough armed checks the
 # sweep ALONE ages the beacon past the grace no matter how small this value is.
 # That is pre-existing behaviour, not something this knob solves.
 FM_WATCH_LOCK_WAIT_TIMEOUT="${FM_WATCH_LOCK_WAIT_TIMEOUT:-30}"
-# Normalized once here so call sites can pass it straight through and
-# fm_lock_acquire_wait never has to guess which default an invalid value meant.
 case "$FM_WATCH_LOCK_WAIT_TIMEOUT" in
   ''|*[!0-9]*|0) FM_WATCH_LOCK_WAIT_TIMEOUT=30 ;;
 esac
@@ -548,9 +549,8 @@ _fm_recovery_marker_arm_check() {
   local marker=$1 lock line quarantine
   FM_RECOVERY_MARKER_ACTION='none'
   lock="${marker}.lock"
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" "$FM_WATCH_LOCK_WAIT_TIMEOUT" \
-    || return "$FM_RECOVERY_MARKER_CONTENDED"
-  if ! fm_lock_acquire_wait "$lock" "$FM_WATCH_LOCK_WAIT_TIMEOUT"; then
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return "$FM_RECOVERY_MARKER_CONTENDED"
+  if ! fm_lock_acquire_wait "$lock"; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return "$FM_RECOVERY_MARKER_CONTENDED"
   fi
@@ -790,11 +790,9 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    the cycle-log and delivery-log waiters already use. Callers must treat a
 #    non-zero return as "did not get the lock" and must not proceed as if they
 #    had.
-fm_lock_acquire_wait() {  # <lockdir> [budget-seconds]
-  local lockdir=$1 budget=${2:-} deadline= now
-  # Callers with a lock-specific ceiling pass an already-normalized budget; the
-  # rest get the global one, which is sized for deliberate long holds.
-  [ -n "$budget" ] || budget=${FM_LOCK_WAIT_TIMEOUT:-300}
+fm_lock_acquire_wait() {  # <lockdir>
+  local lockdir=$1 budget deadline= now
+  budget=${FM_LOCK_WAIT_TIMEOUT:-300}
   # An unreadable override must not silently disable the ceiling that exists to
   # stop a permanent wait, so fall back to the default rather than to zero.
   case "$budget" in

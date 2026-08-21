@@ -136,6 +136,15 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
+# Every lock THIS process waits on uses the watcher budget, not the global
+# ceiling that is sized for the deferred network sweep's deliberate ~120s
+# hold. Assigned to the whole shell rather than passed per call so it also
+# covers the locks taken inside fm_wake_append and inside the libraries
+# sourced above; export -n keeps it off subprocesses, which face the
+# long-hold locks and keep the generous global.
+FM_LOCK_WAIT_TIMEOUT=$FM_WATCH_LOCK_WAIT_TIMEOUT
+export -n FM_LOCK_WAIT_TIMEOUT 2>/dev/null || true
+
 POLL=${FM_POLL:-15}                   # seconds between cycles
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
@@ -524,7 +533,7 @@ procevent_surface_queued() {
   # A contended queue lock skips this cycle rather than killing the watcher: the
   # queued procevent keys are still queued and still unmarked, so the next poll
   # re-surfaces exactly the same set and nothing is lost.
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" "$FM_WATCH_LOCK_WAIT_TIMEOUT" || return 0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 0
   while IFS= read -r key; do
     case "$key" in procevent:*) ;; *) continue ;; esac
     [ -e "$(procevent_surfaced_marker "$key")" ] && continue
