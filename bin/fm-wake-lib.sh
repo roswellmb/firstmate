@@ -18,9 +18,11 @@ FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 # bound here: at or under it, a session on the start path gives up on the fleet
 # lock and falls back to read-only.
 FM_LOCK_WAIT_TIMEOUT="${FM_LOCK_WAIT_TIMEOUT:-300}"
-# The value bin/fm-watch.sh assigns to its OWN shell's FM_LOCK_WAIT_TIMEOUT at
-# startup, unexported, so it governs every lock the watcher process waits on
-# while its subprocesses keep the generous global above.
+# The value bin/fm-watch.sh puts in the private _FM_LOCK_WAIT_BUDGET at startup,
+# so it governs every lock the watcher process waits on. That variable is never
+# exported and is read in preference to FM_LOCK_WAIT_TIMEOUT rather than
+# overwriting it, so the operator's own global survives untouched and still
+# reaches the watcher's subprocesses, which keep the generous ceiling above.
 #
 # PROCESS-SCOPED ON PURPOSE. The first attempt at this passed a per-call budget
 # to fm_lock_acquire_wait at the three call sites the watcher was known to
@@ -792,9 +794,15 @@ fm_lock_held_by_current_process() {  # <lockdir>
 #    had.
 fm_lock_acquire_wait() {  # <lockdir>
   local lockdir=$1 budget deadline= now
-  budget=${FM_LOCK_WAIT_TIMEOUT:-300}
+  # _FM_LOCK_WAIT_BUDGET is the private, never-exported process override a
+  # long-running caller sets for its OWN waits (bin/fm-watch.sh does). Reading
+  # it here rather than overwriting FM_LOCK_WAIT_TIMEOUT leaves an operator's
+  # exported global intact, so it still reaches that caller's subprocesses.
+  budget=${_FM_LOCK_WAIT_BUDGET:-${FM_LOCK_WAIT_TIMEOUT:-300}}
   # An unreadable override must not silently disable the ceiling that exists to
   # stop a permanent wait, so fall back to the default rather than to zero.
+  # Applied to the RESOLVED value, so a malformed private override is caught
+  # too rather than only a malformed public one.
   case "$budget" in
     ''|*[!0-9]*|0) budget=300 ;;
   esac

@@ -138,12 +138,12 @@ fi
 
 # Every lock THIS process waits on uses the watcher budget, not the global
 # ceiling that is sized for the deferred network sweep's deliberate ~120s
-# hold. Assigned to the whole shell rather than passed per call so it also
-# covers the locks taken inside fm_wake_append and inside the libraries
-# sourced above; export -n keeps it off subprocesses, which face the
-# long-hold locks and keep the generous global.
-FM_LOCK_WAIT_TIMEOUT=$FM_WATCH_LOCK_WAIT_TIMEOUT
-export -n FM_LOCK_WAIT_TIMEOUT 2>/dev/null || true
+# hold. Set on the whole shell rather than passed per call so it also covers
+# the locks taken inside fm_wake_append and inside the libraries sourced above.
+# _FM_LOCK_WAIT_BUDGET is private and never exported, so FM_LOCK_WAIT_TIMEOUT
+# is left exactly as the operator set it and still reaches the subprocesses
+# below, which face the long-hold locks and want the generous global.
+_FM_LOCK_WAIT_BUDGET=$FM_WATCH_LOCK_WAIT_TIMEOUT
 
 POLL=${FM_POLL:-15}                   # seconds between cycles
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
