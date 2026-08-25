@@ -156,6 +156,20 @@ Before changing it, inspect the current file and curate the matching bullet in p
 Shared captain preferences that apply across secondmate domains live only in the primary home's optional `data/captain-shared.md`.
 `secondmate-provisioning` owns its propagation contract, including the required header, read-only secondmate copies, quarantine diagnostics, and the rollout rule that existing homes trim `data/captain.md` by hand after first propagation rather than deleting private content automatically.
 
+## Captain project marks (config/project-marks)
+
+`config/project-marks` records the projects the captain has decided firstmate must not quietly start work on.
+It is gitignored, primary-authoritative, and inherited into every local and remote secondmate home through the same declared local-material channel as the other `config/` items, so a mark set in the primary home binds the whole fleet and clearing it there clears it downstream.
+The file lives in `config/` rather than on a `data/projects.md` registry line precisely because of that: the registry is per-home and propagates nowhere, and a control that binds only the home that set it is not a fleet control.
+
+[`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) is the file's single reader, and its header owns the mark schema: the line format, the two kinds and who is allowed to clear each, the rule that two marks for one project resolve to the stricter, and the `--mark` output contract.
+[`bin/fm-project-mark-lib.sh`](../bin/fm-project-mark-lib.sh) owns the single copy of the refusal policy every enforcement point shares, so no two of them can reach opposite verdicts on the same mark.
+
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) is the enforcement point where work starts, and refuses every ship, scout, and relaunch spawn into a marked project before any local copy, endpoint, or task record exists.
+An unparseable marks file refuses fleet-wide rather than reading as "not marked", because a marks file nobody can read may be hiding an exclusion.
+A relaunch is refused earlier still, in [`bin/fm-control.sh`](../bin/fm-control.sh)'s preflight before the worker is stopped, because a mark exists to stop new work and a refusal that had already torn down the work it declines to restart would do the opposite of what it enforces; [`docs/agent-control.md`](agent-control.md#transactional-relaunch) owns that step and what each refusal reports.
+The spawn-side refusal stays as the backstop that catches every other route in.
+
 ## Operational learnings (data/learnings.md)
 
 Fleet-local operational facts and gotchas live locally in `data/learnings.md`; it is gitignored and printed after the captain-preference files in the session-start context digest.
@@ -323,6 +337,10 @@ An absent or incompatible `lavish-axi` reports `MISSING: lavish-axi (install: np
 An absent or too-old `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; firstmate cannot resolve a profile array without a compatible binary.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
+The session-start deferred network stage also reports a `HOME_CURRENCY:` line for any firstmate home that is not exactly at its origin default-branch commit - behind, ahead, diverged, or a distance it cannot measure without fetching - and a separate `cannot verify` line when the comparison could not be made at all, which is never treated as a pass.
+A home at that commit stays silent.
+It covers the code root this instance loads from plus every local secondmate home this home owns; a remote-routed secondmate is reported by the same check in its own session start on its own host, so silence here says nothing about one.
+The check is read-only: it never fetches, fast-forwards, or writes anything, so it changes no home it names, and updating one stays `/updatefirstmate`'s job.
 The locked session-start deferred network stage runs bootstrap's best-effort project clone refresh through `fm-fleet-sync.sh`.
 It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
 Normal completed runs keep local-only and no-origin skips silent.
@@ -337,7 +355,7 @@ When a running home advances and its loaded instruction surface (`AGENTS.md`, `b
 If that send fails, bootstrap keeps an idempotent retry marker and emits `NUDGE_SECONDMATES:` with the failure reason.
 The same bootstrap run emits `SECONDMATE_LIVENESS:` only when a registered secondmate is skipped or its relaunch fails; already-live and successfully relaunched secondmates are handled silently.
 For a mid-session inherited local-material edit where tracked-file sync is not needed, run `bin/fm-config-push.sh`.
-It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, `backend`, `herdr-presentation-spaces`, `startup-memory-budget`, `trace-context`, and `data/captain-shared.md` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero for real propagation errors or config-reread send failures.
+It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, `backend`, `herdr-presentation-spaces`, `startup-memory-budget`, `trace-context`, `project-marks`, and `data/captain-shared.md` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero for real propagation errors or config-reread send failures.
 When an allowlisted config item changes for an already-running local home, it sends the literal-content reread pointer described in [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md); unchanged allowlisted config sends no pointer unless a previous delivery is pending.
 A changed remote home instead receives one durably recorded marked re-read instruction after the allowlisted bytes have transferred because primary-local generation paths are not meaningful on another host.
 The locked bootstrap inheritance pass uses the same placement-specific behavior; see `secondmate-provisioning` for the single contract owner.
@@ -557,6 +575,7 @@ FM_SESSION_START_QUEUED_LIMIT=20   # plain queued backlog rows in the session-st
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_BOOTSTRAP_NETWORK=all   # internal session-start phase split: all, skip (local steps only), or only (network steps only); see bin/fm-bootstrap.sh
 FM_STARTUP_NETWORK_TIMEOUT=120   # seconds bounding the whole deferred network stage; hitting it prints an actionable NETWORK_CHECKS line. This is the LOWER bound on FM_LOCK_WAIT_TIMEOUT, because the stage holds the fleet lock for its whole duration; raising it alone inverts that relationship and makes a session on the start path give up on the fleet lock and fall back to read-only
+FM_HOME_CURRENCY_TIMEOUT=15   # seconds bounding ONE read-only origin probe in bootstrap's home-currency check; empty, zero, or non-numeric uses 15. Origin's advertised tip is cached per origin URL for the run, so homes sharing an origin cost one probe between them, and hitting the bound reports "cannot verify" rather than passing
 FM_TASKS_AXI_COMPATIBLE=   # internal one-hop handoff of an already-computed tasks-axi compatibility verdict (0 or 1); consumed when bin/fm-tasks-axi-lib.sh is sourced
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically

@@ -2,9 +2,9 @@
 name: project-management
 description: >-
   Agent-only procedure for Firstmate project management.
-  Use before adding, creating, removing, or initializing a project.
+  Use before adding, creating, removing, or initializing a project, and before recording or lifting a captain project mark.
   Cloning or registering a project is add intake and uses the same trigger.
-  Owns project add, create, clone, remove, initialization, registry, delivery-mode, autonomy, and outward-consent decisions.
+  Owns project add, create, clone, remove, initialization, registry, delivery-mode, autonomy, outward-consent, and captain project-mark decisions.
 user-invocable: false
 metadata:
   internal: true
@@ -12,7 +12,7 @@ metadata:
 
 # project-management
 
-Use this procedure before adding, creating, removing, or initializing a project.
+Use this procedure before adding, creating, removing, or initializing a project, and before recording or lifting a captain project mark.
 Cloning or registering a project is add intake and uses the same trigger.
 This skill is the single owner of Firstmate's project-management procedure.
 It does not replace `secondmate-provisioning`, which owns project clones inside persistent secondmate homes.
@@ -81,6 +81,24 @@ cd projects/<name> && no-mistakes init && no-mistakes doctor
 Initialization configures the local gate and does not vendor a no-mistakes skill into the project.
 Do not create a commit merely because initialization ran.
 If doctor reports an environment, authentication, or daemon problem, resolve that blocker before dispatching work and never restart the shared daemon from a project operation.
+
+## Captain project marks
+
+A mark records that the captain has decided firstmate must not quietly start work on a project.
+Record one whenever the captain says not to work on a project, or that a project is waiting on something they owe.
+That instruction is durable state, not conversation memory: unrecorded, it dies with the session that heard it, and the next dispatch has nothing to refuse against.
+
+Use the marks-file format and reader contract owned by the header of `bin/fm-project-mode.sh`, and see `docs/configuration.md` for the file's place in configuration and how it reaches every home; edit the file by hand in the primary home, one line per mark, and let the existing inherited-local-material propagation carry it to secondmate homes.
+Choose the kind by who is allowed to clear it, not by how serious the situation feels:
+
+- `excluded` when the captain decided the project is off; only they lift it.
+  Write one only to record a decision the captain has already made, in words that named the project.
+  Never infer an exclusion from a deprioritization, a quiet backlog, a failed task, or your own judgment that a project is not worth doing, and never clear one because a condition changed or time passed - report the situation and let the captain decide.
+- `blocked-on-captain` when the work cannot succeed until the captain supplies something, and name that thing concretely in the reason.
+  You may observe that the named condition has been met and lift it, and you should say so when you do.
+
+Keep the reason specific enough that a refusal months later is actionable on its own, and set the date to the day the mark was recorded.
+When a mark refuses a dispatch you believed was wanted, that is a report to the captain, never a reason to edit the file so the work proceeds.
 
 ## Remove
 

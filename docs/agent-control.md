@@ -65,6 +65,11 @@ It is not deterministic across the verified adapters: codex and grok resume only
    The recorded worktree must exist and be a worktree root; its head and dirty state are recorded.
    For a `kind=secondmate` task, the home's identity marker must match and its child records must be readable, so a relaunch can never strand child work behind an unreadable home.
    A secondmate's own crewmates run in their own endpoints and outlive its relaunch; the relaunched secondmate reconciles them from its home's durable records at startup.
+   A ship or scout task's project is checked here against this home's captain project marks, alongside the other proofs that the work is recoverable, so a mark can never end a running task.
+   An `excluded` mark refuses outright, and the refusal names the recorded worktree the work is preserved in, because that work is untouched and the task can resume the moment the captain lifts the mark.
+   A `blocked-on-captain` mark refuses unless `--despite-block "<why this task does not depend on it>"` states why this one task does not depend on what the mark names, and that stated reason is recorded; a relaunch with no flag resumes on the reason recorded when the task launched, so a mark landing mid-flight never makes an in-flight task unrecoverable.
+   An exclusion has no such flag at any layer.
+   The header of [`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) owns the mark schema and its kinds, and [Captain project marks](configuration.md#captain-project-marks-configproject-marks) owns the file and how it reaches every home.
 3. **Record the note.**
    A ship or scout relaunch requires `--note`, because the replacement inherits the local copy but none of the conversation; the note is appended to the instructions it reads.
    A secondmate relaunch does not require one and never rewrites its standing charter.
@@ -98,7 +103,10 @@ Switching harness is therefore one ordinary relaunch rather than a separate mech
   zellij, orca, and cmux are refused rather than reported as successful blind.
 - An ambiguous or unreadable endpoint state refuses.
   Only a positively classified state acts.
+- A relaunch into a project the captain has marked is refused **before** the agent is stopped, because a mark exists to prevent new work and no refusal may tear down the work it is refusing to restart.
+  An `excluded` mark has no override at this layer or any other, and its refusal names the untouched worktree the preserved work is in.
 - `fm-spawn --relaunch` independently refuses unless the recorded endpoint is positively agent-free and its shell is sitting in the recorded worktree, so a replacement can never join a live agent or start outside the copy holding the work.
+  It re-applies the project-mark refusal as the backstop that catches every route into a spawn, not only this plane's.
 
 ## Capability matrix
 
@@ -118,5 +126,5 @@ The empirical basis for each adapter's value is the `harness-adapters` skill's v
 ## Verification
 
 - `tests/fm-control.test.sh` - the adapter contract for every verified harness, the backend capability matrix, exact-id scoping, the closed verb list, the busy, idle, dead, and idempotent lifecycle cases, and marker non-regression, all against a stubbed session provider.
-- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, and rollback after a failed launch.
+- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals including the project-mark preflight, and rollback after a failed launch.
 - `tests/fm-control-herdr-smoke.test.sh` - the second state-verified backend against the real herdr binary, on an isolated throwaway lab session.

@@ -34,12 +34,30 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Keep the suite hermetic against the external network. bin/fm-bootstrap.sh's
+# home-currency check asks origin directly for its default-branch tip, which for
+# a case whose FM_ROOT is this repo would be a live call to the real forge - slow,
+# non-deterministic, and dependent on what main happens to be today. Suppressing
+# it here is the same trade as FM_GATE_REFUSE_BYPASS above: a real firstmate home
+# never sources this library, so the guarantee is unaffected, and
+# tests/fm-home-currency.test.sh unsets this to drive the real check end to end
+# against local file-based origins that need no network at all.
+export FM_HOME_CURRENCY_TEST_SKIP=1
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # --- reporters --------------------------------------------------------------
+#
+# fail() ABORTS THE WHOLE FILE, and that is the contract bin/fm-test-run.sh
+# reads: it decides pass/fail from the script's exit code and never parses this
+# output, so a `not ok` line that does not also end the script is invisible to
+# the suite. `exit 1` only leaves the current shell, so a case wrapped in a
+# subshell must propagate that status itself (see tests/fm-home-currency.test.sh's
+# run_case); otherwise the file's status is merely its last case's, and a failure
+# anywhere earlier prints its `not ok` and still exits 0.
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2

@@ -250,6 +250,9 @@ Each task's mode and `yolo` posture are firstmate's decision at intake and are p
 A ship brief records its mode as a fixed machine-readable line and the spawn refuses to launch on a different one, so the worker's instructions and the recorded task delivery cannot diverge.
 `data/projects.md` records each project's standing posture and optional `+yolo` flag as the captain's default and as context for that decision, including the conditional `no-mistakes-prod-only` policy; a ship spawn that drops below the registered rigor prints a deviation notice and continues.
 `bin/fm-project-mode.sh` remains the one registry parser for the mechanical consumers that have no task in hand: fleet sync's `local-only` skip and home seeding's refusal and no-mistakes initialization.
+That same script answers one further question about a project, from a separate file rather than the registry: whether the captain has marked it as one firstmate must not start work on.
+A mark refuses the spawn at the point the registry is already consulted, because the two verdicts are different in kind - dropping below the registered rigor is a judgment firstmate is permitted to make and must state, while a mark records a decision that was never firstmate's to make.
+That script's header owns the mark schema and its two kinds, and [Captain project marks](configuration.md#captain-project-marks-configproject-marks) owns the file, how it reaches every home, and where the refusal is enforced.
 When a selected delivery path calls for a diff, `bin/fm-review-diff.sh` refreshes the authoritative base and, when task meta records `pr=`, always fetches and compares against `refs/pull/<n>/head` by default (recorded `pr_head=` is only an offline fallback) before falling back to the local branch with a warning.
 For target project repos shipped through their own no-mistakes pipeline, commits under `.no-mistakes/evidence/` are the pipeline's PR-viewable validation evidence and are expected to stay in the crew branch until the evidence-hosting design changes.
 The firstmate repo itself is the exception: its `.no-mistakes/` directory is local state, stays gitignored, and is rejected by CI if tracked.
@@ -332,6 +335,12 @@ For a remote route, the configured code root updates from its own origin on that
 The update is fast-forward only: dirty, diverged, offline, and off-default targets are reported and left untouched.
 Local homes share the guarded fast-forward helper, while remote updates delegate the same safety decision to the configured host through the generic transport.
 The mechanics are owned by the `/updatefirstmate` skill and firstmate's operating manual in [`AGENTS.md`](../AGENTS.md) (self-update).
+
+Updating is separate from noticing, and only the noticing happens automatically.
+Nothing else in the fleet compared a home against origin: the clone refresh above covers project clones, and the secondmate sweep converges secondmate homes to the primary's local commit, so a home could run months-old instructions, skills, and scripts and still start in silence.
+The session-start deferred network stage therefore reports how far this home - and every local secondmate home it owns - is from its origin default-branch commit, or reports that the comparison could not be made at all, which is never treated as a pass.
+It only reports: a home that fast-forwarded itself under a live validation run would be a worse failure than a stale one, so the repair stays with `/updatefirstmate` above.
+A remote-routed secondmate home is reported by that same check running in its own session start on its own host.
 
 ## Restart-proof
 

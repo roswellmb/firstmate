@@ -6,6 +6,7 @@
 #        fm-control.sh <task-id> exit
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
 #                                         [--effort <level>]
+#                                         [--despite-block <reason>]
 #                                         (--note <text> | --note-file <path>)
 #
 # Why this exists, and how it differs from fm-send.sh. bin/fm-send.sh is the
@@ -50,6 +51,22 @@
 #              the prior durable record in place and reports the concrete
 #              state; it never leaves a half-transitioned task claiming to be
 #              running.
+#              A ship or scout task's project is checked against this home's
+#              captain project marks in the PREFLIGHT, before the agent is
+#              stopped: a mark exists to stop NEW work, so a refusal that had
+#              already torn down the work it is refusing to restart would do
+#              the opposite of what it enforces. The shared policy lives in
+#              bin/fm-project-mark-lib.sh and its schema in
+#              bin/fm-project-mode.sh, so this plane and the spawn can never
+#              reach opposite verdicts. An `excluded` mark is total: nothing
+#              here lifts it, and the refusal names the untouched worktree so
+#              the preserved work can be found. A `blocked-on-captain` mark is
+#              partial, so --despite-block "<why this task does not depend on
+#              it>" resumes the task and records that stated reason; a relaunch
+#              with no flag still resumes on the reason recorded when the task
+#              launched. --despite-block applies to 'relaunch' only, is refused
+#              on an exclusion and on a secondmate (which has no project), and
+#              must be a single non-empty line.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -134,6 +151,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-project-mark-lib.sh
+. "$SCRIPT_DIR/fm-project-mark-lib.sh"
 
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
@@ -192,6 +211,8 @@ MODEL_SET=0
 EFFORT_SET=0
 NOTE=
 NOTE_SET=0
+BLOCK_OVERRIDE=
+BLOCK_OVERRIDE_SET=0
 want_value=
 for a in "$@"; do
   if [ -n "$want_value" ]; then
@@ -208,6 +229,7 @@ for a in "$@"; do
         NOTE=$(cat "$a")
         NOTE_SET=1
         ;;
+      despite-block) BLOCK_OVERRIDE=$a; BLOCK_OVERRIDE_SET=1 ;;
     esac
     want_value=
     continue
@@ -227,6 +249,8 @@ for a in "$@"; do
       NOTE=$(cat "${a#--note-file=}")
       NOTE_SET=1
       ;;
+    --despite-block) want_value=despite-block ;;
+    --despite-block=*) BLOCK_OVERRIDE=${a#--despite-block=}; BLOCK_OVERRIDE_SET=1 ;;
     *) die "unexpected argument '$a'" ;;
   esac
 done
@@ -234,11 +258,20 @@ done
 
 if [ "$VERB" != relaunch ]; then
   [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
-    || die "--harness, --model, --effort, and --note apply to 'relaunch' only"
+    && [ "$BLOCK_OVERRIDE_SET" = 0 ] \
+    || die "--harness, --model, --effort, --note, and --despite-block apply to 'relaunch' only"
 fi
 [ "$HARNESS_SET" = 0 ] || [ -n "$NEW_HARNESS" ] || die "--harness requires a non-empty value"
 [ "$MODEL_SET" = 0 ] || [ -n "$NEW_MODEL" ] || die "--model requires a non-empty value"
 [ "$EFFORT_SET" = 0 ] || [ -n "$NEW_EFFORT" ] || die "--effort requires a non-empty value"
+[ "$BLOCK_OVERRIDE_SET" = 0 ] || [ -n "$BLOCK_OVERRIDE" ] || die "--despite-block requires a non-empty value"
+# The launch owner writes the stated reason into the task record as one
+# key=value line, so a value carrying a newline would forge a second field
+# there. It is refused here rather than there, because there is on the far side
+# of stopping the agent.
+case "$BLOCK_OVERRIDE" in
+  *$'\n'*) die "--despite-block must be a single line" ;;
+esac
 case "$NEW_EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) die "--effort must be one of low, medium, high, xhigh, max" ;;
@@ -291,6 +324,15 @@ RECORDED_HARNESS=$(fm_meta_get "$META" harness)
 KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
+
+# --despite-block acknowledges a captain mark on a PROJECT, and a secondmate is
+# a home rather than work in a project, so there is nothing for it to
+# acknowledge. Refused as soon as the kind is known - the flag must never be
+# carried where it grants nothing, or it becomes habit and reads as protection
+# it does not give.
+if [ "$KIND" = secondmate ] && [ "$BLOCK_OVERRIDE_SET" = 1 ]; then
+  die "--despite-block acknowledges a captain mark on a project; task $ID is a secondmate, which is a home rather than work in a project"
+fi
 
 HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
   || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
@@ -733,7 +775,61 @@ safe_checkpoint() {
       children=$((children + 1))
     done
     CHECKPOINT_LINES+=("children=$children")
+  else
+    preflight_project_mark
   fi
+}
+
+# preflight_project_mark: ask, BEFORE the agent is stopped, whether the captain
+# has marked this task's project as one firstmate must not start work in.
+#
+# The refusal has to live on this side of the stop. bin/fm-spawn.sh enforces the
+# same policy and stays the backstop, but it only runs after do_exit, so a
+# spawn-side refusal alone would end a recoverable task as a stopped one - in
+# the name of a mark whose whole purpose is to prevent NEW work. No refusal path
+# may destroy what it is refusing to restart.
+#
+# The verdict is not reimplemented here: bin/fm-project-mode.sh --mark owns
+# reading and the schema, bin/fm-project-mark-lib.sh owns the
+# excluded-vs-blocked-on-captain policy, and both callers render their own
+# wording from the same answer. A secondmate has no project and never reaches
+# this.
+preflight_project_mark() {
+  local project name recorded
+  project=$(fm_meta_get "$META" project)
+  [ -n "$project" ] \
+    || die "task $ID has no recorded project, so its captain project mark cannot be checked; refusing to relaunch rather than starting work that may be marked. Nothing has been stopped and its work at $WT is untouched"
+  name=$(basename "$project")
+  recorded=$(fm_meta_get "$META" block_override)
+  if fm_project_mark_decide "$name" "$BLOCK_OVERRIDE" "$recorded"; then
+    return 0
+  fi
+  case "$FM_PROJECT_MARK_VERDICT" in
+    unreadable)
+      die "could not read this home's captain project marks, so it cannot be shown that $name is workable; refusing to relaunch task $ID. Its agent has NOT been stopped and its work at $WT is untouched"
+      ;;
+    stray-acknowledgement)
+      die "--despite-block acknowledges a blocked-on-captain mark, and $name carries no mark; drop the flag rather than carrying one that grants nothing"
+      ;;
+    excluded)
+      # An authority state: total, and liftable only by the captain removing the
+      # line. Nothing here offers a way through, so the refusal must not name
+      # one - what it names instead is where the work still is.
+      [ "$BLOCK_OVERRIDE_SET" = 0 ] \
+        || echo "error: --despite-block does not apply to an exclusion; only the captain lifts one" >&2
+      die "$name is marked excluded (set $FM_PROJECT_MARK_DATE): $FM_PROJECT_MARK_REASON
+       That mark records the captain's own decision, so nothing dispatches into $name - not a ship task, not an investigation, not a relaunch. Task $ID has NOT been stopped and nothing of its work has been lost or torn down: its local copy and every commit in it stay exactly as they are at $WT. Only the captain lifts the mark, by removing $name from config/project-marks; until then this task cannot resume."
+      ;;
+    blocked)
+      # A feasibility state: partial, so it opens on an explicit statement of
+      # why THIS task does not depend on the input the mark names.
+      die "$name is marked blocked-on-captain (set $FM_PROJECT_MARK_DATE): $FM_PROJECT_MARK_REASON
+       That mark records work that cannot succeed until the captain supplies what it names, so firstmate does not resume work in $name on its own. Task $ID has NOT been stopped and its work at $WT is untouched. The condition being met clears the mark, by removing $name from config/project-marks. If THIS task genuinely does not depend on that input, say so and it resumes: re-run with --despite-block \"<why this task does not depend on it>\"."
+      ;;
+    *)
+      die "$name carries an unrecognized mark kind \"$FM_PROJECT_MARK_KIND\" (set $FM_PROJECT_MARK_DATE): $FM_PROJECT_MARK_REASON; refusing to relaunch task $ID rather than guessing what the captain meant. Its agent has NOT been stopped and its work at $WT is untouched"
+      ;;
+  esac
 }
 
 # record_note: put the required progress note somewhere durable, and - for a
@@ -814,6 +910,10 @@ do_relaunch() {
   spawn_args=("$ID" --relaunch --harness "$TARGET_HARNESS")
   [ "$TARGET_MODEL" = default ] || spawn_args+=(--model "$TARGET_MODEL")
   [ "$TARGET_EFFORT" = default ] || spawn_args+=(--effort "$TARGET_EFFORT")
+  # The acknowledgement of a blocked-on-captain mark travels to the launch
+  # owner, which records it in the task record; a relaunch with no flag carries
+  # nothing here and resumes on the reason already recorded at launch.
+  [ "$BLOCK_OVERRIDE_SET" = 0 ] || spawn_args+=(--despite-block "$BLOCK_OVERRIDE")
   if FM_CONTROL_RELAUNCH_TX="$RELAUNCH_TX" \
       "$SCRIPT_DIR/fm-spawn.sh" "${spawn_args[@]}" >/dev/null; then
     RELAUNCH_META_PUBLISHED=1
