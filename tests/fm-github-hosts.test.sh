@@ -168,7 +168,7 @@ make_merge_case() {
   local name=$1 dir fakebin
   dir="$TMP_ROOT/merge-$name"
   fakebin="$dir/fakebin"
-  mkdir -p "$dir/state" "$fakebin"
+  mkdir -p "$dir/state" "$fakebin" "$dir/project"
   fm_write_meta "$dir/state/task-x1.meta" \
     "window=fm-task-x1" \
     "worktree=$dir/wt" \
@@ -177,6 +177,7 @@ make_merge_case() {
     "mode=no-mistakes"
   cat > "$fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
+printf 'cwd=%s\n' "$PWD" >> "$FM_TEST_GH_AXI_LOG"
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
 exit 0
 SH
@@ -210,12 +211,14 @@ test_merge_uses_hostname_for_ghe() {
     > "$dir/stdout" 2> "$dir/stderr" \
     || fail "merge failed for a GHE PR URL: $(cat "$dir/stderr")"
 
-  grep -q -- '--hostname github.mpi-internal.com' "$dir/gh-axi.log" \
-    || fail "merge did not pass --hostname for a GHE host: $(cat "$dir/gh-axi.log")"
-  grep -q 'pr merge 99 --repo my-org/my-repo' "$dir/gh-axi.log" \
-    || fail "merge did not pass correct PR number and --repo: $(cat "$dir/gh-axi.log")"
+  grep -qE 'cwd=.*/merge-ghe-hostname/project' "$dir/gh-axi.log" \
+    || fail "merge did not cd into project dir for a GHE host: $(cat "$dir/gh-axi.log")"
+  grep -q 'pr merge 99' "$dir/gh-axi.log" \
+    || fail "merge did not pass correct PR number: $(cat "$dir/gh-axi.log")"
+  grep -q -- '--repo github.mpi-internal.com' "$dir/gh-axi.log" \
+    && fail "merge passed --repo with GHE hostname (should not): $(cat "$dir/gh-axi.log")" || true
 
-  pass "fm-pr-merge.sh passes --hostname <ghe-host> to gh-axi pr merge for GHE hosts"
+  pass "fm-pr-merge.sh cds into project dir for GHE hosts and calls gh-axi pr merge without --repo HOST"
 }
 
 test_merge_no_hostname_for_github_com() {

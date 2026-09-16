@@ -85,5 +85,13 @@ fi
 if [ "$PR_HOST" = github.com ]; then
   gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${merge_args[@]}"}" "$@"
 else
-  gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" --hostname "$PR_HOST" "${merge_args[@]+"${merge_args[@]}"}" "$@"
+  # gh-axi resolves the GHE host from the git remote of the working directory.
+  # Calling it from the firstmate home targets github.com; cd into the project
+  # clone so the correct GHE host is detected automatically.
+  project_dir=$(grep '^project=' "$META" | cut -d= -f2-)
+  if [ -z "$project_dir" ] || [ ! -d "$project_dir" ]; then
+    echo "error: project directory not found for GHE PR merge (project='$project_dir')" >&2
+    exit 1
+  fi
+  (cd "$project_dir" && gh-axi pr merge "$PR_NUMBER" "${merge_args[@]+"${merge_args[@]}"}" "$@")
 fi
